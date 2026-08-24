@@ -85,7 +85,7 @@ Glimse supports managed snapshots only. It does not serve referenced files from 
 
 For Markdown and HTML entry documents, the CLI collects allowlisted relative resources beneath the entry directory. It preserves resource paths and rejects traversal, symlink escape, and unsupported dependency types. Supporting resources do not become visible feed items unless the publication lists them explicitly.
 
-The daemon identifies blobs by content hash. Posts may share one stored blob, and purge removes a blob only after its final reference disappears. SQLite transactions coordinate metadata and blob-reference updates.
+The daemon identifies blobs with SHA-256 encoded as 64 lowercase hexadecimal characters. Stored paths use two levels of two-character hash prefixes for bounded directory fan-out. Posts may share one stored blob, and purge removes a blob only after its final reference disappears. SQLite transactions coordinate metadata and blob-reference updates.
 
 Configurable per-file and per-session byte limits reject a new publication before it becomes visible. Glimse never evicts older visible posts to make room.
 

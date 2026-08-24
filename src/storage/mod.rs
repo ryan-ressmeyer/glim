@@ -1,6 +1,15 @@
-use std::{error::Error, fmt, fs, path::Path, time::Duration};
+use std::{
+    error::Error,
+    fmt, fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+mod blob;
+
+pub use blob::{BlobHash, BlobIntegrityError, BlobRecord, InvalidBlobHash};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
@@ -101,12 +110,14 @@ pub struct SessionRecord {
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
+    root: PathBuf,
 }
 
 impl Store {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
-        fs::create_dir_all(root.as_ref())?;
-        let mut connection = Connection::open(root.as_ref().join(DATABASE_FILENAME))?;
+        let root = root.as_ref().to_owned();
+        fs::create_dir_all(&root)?;
+        let mut connection = Connection::open(root.join(DATABASE_FILENAME))?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
 
@@ -120,8 +131,9 @@ impl Store {
 
         connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         apply_migrations(&mut connection, version, MIGRATIONS)?;
+        blob::recover_blob_store(&connection, &root)?;
 
-        Ok(Self { connection })
+        Ok(Self { connection, root })
     }
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {
@@ -260,6 +272,7 @@ where
 pub enum StoreError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
+    Integrity(BlobIntegrityError),
     SchemaTooNew { found: u32, supported: u32 },
     InvalidMigrationPlan { expected: u32, found: u32 },
     Random(getrandom::Error),
@@ -269,8 +282,9 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(formatter, "failed to prepare store directory: {error}"),
+            Self::Io(error) => write!(formatter, "storage I/O error: {error}"),
             Self::Sqlite(error) => write!(formatter, "SQLite store error: {error}"),
+            Self::Integrity(error) => write!(formatter, "blob integrity error: {error}"),
             Self::SchemaTooNew { found, supported } => write!(
                 formatter,
                 "database schema version {found} is newer than supported version {supported}"
@@ -280,7 +294,7 @@ impl fmt::Display for StoreError {
                 "invalid migration plan: expected version {expected}, found {found}"
             ),
             Self::Random(error) => {
-                write!(formatter, "failed to allocate public session ID: {error}")
+                write!(formatter, "operating-system randomness error: {error}")
             }
             Self::PublicIdExhausted => formatter.write_str("public session ID length exhausted"),
         }
@@ -292,6 +306,7 @@ impl Error for StoreError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
+            Self::Integrity(error) => Some(error),
             Self::SchemaTooNew { .. }
             | Self::InvalidMigrationPlan { .. }
             | Self::Random(_)
@@ -364,6 +379,24 @@ fn apply_migration(transaction: Transaction<'_>, migration: Migration) -> rusqli
 mod tests {
     use super::{Migration, Store, StoreError, apply_migrations, generate_public_id_with_fill};
     use rusqlite::Connection;
+
+    #[test]
+    fn io_error_message_is_context_neutral() {
+        let error = StoreError::Io(std::io::Error::other("disk unavailable"));
+
+        assert_eq!(error.to_string(), "storage I/O error: disk unavailable");
+    }
+
+    #[test]
+    fn randomness_error_message_is_context_neutral() {
+        let source = getrandom::Error::UNSUPPORTED;
+        let error = StoreError::Random(source);
+
+        assert_eq!(
+            error.to_string(),
+            format!("operating-system randomness error: {source}")
+        );
+    }
 
     #[test]
     fn opened_store_connection_enforces_foreign_keys_and_wal() {
