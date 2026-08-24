@@ -1,0 +1,231 @@
+# Implementation plan
+
+## Delivery strategy
+
+Build Glimse as a sequence of usable vertical slices. Each phase begins with failing tests for its public behavior, adds the minimum implementation needed to pass, and ends with fresh verification. Architectural helpers should emerge from tested behavior rather than precede it.
+
+The placeholder binary on `main` marks the planning baseline. Feature work should use a dedicated branch or worktree.
+
+## Phase 0: Repository and quality foundations
+
+### Scope
+
+- Choose a Rust workspace layout that separates reusable core logic from CLI, daemon, and pi-package concerns without creating speculative crates.
+- Establish formatting, linting, unit-test, integration-test, and frontend-test commands.
+- Add continuous integration for the supported Linux target.
+- Add a reproducible frontend build whose output can be embedded in the Rust binary.
+- Document local development commands and the supported Rust and Node versions.
+- Define a migration policy for SQLite and a compatibility policy for the HTTP API and CLI JSON schemas.
+
+### Exit criteria
+
+- One command runs all Rust and frontend checks locally.
+- CI runs the same checks from a clean checkout.
+- The placeholder daemon can embed and serve a static frontend asset in a test fixture.
+- No production session or publication behavior exists yet.
+
+## Phase 1: Storage and ephemeral session lifecycle
+
+### Scope
+
+- Introduce configuration directories and an isolated test-store abstraction.
+- Create the initial SQLite schema for integrations, projects, sessions, posts, files, revisions, and blob references.
+- Implement schema migrations and startup recovery.
+- Implement content-addressed blob writes using temporary files, hashing, atomic rename, and transactional references.
+- Resolve sessions from integration namespace, external key, and project context.
+- Allocate short public session IDs with collision-driven length growth.
+- Implement explicit session close as an atomic metadata and blob purge.
+- Implement seven-day inactivity calculation and a deterministic garbage-collection operation.
+- Track publication activity and visible-viewer heartbeats without treating background reads as activity.
+- Enforce configurable per-file and per-session storage limits before committing a post.
+
+### Test-first scenarios
+
+- Concurrent session resolution returns one active session for the same identity.
+- Distinct integrations may reuse the same external key without collision.
+- Short-ID collisions extend identifiers without changing existing IDs.
+- Duplicate content creates one blob and multiple references.
+- A failed publication leaves no metadata, temporary file, or leaked blob.
+- Closing one session retains blobs referenced by another session.
+- Closing the final referencing session removes the blob and session record.
+- Inactivity purge respects publication and visible-viewer activity.
+- Limit violations reject the full transaction and preserve the existing feed.
+- Startup recovers or removes interrupted temporary writes safely.
+
+### Exit criteria
+
+- Storage and lifecycle tests pass against temporary real SQLite databases and filesystems.
+- Purge is idempotent and safe after process interruption.
+- The daemon does not retain artifact payloads in memory after a request completes.
+
+## Phase 2: Versioned daemon API and CLI
+
+### Scope
+
+- Define versioned request, response, and error schemas for health, session resolution, publication, listing, revision lookup, heartbeat, and close.
+- Implement authenticated and unauthenticated loopback API modes.
+- Implement streaming multipart publication so the CLI uploads bytes rather than granting path access.
+- Add content sniffing and extension/declaration validation.
+- Implement minimal project and Git provenance collection in the CLI.
+- Parse Markdown and HTML resource references in the CLI, collect contained allowlisted assets, and reject traversal or symlink escape.
+- Implement canonical JSON-on-stdin publication and JSON output.
+- Add ergonomic flags for a one-file post, commentary input, captions, revisions, and explicit browser opening.
+- Ensure cancellation and connection loss clean up temporary uploads.
+
+### Test-first scenarios
+
+- CLI and API schema fixtures round-trip across supported versions.
+- Multiline Markdown and ordered file captions survive publication unchanged.
+- MIME mismatches return stable machine-readable errors.
+- Local asset collection preserves safe relative paths and rejects every escape form.
+- Multipart interruption leaves no visible post or orphaned temporary data.
+- Concurrent uploads of identical bytes converge on one blob.
+- Revision publication links immutable posts without modifying the predecessor.
+- CLI JSON errors remain parseable and produce nonzero exit codes.
+
+### Exit criteria
+
+- A shell command can create a session-scoped post, list it, revise it, and close the session through the daemon.
+- The API never accepts a source path as authority to read a host file.
+- OpenAPI or an equivalent checked schema artifact documents the supported API.
+
+## Phase 3: Live browser feed
+
+### Scope
+
+- Build the session feed with vanilla TypeScript and web components.
+- Add project and global feed scope navigation.
+- Implement SSE connection, reconnection, event ordering, and stale-event recovery.
+- Insert new posts immediately when the viewport is at the top.
+- Preserve scroll position and show a new-content indicator when the user has scrolled away.
+- Render post titles, Markdown commentary, provenance, captions, revision links, and ordered files.
+- Add visible-session heartbeat behavior using page visibility and connection state.
+- Add explicit session close in the viewer with destructive confirmation.
+- Add responsive layouts for desktop and remote mobile browsers.
+
+### Renderer sequence
+
+1. Images and SVG with natural sizing and zoom/pan.
+2. Video and audio with controls, no autoplay, offscreen pause, and range requests.
+3. Markdown with sanitized local-resource handling.
+4. Raw text and highlighted code in resizable virtualized panes.
+5. Structured JSON and CSV panes.
+6. PDF.js page-by-page rendering with lazy materialization.
+7. Sandboxed HTML with scripts enabled, unique origin, and network-blocking CSP.
+8. Download fallback for unsupported files.
+
+### Test-first scenarios
+
+- Feed insertion preserves the viewport in both top and scrolled states.
+- SSE reconnect fills missed posts without duplicates or reordering.
+- Hidden or disconnected pages do not keep a session active.
+- Offscreen media pauses and releases bounded resources.
+- Range responses handle valid, invalid, suffix, and partial requests.
+- Malicious Markdown, SVG, and HTML cannot access viewer credentials, other posts, or the network.
+- PDF, text, JSON, and CSV renderers remain usable within configured file limits.
+- Keyboard and touch interactions work for resizing, fullscreen, zoom, and the new-content indicator.
+
+### Exit criteria
+
+- Two concurrent agent sessions publish into isolated live feeds.
+- A remote browser can inspect every supported renderer without opening host applications.
+- Browser memory remains bounded while scrolling through a representative media-heavy feed.
+
+## Phase 4: Network configuration and service lifecycle
+
+### Scope
+
+- Define configuration-file and environment-variable precedence.
+- Bind to loopback by default.
+- Generate and securely store a persistent access token when configured for direct non-loopback access.
+- Implement trusted-proxy mode with explicit allowed proxy settings.
+- Protect HTML pages, SSE, API routes, media, and downloads consistently.
+- Add CSRF and origin protections appropriate to cookie or bearer-token handling.
+- Implement `service install`, `start`, `stop`, `status`, and `uninstall` for a systemd user unit.
+- Add daemon health, version, store-size, active-session, and cleanup status commands.
+- Add structured logs with bounded verbosity and no artifact content or tokens.
+
+### Test-first scenarios
+
+- Default startup is unreachable from non-loopback interfaces.
+- Non-loopback startup fails closed without token or trusted-proxy configuration.
+- Authentication covers SSE and range requests as well as ordinary pages and API calls.
+- Proxy headers are ignored outside trusted-proxy mode.
+- Service commands are idempotent and preserve user configuration and session data unless purge is explicit.
+- Logs redact credentials, commentary, filenames where necessary, and request bodies.
+
+### Exit criteria
+
+- A fresh Linux user can install and operate the daemon without writing a unit file manually.
+- SSH forwarding, Tailscale Serve, and direct authenticated binding have documented configurations.
+- Security-focused integration tests pass through a real listening socket.
+
+## Phase 5: Agent integrations
+
+### Generic skill
+
+- Teach shell-capable agents when visual output warrants publication.
+- Require an artifact and concise commentary rather than text-only feed messages.
+- Use canonical JSON stdin to avoid shell-quoting failures.
+- Derive or request a readable external key without storing daemon session tokens.
+- Explain revisions, session closure, limits, and returned links.
+- Avoid automatic publication of routine source changes or terminal output.
+
+### Native pi extension
+
+- Package a thin extension from the same repository.
+- Register a typed publication tool with ordered files, captions, commentary, and revision target.
+- Supply pi session and workspace provenance from public extension APIs.
+- Register commands to show the current feed URL, report daemon status, and close the session.
+- Use the daemon API or CLI client library without duplicating storage or rendering logic.
+- Fail clearly when the `glim` daemon or compatible binary is unavailable.
+
+### Test-first scenarios
+
+- Skill examples produce schema-valid CLI input.
+- The pi tool maps extension arguments to the same API model as the CLI.
+- Session identity remains stable across repeated calls and isolated across pi sessions.
+- Integration errors do not imply that a post was published when the daemon rejected it.
+- Closing through pi purges the corresponding feed and no other session.
+
+### Exit criteria
+
+- Claude Code can publish through the generic skill.
+- pi can publish through its native tool without using a shell command.
+- Both integrations can contribute to separate sessions in one daemon concurrently.
+
+## Phase 6: Hardening and release
+
+### Scope
+
+- Add fuzz or property tests for path handling, MIME detection, range parsing, short IDs, and schema decoding.
+- Exercise crash recovery around SQLite commits and blob renames.
+- Benchmark hashing, concurrent upload, feed queries, garbage collection, and media serving.
+- Verify bounded memory with large allowed files and long feeds.
+- Add browser security tests for sandbox escape and cross-post access.
+- Produce Linux release binaries and checksums in CI.
+- Support `cargo install` for developer installation.
+- Document upgrades, database migrations, backup expectations, and complete removal.
+- Run the native pi package through pi's package-loading and reload lifecycle.
+
+### Release criteria
+
+- A clean machine can install a release binary, install the user service, publish through CLI and pi, inspect remotely, close the session, and confirm complete purge.
+- Supported upgrade paths preserve active sessions or fail before migration without corrupting them.
+- Security tests cover every content renderer and authenticated route.
+- Release artifacts are reproducible enough to trace each binary to a tagged commit and published checksum.
+
+## Decisions deferred until their owning phase
+
+The implementation should choose these only when a failing test or phase requirement makes them concrete:
+
+- Rust crate boundaries and third-party crates;
+- exact SQL tables and indexes;
+- API paths and JSON field names;
+- default byte limits and browser virtualization thresholds;
+- visual theme and component styling;
+- Base58 versus Base62 public IDs;
+- token transport details;
+- frontend test runner and browser automation library.
+
+Deferring these choices prevents the planning scaffold from becoming untested architecture.

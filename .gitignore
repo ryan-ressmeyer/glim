@@ -1,0 +1,6 @@
+/target/
+/web/dist/
+.env
+*.db
+*.db-shm
+*.db-wal
