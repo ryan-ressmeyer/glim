@@ -1,9 +1,13 @@
-use std::{error::Error, fmt, fs, path::Path};
+use std::{error::Error, fmt, fs, path::Path, time::Duration};
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
+const PUBLIC_ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const INITIAL_PUBLIC_ID_LENGTH: usize = 6;
+const PUBLIC_ID_ACCEPTANCE_BOUND: usize = (u8::MAX as usize + 1) / 58 * 58;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
@@ -87,6 +91,13 @@ struct Migration {
     sql: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub id: i64,
+    pub public_id: String,
+    pub project_id: i64,
+}
+
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
@@ -97,6 +108,7 @@ impl Store {
         fs::create_dir_all(root.as_ref())?;
         let mut connection = Connection::open(root.as_ref().join(DATABASE_FILENAME))?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
 
         let version = schema_version(&connection)?;
         if version > CURRENT_SCHEMA_VERSION {
@@ -115,6 +127,133 @@ impl Store {
     pub fn schema_version(&self) -> Result<u32, StoreError> {
         schema_version(&self.connection).map_err(StoreError::from)
     }
+
+    /// Resolves one session identity and allocates new public IDs from the
+    /// Bitcoin Base58 alphabet
+    /// (`123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`), beginning at six characters.
+    ///
+    /// The working directory is the project identity. A later label for that
+    /// directory replaces the stored label without replacing its project or sessions.
+    pub fn resolve_session(
+        &mut self,
+        integration_namespace: &str,
+        external_key: &str,
+        project_label: &str,
+        working_directory: &str,
+    ) -> Result<SessionRecord, StoreError> {
+        self.resolve_session_with_candidates(
+            integration_namespace,
+            external_key,
+            project_label,
+            working_directory,
+            generate_public_id,
+        )
+    }
+
+    fn resolve_session_with_candidates<F>(
+        &mut self,
+        integration_namespace: &str,
+        external_key: &str,
+        project_label: &str,
+        working_directory: &str,
+        mut candidate: F,
+    ) -> Result<SessionRecord, StoreError>
+    where
+        F: FnMut(usize) -> Result<String, StoreError>,
+    {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO projects (label, working_directory) VALUES (?1, ?2)
+             ON CONFLICT(working_directory) DO UPDATE SET label = excluded.label",
+            params![project_label, working_directory],
+        )?;
+        let project_id = transaction.query_row(
+            "SELECT id FROM projects WHERE working_directory = ?1",
+            [working_directory],
+            |row| row.get::<_, i64>(0),
+        )?;
+
+        if let Some(session) = find_session(
+            &transaction,
+            integration_namespace,
+            external_key,
+            project_id,
+        )? {
+            transaction.commit()?;
+            return Ok(session);
+        }
+
+        let mut length = INITIAL_PUBLIC_ID_LENGTH;
+        let session = loop {
+            let public_id = candidate(length)?;
+            let inserted = transaction.execute(
+                "INSERT INTO sessions
+                 (public_id, integration_namespace, external_key, project_id)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(public_id) DO NOTHING",
+                params![public_id, integration_namespace, external_key, project_id],
+            )?;
+            if inserted == 1 {
+                break SessionRecord {
+                    id: transaction.last_insert_rowid(),
+                    public_id,
+                    project_id,
+                };
+            }
+            length = length.checked_add(1).ok_or(StoreError::PublicIdExhausted)?;
+        };
+        transaction.commit()?;
+        Ok(session)
+    }
+}
+
+fn find_session(
+    transaction: &Transaction<'_>,
+    integration_namespace: &str,
+    external_key: &str,
+    project_id: i64,
+) -> rusqlite::Result<Option<SessionRecord>> {
+    transaction
+        .query_row(
+            "SELECT id, public_id, project_id FROM sessions
+             WHERE integration_namespace = ?1 AND external_key = ?2 AND project_id = ?3",
+            params![integration_namespace, external_key, project_id],
+            |row| {
+                Ok(SessionRecord {
+                    id: row.get(0)?,
+                    public_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+}
+
+fn generate_public_id(length: usize) -> Result<String, StoreError> {
+    generate_public_id_with_fill(length, |random_bytes| {
+        getrandom::fill(random_bytes).map_err(StoreError::Random)
+    })
+}
+
+fn generate_public_id_with_fill<F>(length: usize, mut fill: F) -> Result<String, StoreError>
+where
+    F: FnMut(&mut [u8]) -> Result<(), StoreError>,
+{
+    let mut public_id = String::with_capacity(length);
+    let mut random_bytes = vec![0; length];
+    while public_id.len() < length {
+        random_bytes.resize(length - public_id.len(), 0);
+        fill(&mut random_bytes)?;
+        for byte in random_bytes.iter().copied() {
+            if usize::from(byte) < PUBLIC_ID_ACCEPTANCE_BOUND {
+                public_id
+                    .push(PUBLIC_ID_ALPHABET[usize::from(byte) % PUBLIC_ID_ALPHABET.len()] as char);
+            }
+        }
+    }
+    Ok(public_id)
 }
 
 #[derive(Debug)]
@@ -123,6 +262,8 @@ pub enum StoreError {
     Sqlite(rusqlite::Error),
     SchemaTooNew { found: u32, supported: u32 },
     InvalidMigrationPlan { expected: u32, found: u32 },
+    Random(getrandom::Error),
+    PublicIdExhausted,
 }
 
 impl fmt::Display for StoreError {
@@ -138,6 +279,10 @@ impl fmt::Display for StoreError {
                 formatter,
                 "invalid migration plan: expected version {expected}, found {found}"
             ),
+            Self::Random(error) => {
+                write!(formatter, "failed to allocate public session ID: {error}")
+            }
+            Self::PublicIdExhausted => formatter.write_str("public session ID length exhausted"),
         }
     }
 }
@@ -147,7 +292,10 @@ impl Error for StoreError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
-            Self::SchemaTooNew { .. } | Self::InvalidMigrationPlan { .. } => None,
+            Self::SchemaTooNew { .. }
+            | Self::InvalidMigrationPlan { .. }
+            | Self::Random(_)
+            | Self::PublicIdExhausted => None,
         }
     }
 }
@@ -214,7 +362,7 @@ fn apply_migration(transaction: Transaction<'_>, migration: Migration) -> rusqli
 
 #[cfg(test)]
 mod tests {
-    use super::{Migration, Store, StoreError, apply_migrations};
+    use super::{Migration, Store, StoreError, apply_migrations, generate_public_id_with_fill};
     use rusqlite::Connection;
 
     #[test]
@@ -233,6 +381,64 @@ mod tests {
 
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode, "wal");
+    }
+
+    #[test]
+    fn public_id_generation_rejects_biased_bytes_and_refills_to_requested_length() {
+        let mut bytes = [232, 255, 0, 57, 58, 231].into_iter();
+        let mut fill_count = 0;
+
+        let public_id = generate_public_id_with_fill(4, |buffer| {
+            fill_count += 1;
+            for byte in buffer {
+                *byte = bytes.next().unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(public_id, "1z1z");
+        assert_eq!(public_id.len(), 4);
+        assert_eq!(fill_count, 2);
+        assert_eq!(bytes.next(), None);
+    }
+
+    #[test]
+    fn public_id_collision_increases_the_next_candidate_length() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(root.path()).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO projects (id, label, working_directory)
+                 VALUES (1, 'Existing', '/tmp/existing')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO sessions
+                 (public_id, integration_namespace, external_key, project_id)
+                 VALUES ('111111', 'pi', 'existing', 1)",
+                [],
+            )
+            .unwrap();
+        let mut requested_lengths = Vec::new();
+
+        let session = store
+            .resolve_session_with_candidates("pi", "new", "Glimse", "/tmp/glim", |length| {
+                requested_lengths.push(length);
+                Ok(if length == 6 {
+                    "111111".to_owned()
+                } else {
+                    "2222222".to_owned()
+                })
+            })
+            .unwrap();
+
+        assert_eq!(requested_lengths, [6, 7]);
+        assert_eq!(session.public_id, "2222222");
     }
 
     #[test]

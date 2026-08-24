@@ -46,9 +46,11 @@ A session is an ephemeral feed for one agent workflow.
 
 Every publication identifies an integration namespace, an external session key, and project context. The daemon atomically resolves an active matching session or creates one. Integrations do not need to persist a daemon token or short ID.
 
+The working directory defines project identity. When a later resolution supplies a different label for the same working directory, the daemon updates the label in place without changing the project or session identity.
+
 Each session has two identifiers.
 
-- A short public ID appears in URLs and CLI output. The daemon allocates a compact Base58 or Base62 value and increases its length only when collision pressure requires it.
+- A short public ID appears in URLs and CLI output. The daemon allocates six characters from the Bitcoin Base58 alphabet (`123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`) and increases the candidate length after a collision.
 - An external key identifies the originating workflow within an integration namespace. It may be human-readable or opaque and does not need to appear in the viewer.
 
 Agent-provided links open the session feed. The viewer also provides project and global feed scopes.

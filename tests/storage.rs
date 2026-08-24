@@ -10,6 +10,144 @@ fn sqlite_constraint(error: rusqlite::Error) -> bool {
     )
 }
 
+#[test]
+fn repeated_resolution_returns_one_stable_session() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+
+    let first = store
+        .resolve_session("pi", "session-1", "Glimse", "/tmp/glim")
+        .unwrap();
+    let second = store
+        .resolve_session("pi", "session-1", "Glimse", "/tmp/glim")
+        .unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first.public_id.len(), 6);
+    assert!(first.public_id.chars().all(|character| {
+        "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(character)
+    }));
+
+    drop(store);
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn concurrent_independent_connections_resolve_one_session_without_lock_errors() {
+    let root = TempDir::new().unwrap();
+    Store::open(root.path()).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+
+    let handles = (0..16)
+        .map(|_| {
+            let database_root = root.path().to_owned();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(database_root).unwrap();
+                (0..10)
+                    .map(|round| {
+                        barrier.wait();
+                        store.resolve_session(
+                            "pi",
+                            &format!("shared-{round}"),
+                            "Glimse",
+                            "/tmp/glim",
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let sessions_by_connection = handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .unwrap()
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    for round in 0..10 {
+        assert!(
+            sessions_by_connection
+                .iter()
+                .all(|sessions| sessions[round] == sessions_by_connection[0][round])
+        );
+    }
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        10
+    );
+}
+
+#[test]
+fn external_keys_are_isolated_by_integration_namespace_and_project() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+
+    let pi_glim = store
+        .resolve_session("pi", "shared", "Glimse", "/tmp/glim")
+        .unwrap();
+    let claude_glim = store
+        .resolve_session("claude", "shared", "Glimse", "/tmp/glim")
+        .unwrap();
+    let pi_other = store
+        .resolve_session("pi", "shared", "Other", "/tmp/other")
+        .unwrap();
+
+    assert_ne!(pi_glim.id, claude_glim.id);
+    assert_ne!(pi_glim.id, pi_other.id);
+    assert_ne!(pi_glim.project_id, pi_other.project_id);
+    assert_ne!(pi_glim.public_id, claude_glim.public_id);
+    assert_ne!(pi_glim.public_id, pi_other.public_id);
+}
+
+#[test]
+fn resolving_existing_working_directory_updates_label_without_changing_identity() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let first = store
+        .resolve_session("pi", "session-1", "Old label", "/tmp/glim")
+        .unwrap();
+
+    let resolved = store
+        .resolve_session("pi", "session-1", "Current label", "/tmp/glim")
+        .unwrap();
+
+    assert_eq!(resolved, first);
+    drop(store);
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    let project = connection
+        .query_row(
+            "SELECT id, label FROM projects WHERE working_directory = '/tmp/glim'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(project, (first.project_id, "Current label".to_owned()));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
 fn insert_project_and_session(connection: &Connection) {
     connection
         .execute(
