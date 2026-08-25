@@ -36,11 +36,13 @@ fn openapi_paths_and_methods_exactly_match_current_api_routes() {
 }
 
 #[test]
-fn checked_cli_schema_artifacts_are_versioned_and_closed() {
+fn checked_json_schema_artifacts_are_versioned_and_closed() {
     let input: Value =
         serde_json::from_str(include_str!("../docs/cli-publish-v1.schema.json")).unwrap();
     let output: Value =
         serde_json::from_str(include_str!("../docs/cli-output-v1.schema.json")).unwrap();
+    let configuration: Value =
+        serde_json::from_str(include_str!("../docs/config-v1.schema.json")).unwrap();
     assert_eq!(input["properties"]["schema_version"]["const"], 1);
     assert_eq!(input["additionalProperties"], false);
     assert_eq!(
@@ -55,6 +57,9 @@ fn checked_cli_schema_artifacts_are_versioned_and_closed() {
         output["oneOf"][1]["properties"]["schema_version"]["const"],
         1
     );
+    assert_eq!(configuration["properties"]["schema_version"]["const"], 1);
+    assert_eq!(configuration["additionalProperties"], false);
+    assert_eq!(configuration["required"], json!(["schema_version"]));
 }
 
 #[test]

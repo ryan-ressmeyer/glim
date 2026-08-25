@@ -36,8 +36,15 @@ const portAvailable = await new Promise((resolve) => {
 });
 if (!portAvailable) throw new Error("Chromium live-feed regression requires free port 3030");
 
+const daemonEnvironment = {
+  ...process.env,
+  XDG_CONFIG_HOME: storeRoot,
+  GLIM_STORE_ROOT: storeRoot,
+  GLIM_BIND: "127.0.0.1:3030",
+};
+delete daemonEnvironment.GLIM_CONFIG;
 const daemon = spawn(daemonBinary, ["daemon"], {
-  env: { ...process.env, GLIM_STORE_ROOT: storeRoot },
+  env: daemonEnvironment,
   stdio: ["ignore", "ignore", "pipe"],
 });
 let daemonErrors = "";

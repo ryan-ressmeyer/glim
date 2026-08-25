@@ -2,7 +2,7 @@
 
 Glimse is a local service for visual output produced by terminal-based AI agents. The daemon listens on loopback and persists immutable publications under a per-user store root. The structured CLI publishes local files, reads daemon state, closes sessions, and returns machine-readable JSON.
 
-The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The browser feed receives live updates. Authentication and service management remain pending.
+The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The daemon configuration schema is [`docs/config-v1.schema.json`](docs/config-v1.schema.json). The browser feed receives live updates. Authentication and service management remain pending.
 
 The agreed product design is recorded in [`docs/product-design.md`](docs/product-design.md). The dependency-ordered build plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
@@ -39,11 +39,21 @@ cargo run --locked
 cargo run --locked -- daemon
 ```
 
-The daemon listens on `127.0.0.1:3030`. It selects the store root from `GLIM_STORE_ROOT`, then `$XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. Use an absolute `GLIM_STORE_ROOT` for an isolated development store.
+The daemon listens on `127.0.0.1:3030` by default. It reads a bounded, versioned JSON configuration from `$XDG_CONFIG_HOME/glim/config.json` when `XDG_CONFIG_HOME` is set, or from `$HOME/.config/glim/config.json` otherwise. Set `GLIM_CONFIG` to an absolute path when a different file is required; a missing explicit file is an error. Environment values override file values.
+
+```json
+{
+  "schema_version": 1,
+  "store_root": "/home/user/.local/share/glim",
+  "bind": "127.0.0.1:3030"
+}
+```
+
+`GLIM_STORE_ROOT` overrides `store_root`. Without either value, the daemon uses `$XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. `GLIM_BIND` overrides `bind`. Bind values must contain a numeric loopback address and a nonzero port. Non-loopback startup fails until a later Phase 4 slice adds authenticated access.
 
 ```bash
-GLIM_STORE_ROOT=/tmp/glim-store cargo run --locked
-curl http://127.0.0.1:3030/api/v1/health
+GLIM_STORE_ROOT=/tmp/glim-store GLIM_BIND=127.0.0.1:4040 cargo run --locked
+curl http://127.0.0.1:4040/api/v1/health
 ```
 
 The frontend build writes `web/dist/index.html`, `web/dist/assets/app.js`, and the bundled PDF.js worker at `web/dist/assets/pdf.worker.mjs`. Rust embeds all three files, so the resulting binary does not read frontend files at runtime.

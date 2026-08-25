@@ -69,7 +69,10 @@ async fn start_daemon_process(store_root: &std::path::Path) -> DaemonProcess {
     drop(port);
     let child = Command::new(env!("CARGO_BIN_EXE_glim"))
         .arg("daemon")
+        .env_remove("GLIM_CONFIG")
+        .env("XDG_CONFIG_HOME", store_root)
         .env("GLIM_STORE_ROOT", store_root)
+        .env("GLIM_BIND", "127.0.0.1:3030")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

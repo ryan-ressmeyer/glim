@@ -173,6 +173,12 @@ Top-of-page viewers receive posts immediately. Scrolled viewers retain at most 1
 
 ## Phase 4: Network configuration and service lifecycle
 
+### Configuration and safe-listener slice completed
+
+The daemon now reads a strict, versioned JSON configuration from the XDG or home configuration directory, with an explicit `GLIM_CONFIG` override. Files are bounded to 64 KiB. Environment values override file values, and file values override secure defaults. `GLIM_STORE_ROOT` and `GLIM_BIND` are the initial environment controls.
+
+The listener accepts numeric loopback addresses with nonzero ports. Non-loopback values fail before the store opens or a socket binds. This preserves the local-only security boundary while allowing isolated ports for development and tests. Token authentication, trusted-proxy mode, service commands, status expansion, and structured logs remain in later Phase 4 slices.
+
 ### Scope
 
 - Define configuration-file and environment-variable precedence.

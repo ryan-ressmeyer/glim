@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://glimse.local/schemas/config-v1.json",
+  "title": "Glimse daemon configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "store_root": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/",
+      "description": "Absolute persistent store path. GLIM_STORE_ROOT takes precedence."
+    },
+    "bind": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(127(?:\\.[0-9]{1,3}){3}:[1-9][0-9]*|\\[::1\\]:[1-9][0-9]*)$",
+      "description": "Numeric loopback IP socket address with a nonzero port, for example 127.0.0.1:3030 or [::1]:3030. GLIM_BIND takes precedence."
+    }
+  }
+}

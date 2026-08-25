@@ -31,7 +31,7 @@ The daemon keeps metadata on disk, streams media from storage, and bounds all in
 
 ## Network and authentication
 
-The daemon binds to loopback by default. Users may configure another interface.
+The daemon binds to loopback by default. It reads a versioned JSON file from the user configuration directory, with environment variables taking precedence. Loopback ports are configurable. A non-loopback address fails startup until one of the authenticated modes below is selected.
 
 Non-loopback deployments require one of two explicit modes.
 

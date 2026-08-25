@@ -1,7 +1,4 @@
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    process::ExitCode,
-};
+use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -51,12 +48,11 @@ fn print_cli_error(error: glim::cli::CliError) {
 }
 
 async fn run_daemon() -> Result<(), String> {
-    let root = glim::daemon::resolve_store_root()?;
-    let store = glim::daemon::open_store(root)?;
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 3030));
-    let listener = tokio::net::TcpListener::bind(address)
+    let configuration = glim::daemon::resolve_daemon_configuration()?;
+    let store = glim::daemon::open_store(configuration.store)?;
+    let listener = tokio::net::TcpListener::bind(configuration.bind)
         .await
-        .map_err(|error| format!("could not bind {address}: {error}"))?;
+        .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
     axum::serve(listener, glim::app_with_store(store))
         .await
         .map_err(|error| format!("server failed: {error}"))
