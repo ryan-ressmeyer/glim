@@ -23,32 +23,27 @@ pub struct CollectedSupportAsset {
 pub fn collect_support_assets(entry: &Path) -> Result<Vec<CollectedSupportAsset>, String> {
     let canonical_entry = fs::canonicalize(entry)
         .map_err(|error| format!("could not resolve entry file: {error}"))?;
-    let root = canonical_entry
-        .parent()
-        .ok_or_else(|| "entry file has no parent directory".to_owned())?
-        .to_owned();
-    let mut text = String::new();
-    let mut entry_file = File::open(&canonical_entry)
-        .map_err(|error| format!("could not open entry file: {error}"))?;
-    if !entry_file
-        .metadata()
-        .map_err(|error| format!("could not inspect opened entry file: {error}"))?
-        .is_file()
-    {
-        return Err("entry file must be a regular file".into());
-    }
-    entry_file
-        .read_to_string(&mut text)
-        .map_err(|error| format!("entry file must be UTF-8 text: {error}"))?;
     let extension = canonical_entry
         .extension()
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
+    if !matches!(extension.as_str(), "md" | "markdown" | "html" | "htm") {
+        return Ok(vec![]);
+    }
+    let root = canonical_entry
+        .parent()
+        .ok_or_else(|| "entry file has no parent directory".to_owned())?
+        .to_owned();
+    let mut text = String::new();
+    File::open(&canonical_entry)
+        .map_err(|error| format!("could not open entry file: {error}"))?
+        .read_to_string(&mut text)
+        .map_err(|error| format!("entry file must be UTF-8 text: {error}"))?;
     let references = match extension.as_str() {
         "md" | "markdown" => markdown_references(&text)?,
         "html" | "htm" => html_references(&text)?,
-        _ => return Ok(vec![]),
+        _ => unreachable!("entry extension was checked above"),
     };
     resolve_references(&root, references)
 }

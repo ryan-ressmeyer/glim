@@ -28,9 +28,10 @@ pub const API_V1_ROUTES: &[(&str, &str)] = &[
 
 use axum::{
     Json, Router,
-    http::{HeaderValue, header},
+    extract::Path,
+    http::{HeaderValue, StatusCode, header},
     middleware,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use serde::Serialize;
@@ -64,6 +65,9 @@ fn app_with_state(state: api::ApiState) -> Router {
         .method_not_allowed_fallback(api::method_not_allowed);
     Router::new()
         .route("/", get(root))
+        .route("/feed", get(root))
+        .route("/sessions/{public_id}", get(session_page))
+        .route("/projects/{project_id}", get(project_page))
         .route("/assets/app.js", get(frontend_script))
         .nest("/api/v1", v1)
         .fallback(api::root_not_found)
@@ -73,6 +77,31 @@ fn app_with_state(state: api::ApiState) -> Router {
 
 async fn root() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+async fn session_page(Path(public_id): Path<String>) -> Response {
+    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    if public_id.len() < 6
+        || !public_id
+            .chars()
+            .all(|character| BASE58.contains(character))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(INDEX_HTML).into_response()
+}
+
+async fn project_page(Path(project_id): Path<String>) -> Response {
+    // Browser page routes accept only IDs exactly representable by JavaScript.
+    const MAX_BROWSER_SAFE_ID: i64 = 9_007_199_254_740_991;
+    if project_id
+        .parse::<i64>()
+        .ok()
+        .is_none_or(|value| value <= 0 || value > MAX_BROWSER_SAFE_ID)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(INDEX_HTML).into_response()
 }
 
 async fn frontend_script() -> impl IntoResponse {

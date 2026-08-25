@@ -118,6 +118,12 @@ Phase 2D adds the canonical JSON and one-file publication interfaces, one-value 
 
 ## Phase 3: Live browser feed
 
+### First static viewer slice completed
+
+The first Phase 3 slice serves routed session, project, and global feeds from the embedded frontend. It adds bounded cursor pagination, cached session provenance, scoped navigation, sanitized Markdown commentary, and safe static renderers for images, SVG, Markdown artifacts, text, JSON, CSV, and downloads. PDF, video, audio, and HTML appear as pending download cards. The feed remains intentionally fully expanded.
+
+This slice does not add SSE, viewport-aware insertion, heartbeat, close actions, PDF.js, media playback, or scripted HTML. Those behaviors remain in the serial renderer and live-feed slices below, so the Phase 3 exit criteria are not yet satisfied.
+
 ### Scope
 
 - Build the session feed with vanilla TypeScript and web components.

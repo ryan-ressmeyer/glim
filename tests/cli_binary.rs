@@ -11,6 +11,8 @@ use std::{ffi::OsString, os::unix::ffi::OsStringExt, os::unix::fs::symlink};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+static REAL_DAEMON_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn run_glim(
     args: &[&str],
     input: Option<&Value>,
@@ -428,7 +430,65 @@ fn complete_created_response(public_id: &str, post_id: i64, post_session_id: &st
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn compiled_cli_publishes_binary_files_with_default_asset_collection() {
+    let _guard = REAL_DAEMON_LOCK.lock().await;
+    let store = TempDir::new().unwrap();
+    let _daemon = start_daemon_process(store.path()).await;
+    let files = TempDir::new().unwrap();
+    let artifacts: [(&str, &[u8], &str); 7] = [
+        ("plot.png", b"\x89PNG\r\n\x1a\n\xff", "image"),
+        ("paper.pdf", b"%PDF-1.7\n%\xff", "pdf"),
+        ("raw.bin", b"\0\xff", "download"),
+        ("photo.jpg", b"\xff\xd8\xff\0", "image"),
+        ("anim.gif", b"GIF89a\xff", "image"),
+        ("invalid.txt", b"text\xff", "download"),
+        ("icon.ico", b"\0\0\x01\0\x01\0\xff", "image"),
+    ];
+    for (filename, bytes, _) in artifacts {
+        fs::write(files.path().join(filename), bytes).unwrap();
+    }
+    let input = json!({
+        "schema_version":1, "integration_namespace":"pi", "external_session_key":"binary-default",
+        "project_label":"Glim", "working_directory":files.path(), "title":"Binary files",
+        "commentary":"Default asset collection must not decode binary entries",
+        "files": artifacts.iter().map(|(filename, _, _)| json!({"source_path": files.path().join(filename)})).collect::<Vec<_>>()
+    });
+
+    let output = run_glim(
+        &["publish", "--json"],
+        Some(&input),
+        "http://127.0.0.1:3030",
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "publication failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let payload = one_json(&output);
+    let post_id = payload["result"]["post"]["id"].as_i64().unwrap();
+    let published = payload["result"]["post"]["files"].as_array().unwrap();
+    assert_eq!(published.len(), artifacts.len());
+    for (position, (filename, expected_bytes, renderer)) in artifacts.iter().enumerate() {
+        assert_eq!(published[position]["filename"], *filename);
+        assert_eq!(published[position]["renderer"], *renderer);
+        let response = reqwest::get(format!(
+            "http://127.0.0.1:3030/api/v1/posts/{post_id}/files/{position}/content"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{filename}");
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            *expected_bytes,
+            "{filename}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn real_process_publication_streams_recursive_css_support_bytes_from_offset_zero() {
+    let _guard = REAL_DAEMON_LOCK.lock().await;
     let store = TempDir::new().unwrap();
     let _daemon = start_daemon_process(store.path()).await;
     let files = TempDir::new().unwrap();

@@ -55,6 +55,56 @@ async fn root_serves_the_embedded_frontend() {
 }
 
 #[tokio::test]
+async fn feed_page_routes_serve_the_embedded_frontend() {
+    for uri in [
+        "/feed",
+        "/sessions/2zY8Ab",
+        "/projects/42",
+        "/projects/9007199254740991",
+    ] {
+        let response = glim::app()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8",
+            "{uri}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("Glimse"));
+    }
+}
+
+#[tokio::test]
+async fn malformed_feed_page_shapes_are_not_spa_fallbacks() {
+    for uri in [
+        "/sessions",
+        "/sessions/abc",
+        "/sessions/0OIlxx",
+        "/sessions/abc-def",
+        "/sessions/abc/extra",
+        "/projects",
+        "/projects/0",
+        "/projects/-1",
+        "/projects/9007199254740992",
+        "/projects/9223372036854775807",
+        "/projects/9223372036854775808",
+        "/projects/1/extra",
+        "/global",
+    ] {
+        let response = glim::app()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn compiled_frontend_script_is_embedded() {
     let response = glim::app()
         .oneshot(

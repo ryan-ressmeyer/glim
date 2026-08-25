@@ -13,9 +13,16 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/papaparse": "^5.5.2",
+    "@types/sanitize-html": "^2.16.1",
     "happy-dom": "20.11.6",
     "typescript": "5.9.3",
     "vite": "8.2.2",
     "vitest": "4.1.11"
+  },
+  "dependencies": {
+    "marked": "^17.0.6",
+    "papaparse": "^5.7.0",
+    "sanitize-html": "^2.17.7"
   }
 }

@@ -43,6 +43,31 @@ fn markdown_and_html_assets_preserve_first_use_order_and_normalized_paths() {
 }
 
 #[test]
+fn non_document_artifact_is_not_interpreted_as_utf8() {
+    let root = TempDir::new().unwrap();
+    let entry = root.path().join("plot.png");
+    fs::write(&entry, b"\x89PNG\r\n\x1a\n\xff").unwrap();
+
+    let assets = collect_support_assets(&entry).unwrap();
+
+    assert!(assets.is_empty());
+}
+
+#[test]
+fn markdown_and_html_entries_still_require_utf8() {
+    let root = TempDir::new().unwrap();
+    for name in ["entry.md", "entry.html"] {
+        let entry = root.path().join(name);
+        fs::write(&entry, b"text\xff").unwrap();
+        let error = collect_support_assets(&entry).unwrap_err();
+        assert!(
+            error.contains("entry file must be UTF-8 text"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
 fn large_markdown_has_no_text_specific_collection_limit() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("image.png"), b"image").unwrap();
