@@ -207,6 +207,7 @@ async fn listing_and_lookup_preserve_nested_json_and_differentiate_errors() {
                 title: "Plot".into(),
                 commentary: "one\n\ntwo".into(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "plot.txt".into(),
                     caption: Some("a\nb".into()),
@@ -309,6 +310,7 @@ async fn corrupt_post_metadata_is_sanitized_without_poisoning_later_reads() {
                 title: "Corrupt".into(),
                 commentary: "Metadata".into(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "one.bin".into(),
                     caption: None,
@@ -656,6 +658,26 @@ async fn multipart_manifest_and_part_contract_errors_are_typed_and_leave_no_stat
         let (actual_status, payload) = post_multipart(app, "b", body).await;
         assert_eq!(actual_status, status, "{name}: {payload}");
         assert_eq!(payload["error"]["code"], code, "{name}");
+        assert_clean_publication_store(&root);
+    }
+}
+
+#[tokio::test]
+async fn http_git_provenance_validation_rejects_unsafe_inert_metadata_before_upload() {
+    let invalid = [
+        json!({"root":"relative","branch":"main","commit":"a".repeat(40)}),
+        json!({"root":"/work\nleak","branch":"main","commit":"a".repeat(40)}),
+        json!({"root":"/work","branch":"bad\nbranch","commit":"a".repeat(40)}),
+        json!({"root":"/work","branch":"main","commit":"a".repeat(39)}),
+    ];
+    for git in invalid {
+        let root = TempDir::new().unwrap();
+        let app = glim::app_with_store(Store::open(root.path()).unwrap());
+        let mut manifest = minimal_manifest();
+        manifest["git"] = git;
+        let (status, payload) = post_multipart(app, "b", multipart_body("b", &manifest, &[])).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(payload["error"]["code"], "validation_failed");
         assert_clean_publication_store(&root);
     }
 }

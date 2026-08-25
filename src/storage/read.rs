@@ -3,7 +3,7 @@ use std::{fs::File, io};
 use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
-use super::{ArtifactRenderer, BlobHash, BlobRecord, Store, StoreError};
+use super::{ArtifactRenderer, BlobHash, BlobRecord, GitProvenance, Store, StoreError};
 
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
 pub const MAX_PAGE_LIMIT: u32 = 100;
@@ -65,6 +65,7 @@ pub struct PostRead {
     pub commentary: String,
     pub predecessor_post_id: Option<i64>,
     pub published_at: i64,
+    pub git: Option<GitProvenance>,
     pub files: Vec<PostFileRead>,
 }
 
@@ -295,12 +296,57 @@ fn load_post(
     connection: &rusqlite::Connection,
     post_id: i64,
 ) -> Result<Option<PostRead>, StoreError> {
-    let Some(mut post) = connection.query_row(
-        "SELECT p.id, p.session_id, s.public_id, p.title, p.commentary, p.predecessor_post_id, p.published_at
-         FROM posts p JOIN sessions s ON s.id = p.session_id WHERE p.id = ?1",
-        [post_id],
-        |row| Ok(PostRead { id: row.get(0)?, session_id: row.get(1)?, session_public_id: row.get(2)?, title: row.get(3)?, commentary: row.get(4)?, predecessor_post_id: row.get(5)?, published_at: row.get(6)?, files: vec![] }),
-    ).optional()? else { return Ok(None); };
+    let Some(raw) = connection
+        .query_row(
+            "SELECT p.id, p.session_id, s.public_id, p.title, p.commentary, p.predecessor_post_id, p.published_at,
+                    p.git_root, p.git_branch, p.git_commit
+             FROM posts p JOIN sessions s ON s.id = p.session_id WHERE p.id = ?1",
+            [post_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let git = match (raw.7, raw.8, raw.9) {
+        (None, None, None) => None,
+        (Some(root), branch, commit) => {
+            let git = GitProvenance {
+                root,
+                branch,
+                commit,
+            };
+            if !git.is_valid() {
+                return Err(StoreError::InvalidPostMetadata);
+            }
+            Some(git)
+        }
+        _ => return Err(StoreError::InvalidPostMetadata),
+    };
+    let mut post = PostRead {
+        id: raw.0,
+        session_id: raw.1,
+        session_public_id: raw.2,
+        title: raw.3,
+        commentary: raw.4,
+        predecessor_post_id: raw.5,
+        published_at: raw.6,
+        git,
+        files: vec![],
+    };
     let raw_files = connection
         .prepare(
             "SELECT f.id, f.position, f.filename, f.caption, f.media_type, f.renderer, b.hash, b.byte_size

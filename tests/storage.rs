@@ -400,6 +400,7 @@ fn version_four_files_migrate_to_conservative_download_classification() {
                 title: "Legacy".into(),
                 commentary: "Historical".into(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![glim::storage::PublicationFile {
                     filename: "entry.md".into(),
                     caption: None,
@@ -413,13 +414,133 @@ fn version_four_files_migrate_to_conservative_download_classification() {
         .id;
     drop(store);
     let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
-    connection.execute_batch("ALTER TABLE post_files DROP COLUMN renderer; ALTER TABLE post_files DROP COLUMN media_type; PRAGMA user_version = 4;").unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE post_files DROP COLUMN renderer;
+             ALTER TABLE post_files DROP COLUMN media_type;
+             ALTER TABLE posts DROP COLUMN git_commit;
+             ALTER TABLE posts DROP COLUMN git_branch;
+             ALTER TABLE posts DROP COLUMN git_root;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
     drop(connection);
 
     let reopened = Store::open(root.path()).unwrap();
     let file = &reopened.post(post_id).unwrap().files[0];
     assert_eq!(file.media_type, "application/octet-stream");
     assert_eq!(file.renderer, glim::storage::ArtifactRenderer::Download);
+}
+
+#[test]
+fn populated_version_five_migration_preserves_the_existing_immutability_trigger() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let session = store
+        .resolve_session("pi", "v5", "Legacy", "/legacy-v5")
+        .unwrap();
+    let post = store
+        .publish_at(
+            glim::storage::PublicationRequest {
+                session_public_id: session.public_id,
+                title: "Legacy".into(),
+                commentary: "Version five".into(),
+                predecessor_post_id: None,
+                git: None,
+                files: vec![glim::storage::PublicationFile {
+                    filename: "entry.txt".into(),
+                    caption: None,
+                    blob: store
+                        .stage_publication_blob(std::io::Cursor::new(b"legacy"))
+                        .unwrap(),
+                    support_assets: vec![],
+                }],
+            },
+            1,
+        )
+        .unwrap();
+    drop(store);
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE posts DROP COLUMN git_commit;
+         ALTER TABLE posts DROP COLUMN git_branch;
+         ALTER TABLE posts DROP COLUMN git_root;
+         DROP TRIGGER posts_are_immutable;
+         CREATE TRIGGER posts_are_immutable BEFORE UPDATE ON posts
+         BEGIN SELECT RAISE(ABORT, 'v5 immutable marker'); END;
+         PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = Store::open(root.path()).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    drop(reopened);
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    let error = connection
+        .execute("UPDATE posts SET title='changed' WHERE id=?1", [post.id])
+        .unwrap_err();
+    assert!(
+        matches!(error, rusqlite::Error::SqliteFailure(_, Some(ref message)) if message == "v5 immutable marker")
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT git_root FROM posts WHERE id=?1", [post.id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn failed_version_six_migration_rolls_back_a_successful_first_alter_and_preserves_trigger() {
+    let root = TempDir::new().unwrap();
+    Store::open(root.path()).unwrap();
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE posts DROP COLUMN git_root;
+             DROP TRIGGER posts_are_immutable;
+             CREATE TRIGGER posts_are_immutable BEFORE UPDATE ON posts
+             BEGIN SELECT RAISE(ABORT, 'rollback marker'); END;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    let original_trigger = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='posts_are_immutable'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(Store::open(root.path()).is_err());
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    let trigger = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='posts_are_immutable'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let git_root_columns = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('posts') WHERE name='git_root'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(trigger, original_trigger);
+    assert_eq!(git_root_columns, 0);
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        5
+    );
 }
 
 #[test]
@@ -433,8 +554,9 @@ fn populated_version_three_store_backfills_deterministic_support_asset_positions
     drop(connection);
 
     let reopened = Store::open(root.path()).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 5);
+    assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let post = reopened.post(1).unwrap();
+    assert_eq!(post.git, None);
     assert!(
         post.files
             .iter()

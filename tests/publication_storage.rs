@@ -30,6 +30,7 @@ fn one_file_request(
         title: title.to_owned(),
         commentary: commentary.to_owned(),
         predecessor_post_id: None,
+        git: None,
         files: vec![PublicationFile {
             filename: "artifact.bin".to_owned(),
             caption: None,
@@ -75,6 +76,7 @@ fn publication_preserves_content_order_timestamp_and_advances_activity() {
                 title: "  Analysis title  ".to_owned(),
                 commentary: "  **Result**\n".to_owned(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![
                     PublicationFile {
                         filename: "index.md".to_owned(),
@@ -223,6 +225,7 @@ fn duplicate_content_has_one_physical_blob_and_one_reference_per_occurrence() {
                 title: "First".to_owned(),
                 commentary: "Result".to_owned(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "entry.txt".to_owned(),
                     caption: None,
@@ -296,6 +299,7 @@ fn publication_validation_returns_stable_errors_without_visible_metadata() {
             title: "title".to_owned(),
             commentary: "comment".to_owned(),
             predecessor_post_id: None,
+            git: None,
             files: vec![],
         },
         1,
@@ -311,6 +315,7 @@ fn publication_validation_returns_stable_errors_without_visible_metadata() {
             title: "title".to_owned(),
             commentary: "comment".to_owned(),
             predecessor_post_id: None,
+            git: None,
             files: vec![PublicationFile {
                 filename: "entry.md".to_owned(),
                 caption: None,
@@ -379,6 +384,7 @@ fn publishing_store_revalidates_staged_size_against_its_upload_limit() {
                 title: "Too large".to_owned(),
                 commentary: "Reject the consumed stage".to_owned(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "four.bin".to_owned(),
                     caption: None,
@@ -443,6 +449,7 @@ fn publishing_store_revalidates_support_asset_size_against_its_upload_limit() {
                 title: "Support too large".to_owned(),
                 commentary: "Reject all consumed stages".to_owned(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "entry.md".to_owned(),
                     caption: None,
@@ -499,6 +506,7 @@ fn publication_rejects_and_cleans_a_stage_from_another_store_root() {
                 title: "Wrong root".to_owned(),
                 commentary: "Reject the foreign stage".to_owned(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "foreign.bin".to_owned(),
                     caption: None,
@@ -656,6 +664,7 @@ fn aggregate_quota_counts_distinct_new_hashes_once_at_the_exact_boundary() {
                 title: "Boundary".to_owned(),
                 commentary: "Six unique bytes".to_owned(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![
                     PublicationFile {
                         filename: "a".to_owned(),
@@ -725,6 +734,7 @@ fn sqlite_failure_after_final_creation_rolls_back_and_removes_new_files() {
             title: "Fail".to_owned(),
             commentary: "Rollback".to_owned(),
             predecessor_post_id: None,
+            git: None,
             files: vec![
                 PublicationFile {
                     filename: "existing".to_owned(),

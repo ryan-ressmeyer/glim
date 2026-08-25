@@ -1,8 +1,8 @@
 # Glimse
 
-Glimse is a local service for visual output produced by terminal-based AI agents. The Phase 2B daemon listens on loopback and persists metadata and uploaded bytes under a per-user store root. It implements session resolution and lookup, scoped post listing and lookup, visible-session heartbeats, session close, and streaming multipart publication through the versioned HTTP API.
+Glimse is a local service for visual output produced by terminal-based AI agents. The daemon listens on loopback and persists immutable publications under a per-user store root. The structured CLI publishes local files, reads daemon state, closes sessions, and returns machine-readable JSON.
 
-The API is usable directly with HTTP clients such as `curl`. The checked contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). A CLI, artifact-byte serving, MIME validation, the live viewer and media renderers, authentication, and service management remain pending. The embedded frontend is still a foundation; published artifacts are not browser-viewable yet.
+The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The live viewer, authentication, and service management remain pending.
 
 The agreed product design is recorded in [`docs/product-design.md`](docs/product-design.md). The dependency-ordered build plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
@@ -31,11 +31,12 @@ make check-frontend  # Run TypeScript checks, frontend tests, and the production
 make check           # Run every frontend and Rust check
 ```
 
-Clippy runs with warnings denied. Cargo commands use `Cargo.lock`, and frontend installation uses `web/package-lock.json`. Run the daemon after building.
+Clippy runs with warnings denied. Cargo commands use `Cargo.lock`, and frontend installation uses `web/package-lock.json`. Run the daemon after building. No arguments and the explicit `daemon` command are equivalent.
 
 ```bash
 make build
 cargo run --locked
+cargo run --locked -- daemon
 ```
 
 The daemon listens on `127.0.0.1:3030`. It selects the store root from `GLIM_STORE_ROOT`, then `$XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. Use an absolute `GLIM_STORE_ROOT` for an isolated development store.
@@ -46,6 +47,39 @@ curl http://127.0.0.1:3030/api/v1/health
 ```
 
 The frontend build writes `web/dist/index.html` and `web/dist/assets/app.js`. Rust embeds both files with `include_str!` and `include_bytes!`, so the resulting binary does not read frontend files at runtime.
+
+## CLI
+
+Every short-lived CLI command writes one JSON value to standard output. Failures use the same output channel and exit nonzero. A committed publication remains successful if an explicitly requested browser launch fails; `result.browser_launch` reports the launch outcome. `GLIM_DAEMON_URL` overrides the development client endpoint; the default is `http://127.0.0.1:3030`. The Phase 2 client accepts an HTTP origin only. HTTPS transport remains deferred to Phase 4.
+
+Canonical publication reads versioned JSON from standard input.
+
+```bash
+cat <<'JSON' | glim publish --json
+{"schema_version":1,"integration_namespace":"pi","external_session_key":"session-1","project_label":"analysis","working_directory":"/work/analysis","title":"Population response","commentary":"The response increased.\n\nError bars show SEM.","files":[{"source_path":"/work/analysis/plot.png","caption":"Mean response"}]}
+JSON
+```
+
+A one-file publication can use flags. `--commentary-file` avoids shell quoting for multiline Markdown. Add `--open` only when the command should launch a browser.
+
+```bash
+glim publish --file plot.png --integration pi --external-key session-1 \
+  --project analysis --working-directory "$PWD" --title "Population response" \
+  --commentary-file commentary.md --caption "Mean response"
+glim status
+glim list --session PUBLIC_ID --limit 20
+glim list --project PROJECT_ID
+glim list --global
+glim show POST_ID
+glim open PUBLIC_ID
+glim close PUBLIC_ID
+```
+
+Markdown image references and HTML resource attributes collect local allowlisted files beneath the entry document directory. Linked CSS is tokenized recursively to collect `@import` and `url()` dependencies with bounded depth and reference counts. Collection ignores remote, fragment, data, and blob references. Invalid encodings, absolute paths, escaping traversal, unsupported files, special files, and escaping symlinks reject publication before any HTTP request.
+
+Markdown, HTML, and CSS parsers require complete UTF-8 text. The CLI therefore holds a transient parser input allocation while collecting references, regardless of entry size. Artifact upload remains streamed, parser text is released before the HTTP request, and the daemon retains its streaming memory boundary. Inline `<style>` blocks and HTML `style` attributes remain deferred to the renderer slice.
+
+The CLI records the Git root, branch, and commit when available. It does not collect remotes, diffs, environment variables, usernames, or repository contents.
 
 ## Compatibility
 

@@ -18,6 +18,7 @@ fn publish(store: &mut Store, session: &str, title: &str, at: i64) -> i64 {
                 title: title.to_owned(),
                 commentary: format!("line one\n\n{title}"),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: format!("{title}.txt"),
                     caption: Some(format!("caption\n{title}")),
@@ -53,6 +54,7 @@ fn reconstructs_session_and_nested_immutable_post_without_refreshing_activity() 
                 title: "Original".into(),
                 commentary: "first\n\nsecond".into(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![
                     PublicationFile {
                         filename: "entry.md".into(),
@@ -85,6 +87,7 @@ fn reconstructs_session_and_nested_immutable_post_without_refreshing_activity() 
         title: "Revision".into(),
         commentary: "revised".into(),
         predecessor_post_id: Some(first.id),
+        git: None,
         files: vec![PublicationFile {
             filename: "revision.txt".into(),
             caption: None,
@@ -165,6 +168,7 @@ fn corrupt_negative_blob_sizes_return_typed_errors_without_panicking() {
                 title: "Corrupt".into(),
                 commentary: "Metadata".into(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "entry.md".into(),
                     caption: None,

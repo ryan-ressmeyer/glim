@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://glimse.local/schemas/cli-output-v1.json",
+  "title": "Glimse CLI output v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "ok", "result"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "ok": {"const": true},
+        "result": {"type": ["object", "array", "string", "number", "boolean", "null"]}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "ok", "error"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "ok": {"const": false},
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "details"],
+          "properties": {
+            "code": {"type": "string", "pattern": "^[a-z0-9_]+$"},
+            "message": {"type": "string"},
+            "details": {"type": "object"}
+          }
+        }
+      }
+    }
+  ]
+}

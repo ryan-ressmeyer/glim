@@ -84,6 +84,20 @@ async fn publication_classifies_signature_and_text_families_and_ignores_part_hea
             "image",
         ),
         (
+            "image.avif",
+            Some("image/avif"),
+            b"\0\0\0\x18ftypavif\0\0\0\0avifavis",
+            "image/avif",
+            "image",
+        ),
+        (
+            "favicon.ico",
+            Some("image/x-icon"),
+            b"\0\0\x01\0\x01\0rest",
+            "image/x-icon",
+            "image",
+        ),
+        (
             "vector.svg",
             None,
             b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
@@ -175,6 +189,9 @@ async fn publication_classifies_signature_and_text_families_and_ignores_part_hea
 async fn exact_subtype_and_known_active_extension_mismatches_fail_atomically() {
     let cases: &[(&str, Option<&str>, &[u8])] = &[
         ("photo.jpg", None, b"\x89PNG\r\n\x1a\nrest"),
+        ("claim.png", None, b"\0\0\0\x18ftypavif\0\0\0\0avifavis"),
+        ("claim.png", None, b"\0\0\x01\0\x01\0rest"),
+        ("generic.heic", None, b"\0\0\0\x18ftypavif\0\0\0\0avifavis"),
         ("movie.webm", None, b"\0\0\0\x18ftypisom\0\0\0\0isommp42"),
         ("sound.mp3", None, b"RIFFxxxxWAVErest"),
         (
@@ -496,6 +513,7 @@ fn artifact_store(root: &TempDir, filename: &str, bytes: &[u8]) -> (Store, i64) 
                 title: "Delivery".into(),
                 commentary: "Bytes".into(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: filename.into(),
                     caption: None,
@@ -548,6 +566,12 @@ async fn support_dependencies_receive_safe_nosniff_compatible_media_types() {
         ("data.json", br#"{"value":1}"#, "application/json"),
         ("image.png", b"\x89PNG\r\n\x1a\nrest", "image/png"),
         (
+            "image.avif",
+            b"\0\0\0\x18ftypavif\0\0\0\0avifavis",
+            "image/avif",
+        ),
+        ("favicon.ico", b"\0\0\x01\0\x01\0rest", "image/x-icon"),
+        (
             "image.svg",
             b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
             "image/svg+xml",
@@ -576,6 +600,7 @@ async fn support_dependencies_receive_safe_nosniff_compatible_media_types() {
                 title: "Support".into(),
                 commentary: "Types".into(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "entry.md".into(),
                     caption: None,
@@ -731,6 +756,7 @@ async fn invalid_ranges_zero_bytes_association_and_support_paths_are_isolated() 
                 title: "Other".into(),
                 commentary: "Other".into(),
                 predecessor_post_id: None,
+                git: None,
                 files: vec![PublicationFile {
                     filename: "other.txt".into(),
                     caption: None,

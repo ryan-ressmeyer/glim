@@ -68,12 +68,39 @@ pub struct PublicationIdentity {
     pub working_directory: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitProvenance {
+    pub root: String,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+}
+
+impl GitProvenance {
+    pub(crate) fn is_valid(&self) -> bool {
+        let commit_valid = self.commit.as_ref().is_none_or(|value| {
+            matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        std::path::Path::new(&self.root).is_absolute()
+            && !self.root.is_empty()
+            && self.root.len() <= 4096
+            && !self.root.chars().any(char::is_control)
+            && self.branch.as_ref().is_none_or(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 1024
+                    && !value.chars().any(char::is_control)
+            })
+            && commit_valid
+    }
+}
+
 #[derive(Debug)]
 pub struct PublicationRequest {
     pub session_public_id: String,
     pub title: String,
     pub commentary: String,
     pub predecessor_post_id: Option<i64>,
+    pub git: Option<GitProvenance>,
     pub files: Vec<PublicationFile>,
 }
 
@@ -300,14 +327,18 @@ impl Store {
 
             self.connection.execute(
                 "INSERT INTO posts
-                 (session_id, title, commentary, predecessor_post_id, published_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (session_id, title, commentary, predecessor_post_id, published_at,
+                  git_root, git_branch, git_commit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     session_id,
                     request.title,
                     request.commentary,
                     request.predecessor_post_id,
-                    published_at
+                    published_at,
+                    request.git.as_ref().map(|git| git.root.as_str()),
+                    request.git.as_ref().and_then(|git| git.branch.as_deref()),
+                    request.git.as_ref().and_then(|git| git.commit.as_deref()),
                 ],
             )?;
             let post_id = self.connection.last_insert_rowid();
@@ -477,6 +508,9 @@ fn validate_request(
     }
     if request.files.is_empty() {
         return Err(StoreError::PublicationRequiresFile);
+    }
+    if request.git.as_ref().is_some_and(|git| !git.is_valid()) {
+        return Err(StoreError::InvalidGitProvenance);
     }
     for file in &request.files {
         validate_staged_blob(&file.blob, root, max_upload_bytes)?;

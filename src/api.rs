@@ -24,9 +24,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::storage::{
-    ActivityReport, LifecycleReport, PageRequest, PublicationFile, PublicationIdentity,
-    PublicationRequest, PublicationStagingWriter, PublicationSupportAsset, PublishedPublication,
-    Store, StoreError,
+    ActivityReport, GitProvenance, LifecycleReport, PageRequest, PublicationFile,
+    PublicationIdentity, PublicationRequest, PublicationStagingWriter, PublicationSupportAsset,
+    PublishedPublication, Store, StoreError,
 };
 
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
@@ -239,6 +239,7 @@ pub struct PublicationManifest {
     pub title: String,
     pub commentary: String,
     pub predecessor_post_id: Option<i64>,
+    pub git: Option<GitProvenance>,
     pub files: Vec<ManifestFile>,
 }
 
@@ -434,6 +435,7 @@ async fn publish_post(
         title: manifest.title,
         commentary: manifest.commentary,
         predecessor_post_id: manifest.predecessor_post_id,
+        git: manifest.git,
         files,
     };
     let published_at = daemon_unix_seconds()?;
@@ -473,6 +475,13 @@ fn validate_manifest(manifest: &PublicationManifest) -> Result<HashSet<String>, 
         ("commentary", manifest.commentary.as_str()),
     ] {
         validate_nonblank(field, value)?;
+    }
+    if manifest.git.as_ref().is_some_and(|git| !git.is_valid()) {
+        return Err(ApiError::multipart(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "Git provenance is malformed",
+        ));
     }
     if manifest.files.is_empty() {
         return Err(ApiError::multipart(
@@ -1015,6 +1024,7 @@ impl From<StoreError> for ApiError {
             StoreError::BlankPublicationTitle
             | StoreError::BlankPublicationCommentary
             | StoreError::PublicationRequiresFile
+            | StoreError::InvalidGitProvenance
             | StoreError::DuplicateSupportPath { .. }
             | StoreError::InvalidSupportPath { .. } => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1028,7 +1038,7 @@ impl From<StoreError> for ApiError {
                 "Predecessor belongs to another session",
                 json!({"post_id": post_id}),
             ),
-            StoreError::Integrity(_) => Self::new(
+            StoreError::Integrity(_) | StoreError::InvalidPostMetadata => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_integrity_error",
                 "Stored data failed integrity validation",

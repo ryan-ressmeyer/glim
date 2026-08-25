@@ -7,7 +7,7 @@ use axum::{
 use glim::{
     API_V1_ROUTES,
     api::{ErrorBody, ErrorEnvelope, ResolveSessionRequest},
-    storage::{PostFileRead, SessionRead},
+    storage::{GitProvenance, PostFileRead, SessionRead},
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -33,6 +33,28 @@ fn openapi_paths_and_methods_exactly_match_current_api_routes() {
         .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
         .collect::<BTreeSet<_>>();
     assert_eq!(documented, implemented);
+}
+
+#[test]
+fn checked_cli_schema_artifacts_are_versioned_and_closed() {
+    let input: Value =
+        serde_json::from_str(include_str!("../docs/cli-publish-v1.schema.json")).unwrap();
+    let output: Value =
+        serde_json::from_str(include_str!("../docs/cli-output-v1.schema.json")).unwrap();
+    assert_eq!(input["properties"]["schema_version"]["const"], 1);
+    assert_eq!(input["additionalProperties"], false);
+    assert_eq!(
+        input["properties"]["files"]["items"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        output["oneOf"][0]["properties"]["schema_version"]["const"],
+        1
+    );
+    assert_eq!(
+        output["oneOf"][1]["properties"]["schema_version"]["const"],
+        1
+    );
 }
 
 #[test]
@@ -64,6 +86,18 @@ fn representative_fixtures_match_the_rust_serde_contracts() {
     assert_eq!(
         serde_json::to_value(session).unwrap()["project"]["label"],
         "Glim"
+    );
+
+    let git: GitProvenance = serde_json::from_value(json!({
+        "root":"/work", "branch":"phase-2-cli", "commit":"0123456789abcdef0123456789abcdef01234567"
+    }))
+    .unwrap();
+    assert_eq!(git.branch.as_deref(), Some("phase-2-cli"));
+    assert!(
+        serde_json::from_value::<GitProvenance>(json!({
+            "root":"/work", "branch":null, "commit":null, "remote":"forbidden"
+        }))
+        .is_err()
     );
 
     let file: PostFileRead = serde_json::from_value(json!({
@@ -108,6 +142,7 @@ fn representative_fixtures_match_the_rust_serde_contracts() {
         "Session",
         "Post",
         "PostPage",
+        "GitProvenance",
         "ErrorEnvelope",
     ] {
         assert!(

@@ -158,6 +158,10 @@ fn strong_signature(bytes: &[u8]) -> Option<FileClassification> {
         Some(c("image/gif", ArtifactRenderer::Image))
     } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         Some(c("image/webp", ArtifactRenderer::Image))
+    } else if is_avif(bytes) {
+        Some(c("image/avif", ArtifactRenderer::Image))
+    } else if is_ico(bytes) {
+        Some(c("image/x-icon", ArtifactRenderer::Image))
     } else if bytes.starts_with(b"%PDF-") {
         Some(c("application/pdf", ArtifactRenderer::Pdf))
     } else if is_mp4_audio(bytes) {
@@ -177,6 +181,19 @@ fn strong_signature(bytes: &[u8]) -> Option<FileClassification> {
     } else {
         None
     }
+}
+
+fn is_avif(bytes: &[u8]) -> bool {
+    bmff_brands(bytes).is_some_and(|(major, compatible)| {
+        matches!(major, b"avif" | b"avis")
+            || compatible
+                .chunks_exact(4)
+                .any(|brand| matches!(brand, b"avif" | b"avis"))
+    })
+}
+
+fn is_ico(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && bytes[..4] == [0, 0, 1, 0] && u16::from_le_bytes([bytes[4], bytes[5]]) > 0
 }
 
 fn is_mp4_audio(bytes: &[u8]) -> bool {
@@ -246,6 +263,9 @@ fn filename_expectation(extension: Option<&str>) -> Option<FilenameExpectation> 
         "jpg" | "jpeg" => ("image/jpeg", true),
         "gif" => ("image/gif", true),
         "webp" => ("image/webp", true),
+        "avif" => ("image/avif", true),
+        "ico" => ("image/x-icon", true),
+        "heic" | "heif" => ("image/heif", true),
         "svg" => ("image/svg+xml", true),
         "pdf" => ("application/pdf", true),
         "mp4" => ("video/mp4", true),
@@ -274,6 +294,8 @@ fn normalize_declared(value: &str) -> Result<FileClassification, StoreError> {
         "image/jpeg" => c("image/jpeg", ArtifactRenderer::Image),
         "image/gif" => c("image/gif", ArtifactRenderer::Image),
         "image/webp" => c("image/webp", ArtifactRenderer::Image),
+        "image/avif" => c("image/avif", ArtifactRenderer::Image),
+        "image/x-icon" | "image/vnd.microsoft.icon" => c("image/x-icon", ArtifactRenderer::Image),
         "image/svg+xml" => c("image/svg+xml", ArtifactRenderer::Svg),
         "application/pdf" => c("application/pdf", ArtifactRenderer::Pdf),
         "video/mp4" => c("video/mp4", ArtifactRenderer::Video),
@@ -363,6 +385,8 @@ fn strong_media_type(classification: &FileClassification) -> &'static str {
         "image/jpeg" => "image/jpeg",
         "image/gif" => "image/gif",
         "image/webp" => "image/webp",
+        "image/avif" => "image/avif",
+        "image/x-icon" => "image/x-icon",
         "application/pdf" => "application/pdf",
         "video/mp4" => "video/mp4",
         "video/webm" => "video/webm",

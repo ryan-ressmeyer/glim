@@ -72,7 +72,7 @@ The placeholder binary on `main` marks the planning baseline. Feature work shoul
 
 Phase 2A defines the checked OpenAPI 3.1 contract and implements storage read models plus stateful daemon endpoints for session resolution and lookup, scoped post listing, post lookup, visible-session heartbeat, and session close. Lists are bounded and cursor-based. Storage reads preserve immutable nested post data and do not refresh session activity. Heartbeats use daemon-owned wall-clock time. Every v1 routing and extraction failure uses the JSON error envelope. `app_with_store(Store)` runs synchronous SQLite operations on Tokio's blocking pool behind one shared mutex; `app()` retains the same frontend and health behavior while stateful routes return a stable unavailable error.
 
-This foundation does not satisfy the Phase 2 exit criteria.
+This foundation did not satisfy the Phase 2 exit criteria.
 
 ### Phase 2B streaming publication completed
 
@@ -82,7 +82,9 @@ Phase 2B wires the runnable daemon to a persistent per-user store and adds `POST
 
 Phase 2C validates visible-file media declarations against manifest filenames and bounded byte prefixes. Schema v5 persists the effective media type and a closed renderer classification; older files migrate to the download fallback without scanning finalized bytes. Versioned `GET` and `HEAD` routes stream visible files and associated nested support assets from validated open blob handles after releasing the store mutex. The routes implement one RFC 9110 byte range, immutable caching, sanitized dispositions, nosniff, restrictive sandbox policy, exact association lookup, and traversal-resistant support paths.
 
-Phase 2 remains incomplete. CLI publication, source-asset discovery, authentication modes, and final configuration precedence remain pending.
+### Phase 2D structured CLI and provenance completed
+
+Phase 2D adds the canonical JSON and one-file publication interfaces, one-value JSON command output, scoped list/show/status/close/open commands, explicit browser launch, streaming file-handle multipart uploads, bounded Markdown and HTML dependency collection, and immutable optional Git provenance. The CLI uses `GLIM_DAEMON_URL` only as a development and test override. Authentication and final configuration precedence remain assigned to Phase 4.
 
 ### Scope
 
@@ -91,10 +93,10 @@ Phase 2 remains incomplete. CLI publication, source-asset discovery, authenticat
 - Implement streaming multipart publication so the CLI uploads bytes rather than granting path access.
 - Reject the whole publication when any upload exceeds the per-file ceiling or its additional unique finalized bytes exceed the global budget.
 - [Completed in Phase 2C] Add content sniffing and extension/declaration validation.
-- Implement minimal project and Git provenance collection in the CLI.
-- Parse Markdown and HTML resource references in the CLI, collect contained allowlisted assets, and reject traversal or symlink escape.
-- Implement canonical JSON-on-stdin publication and JSON output.
-- Add ergonomic flags for a one-file post, commentary input, captions, revisions, and explicit browser opening.
+- [Completed in Phase 2D] Implement minimal project and Git provenance collection in the CLI.
+- [Completed in Phase 2D] Parse Markdown and HTML resource references in the CLI, collect contained allowlisted assets, and reject traversal or symlink escape.
+- [Completed in Phase 2D] Implement canonical JSON-on-stdin publication and JSON output.
+- [Completed in Phase 2D] Add ergonomic flags for a one-file post, commentary input, captions, revisions, and explicit browser opening.
 - Ensure cancellation and connection loss clean up temporary uploads.
 
 ### Test-first scenarios

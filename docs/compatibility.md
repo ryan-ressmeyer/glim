@@ -1,6 +1,6 @@
 # Compatibility policies
 
-These policies apply to the interfaces implemented so far. CLI JSON commands remain pending.
+These policies apply to the SQLite store, v1 HTTP API, and v1 CLI JSON interfaces.
 
 ## SQLite migrations
 
@@ -29,7 +29,7 @@ Post lists use bounded reverse-publication ordering. The daemon orders posts by 
 
 Working directories returned with project metadata are identity values supplied during session resolution. The daemon does not read them as source paths. The compatibility `glim::app()` constructor exposes the complete route surface but returns `503 storage_unavailable` for stateful routes. Tests and configured embeddings use `glim::app_with_store(Store)`.
 
-### Phase 2B publication and daemon additions
+### Phase 2B through 2D publication and daemon additions
 
 `POST /api/v1/posts` accepts streaming `multipart/form-data`. The first part is a UTF-8 JSON part named `manifest`, limited to 64 KiB. The manifest rejects unknown fields and declares at most 256 uniquely named byte parts. Every declared part must appear exactly once after the manifest; multipart arrival order does not affect visible-file or support-asset order. Stored filenames and support paths come from the manifest. Client content-disposition filenames, declared MIME values, working directories, and other host paths do not grant filesystem-read authority.
 
@@ -41,11 +41,16 @@ Visible bytes use `GET` or `HEAD /api/v1/posts/{post_id}/files/{position}/conten
 
 Artifact responses include an effective content type, exact length, `Accept-Ranges: bytes`, a sanitized content disposition, private immutable caching, `X-Content-Type-Options: nosniff`, and a `default-src 'none'; sandbox` content security policy. One prefix, bounded, open-ended, or suffix byte range returns `206`. Malformed, multiple, and unsatisfiable ranges return `416`, `Content-Range: bytes */<length>`, and an empty body. The daemon opens and validates the final blob on the blocking pool, releases the store mutex, and then streams from the open handle.
 
+Schema v6 adds nullable Git root, branch, and commit columns to immutable posts without replacing the production immutability trigger. Existing posts migrate with all three values absent. HTTP clients may supply an absolute control-free root, an optional nonblank control-free branch, and an optional full 40- or 64-digit hexadecimal object ID as bounded inert metadata. The daemon does not execute Git, inspect the supplied root, or collect repository state.
+
 The runnable binary opens a persistent store before binding `127.0.0.1:3030`. Store-root selection uses `GLIM_STORE_ROOT` first as a development and test override, then nonblank `XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. Startup fails when none is usable. Every leaf store root newly created by the daemon has mode `0700` on Linux, including a new explicit override. An existing explicit override retains its permissions. Phase 4 still owns final configuration precedence, production limits, binding options, authentication, and service management.
 
 ## CLI JSON schemas
 
-- Canonical JSON input and structured output will carry an explicit schema version when they are introduced.
-- Within one schema major version, required input fields and the meaning and type of existing output fields remain stable. Producers may add optional input fields; consumers must ignore unknown output fields.
-- A breaking field or semantic change requires a new schema major version. Unsupported versions fail with a nonzero exit status and a parseable JSON error when JSON output is requested.
-- Human-readable CLI output is not a machine interface. Automation must use the documented JSON input and output modes.
+The checked v1 artifacts are `docs/cli-publish-v1.schema.json` and `docs/cli-output-v1.schema.json`. `glim publish --json` rejects unknown input fields and unsupported versions before opening an HTTP request. Every short-lived command writes exactly one v1 output value and uses a nonzero status for errors. Publication success requires a decoded `201` daemon response. After decoding a committed publication, browser-launch failure is reported inside the successful result rather than changing the command status. A malformed `201` error sets `publication_may_have_succeeded` so clients do not retry blindly.
+
+Within one schema major version, required input fields and the meaning and type of existing output fields remain stable. Producers may add optional input fields only when older clients can reject them safely; consumers must ignore unknown output fields. A breaking field or semantic change requires a new schema major version.
+
+Source paths exist only in CLI input. The CLI resolves and opens each source, then streams open handles as multipart byte parts. Daemon manifests contain filenames, ordered support paths, publication identity, and inert provenance, but no path that grants host filesystem authority.
+
+Markdown, HTML, and recursive linked-CSS dependency collection is bounded to 512 parsed references, eight CSS levels, 255 support assets per entry, and 256 total multipart byte parts. Text entries have no CLI-specific byte ceiling. The parsers require complete UTF-8 input, so the CLI temporarily holds parser text while retaining only discovered references afterward; upload bytes and daemon ingestion remain streamed. First-use depth-first order is stable. Local paths are percent-decoded once, normalized to slash-separated relative paths, contained by canonical entry-directory paths, and opened before the request begins. Remote schemes, protocol-relative URLs, fragments, and data or blob URLs are never fetched. Inline `<style>` content and `style` attributes remain deferred to the renderer slice.

@@ -18,8 +18,8 @@ pub use classification::ArtifactRenderer;
 pub use lifecycle::LifecycleReport;
 pub(crate) use publication::PublicationStagingWriter;
 pub use publication::{
-    PostRecord, PublicationFile, PublicationIdentity, PublicationRequest, PublicationSupportAsset,
-    PublishedPublication, StagedPublicationBlob,
+    GitProvenance, PostRecord, PublicationFile, PublicationIdentity, PublicationRequest,
+    PublicationSupportAsset, PublishedPublication, StagedPublicationBlob,
 };
 pub(crate) use read::AssociatedArtifact;
 pub use read::{
@@ -27,7 +27,7 @@ pub use read::{
     ProjectRead, SessionRead, SupportAssetRead,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
 const PUBLIC_ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const INITIAL_PUBLIC_ID_LENGTH: usize = 6;
@@ -161,6 +161,14 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE post_files ADD COLUMN media_type TEXT NOT NULL DEFAULT 'application/octet-stream';
             ALTER TABLE post_files ADD COLUMN renderer TEXT NOT NULL DEFAULT 'download'
                 CHECK (renderer IN ('image','svg','pdf','video','audio','markdown','text','json','csv','html','download'));
+        "#,
+    },
+    Migration {
+        version: 6,
+        sql: r#"
+            ALTER TABLE posts ADD COLUMN git_root TEXT;
+            ALTER TABLE posts ADD COLUMN git_branch TEXT;
+            ALTER TABLE posts ADD COLUMN git_commit TEXT;
         "#,
     },
 ];
@@ -499,6 +507,8 @@ pub enum StoreError {
     BlankPublicationTitle,
     BlankPublicationCommentary,
     PublicationRequiresFile,
+    InvalidGitProvenance,
+    InvalidPostMetadata,
     PredecessorNotFound {
         post_id: i64,
     },
@@ -566,6 +576,8 @@ impl fmt::Display for StoreError {
             Self::PublicationRequiresFile => {
                 formatter.write_str("publication requires at least one visible file")
             }
+            Self::InvalidGitProvenance => formatter.write_str("invalid Git provenance"),
+            Self::InvalidPostMetadata => formatter.write_str("invalid persisted post metadata"),
             Self::PredecessorNotFound { post_id } => {
                 write!(formatter, "predecessor post {post_id} was not found")
             }
@@ -615,6 +627,8 @@ impl Error for StoreError {
             | Self::BlankPublicationTitle
             | Self::BlankPublicationCommentary
             | Self::PublicationRequiresFile
+            | Self::InvalidGitProvenance
+            | Self::InvalidPostMetadata
             | Self::PredecessorNotFound { .. }
             | Self::CrossSessionPredecessor { .. }
             | Self::DuplicateSupportPath { .. }
@@ -797,7 +811,7 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::InvalidMigrationPlan {
-                expected: 5,
+                expected: 6,
                 found: 0
             }
         ));
