@@ -33,8 +33,8 @@ struct Health {
     version: &'static str,
 }
 
-/// Builds the compatibility application. Stateful v1 routes remain present and
-/// return `storage_unavailable`; persistent daemon root/config wiring is deferred.
+/// Builds the compatibility application without a configured store. Stateful v1
+/// routes remain present and return `storage_unavailable`.
 pub fn app() -> Router {
     app_with_state(api::ApiState::default())
 }

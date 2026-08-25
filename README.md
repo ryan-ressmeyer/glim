@@ -1,8 +1,8 @@
 # Glimse
 
-Glimse is an ephemeral browser feed for visual output produced by terminal-based AI agents. Agents will publish images, PDFs, video, audio, rendered documents, and structured text through the `glim` command. A local web service will present those results with the agent's commentary in a session-scoped feed.
+Glimse is a local service for visual output produced by terminal-based AI agents. The Phase 2B daemon listens on loopback and persists metadata and uploaded bytes under a per-user store root. It implements session resolution and lookup, scoped post listing and lookup, visible-session heartbeats, session close, and streaming multipart publication through the versioned HTTP API.
 
-Phase 0 provides the HTTP application and embedded frontend foundation. `GET /api/v1/health` reports the package version, and `/` serves the compiled Glimse web component from the binary. Sessions, publication, storage, authentication, and renderers remain deferred to later phases.
+The API is usable directly with HTTP clients such as `curl`. The checked contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). A CLI, artifact-byte serving, MIME validation, the live viewer and media renderers, authentication, and service management remain pending. The embedded frontend is still a foundation; published artifacts are not browser-viewable yet.
 
 The agreed product design is recorded in [`docs/product-design.md`](docs/product-design.md). The dependency-ordered build plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
@@ -31,14 +31,19 @@ make check-frontend  # Run TypeScript checks, frontend tests, and the production
 make check           # Run every frontend and Rust check
 ```
 
-Clippy runs with warnings denied. Cargo commands use `Cargo.lock`, and frontend installation uses `web/package-lock.json`. Run the development server after building.
+Clippy runs with warnings denied. Cargo commands use `Cargo.lock`, and frontend installation uses `web/package-lock.json`. Run the daemon after building.
 
 ```bash
 make build
 cargo run --locked
 ```
 
-The Phase 0 binary listens on `127.0.0.1:3030`. Network configuration belongs to a later phase.
+The daemon listens on `127.0.0.1:3030`. It selects the store root from `GLIM_STORE_ROOT`, then `$XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. Use an absolute `GLIM_STORE_ROOT` for an isolated development store.
+
+```bash
+GLIM_STORE_ROOT=/tmp/glim-store cargo run --locked
+curl http://127.0.0.1:3030/api/v1/health
+```
 
 The frontend build writes `web/dist/index.html` and `web/dist/assets/app.js`. Rust embeds both files with `include_str!` and `include_bytes!`, so the resulting binary does not read frontend files at runtime.
 

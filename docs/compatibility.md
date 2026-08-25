@@ -1,6 +1,6 @@
 # Compatibility policies
 
-These policies apply when the corresponding interfaces are introduced. Phase 0 has no SQLite schema or CLI JSON command yet.
+These policies apply to the interfaces implemented so far. CLI JSON commands remain pending.
 
 ## SQLite migrations
 
@@ -17,7 +17,7 @@ These policies apply when the corresponding interfaces are introduced. Phase 0 h
 - Removing or renaming a field, changing its type or meaning, or otherwise requiring client changes introduces a new major API path. Old and new major versions receive a documented overlap period before removal.
 - The health response in v1 keeps `ok` as a boolean and `version` as a string.
 
-### Phase 2A v1 contract
+### Current v1 contract
 
 The checked contract is `docs/openapi-v1.json`. It covers health, session resolution and lookup, post lookup and scoped listing, heartbeat, close, and Phase 2B multipart publication. Artifact-byte serving is not part of this contract.
 

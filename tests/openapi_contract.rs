@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 #[test]
-fn openapi_paths_and_methods_exactly_match_phase_2a_routes() {
+fn openapi_paths_and_methods_exactly_match_current_api_routes() {
     let document: Value = serde_json::from_str(include_str!("../docs/openapi-v1.json")).unwrap();
     assert_eq!(document["openapi"], "3.1.0");
     let documented = document["paths"]

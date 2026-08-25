@@ -384,6 +384,69 @@ fn version_two_posts_migrate_with_a_signed_publication_timestamp() {
 }
 
 #[test]
+fn populated_version_three_store_backfills_deterministic_support_asset_positions() {
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path()).unwrap();
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/legacy-v3-populated.sql"))
+        .unwrap();
+    drop(connection);
+
+    let reopened = Store::open(root.path()).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 4);
+    let post = reopened.post(1).unwrap();
+    let read_paths = post
+        .files
+        .iter()
+        .map(|file| {
+            file.support_assets
+                .iter()
+                .map(|asset| asset.relative_path.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_paths,
+        [
+            vec!["a-first.js", "m-middle.js", "z-last.css"],
+            vec!["images/a.png", "images/z.png"],
+        ]
+    );
+    drop(reopened);
+
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    let migrated_assets = connection
+        .prepare(
+            "SELECT entry_file_id, id, relative_path, position
+             FROM support_assets
+             ORDER BY entry_file_id, position",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        migrated_assets,
+        [
+            (10, 101, "a-first.js".to_owned(), 0),
+            (10, 102, "m-middle.js".to_owned(), 1),
+            (10, 103, "z-last.css".to_owned(), 2),
+            (20, 201, "images/a.png".to_owned(), 0),
+            (20, 202, "images/z.png".to_owned(), 1),
+        ]
+    );
+}
+
+#[test]
 fn newer_schema_version_returns_typed_incompatibility_error() {
     let root = TempDir::new().unwrap();
     std::fs::create_dir_all(root.path()).unwrap();
