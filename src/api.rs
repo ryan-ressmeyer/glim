@@ -1,10 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        OriginalUri, Path, Query, State,
+        DefaultBodyLimit, Multipart, OriginalUri, Path, Query, State,
+        multipart::MultipartRejection,
         rejection::{BytesRejection, JsonRejection, QueryRejection},
     },
     http::{Request, StatusCode},
@@ -15,7 +20,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::storage::{ActivityReport, LifecycleReport, PageRequest, Store, StoreError};
+use crate::storage::{
+    ActivityReport, LifecycleReport, PageRequest, PublicationFile, PublicationIdentity,
+    PublicationRequest, PublicationStagingWriter, PublicationSupportAsset, PublishedPublication,
+    Store, StoreError,
+};
+
+const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_DECLARED_PARTS: usize = 256;
 
 #[derive(Clone, Default)]
 pub(crate) struct ApiState {
@@ -41,6 +53,10 @@ pub(crate) fn routes() -> Router<ApiState> {
         .route("/sessions/{public_id}/heartbeat", post(heartbeat))
         .route("/projects/{project_id}/posts", get(project_posts))
         .route("/posts", get(global_posts))
+        .route(
+            "/posts",
+            post(publish_post).route_layer(DefaultBodyLimit::disable()),
+        )
         .route("/posts/{post_id}", get(get_post))
 }
 
@@ -174,6 +190,325 @@ async fn get_session(
     Ok(Json(
         with_store(state, move |store| store.session(&public_id)).await?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationManifest {
+    pub integration_namespace: String,
+    pub external_key: String,
+    pub project_label: String,
+    pub working_directory: String,
+    pub title: String,
+    pub commentary: String,
+    pub predecessor_post_id: Option<i64>,
+    pub files: Vec<ManifestFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestFile {
+    pub part: String,
+    pub filename: String,
+    pub caption: Option<String>,
+    #[serde(default)]
+    pub support_assets: Vec<ManifestSupportAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestSupportAsset {
+    pub part: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PublicationResponse {
+    session: crate::storage::SessionRead,
+    post: crate::storage::PostRead,
+}
+
+async fn publish_post(
+    State(state): State<ApiState>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<(StatusCode, Json<PublicationResponse>), ApiError> {
+    let mut multipart = multipart.map_err(|_| {
+        ApiError::multipart(
+            StatusCode::BAD_REQUEST,
+            "malformed_multipart",
+            "Multipart request is malformed",
+        )
+    })?;
+    let mut manifest_field = multipart
+        .next_field()
+        .await
+        .map_err(|_| {
+            ApiError::multipart(
+                StatusCode::BAD_REQUEST,
+                "multipart_stream_error",
+                "Multipart request stream was interrupted",
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::multipart(
+                StatusCode::BAD_REQUEST,
+                "manifest_must_be_first",
+                "The first multipart part must be manifest",
+            )
+        })?;
+    if manifest_field.name() != Some("manifest") {
+        return Err(ApiError::multipart(
+            StatusCode::BAD_REQUEST,
+            "manifest_must_be_first",
+            "The first multipart part must be manifest",
+        ));
+    }
+    let mut manifest_bytes = Vec::new();
+    while let Some(chunk) = manifest_field.chunk().await.map_err(|_| {
+        ApiError::multipart(
+            StatusCode::BAD_REQUEST,
+            "multipart_stream_error",
+            "Multipart request stream was interrupted",
+        )
+    })? {
+        if manifest_bytes.len().saturating_add(chunk.len()) > MAX_MANIFEST_BYTES {
+            return Err(ApiError::multipart(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "manifest_too_large",
+                "Publication manifest exceeds 64 KiB",
+            ));
+        }
+        manifest_bytes.extend_from_slice(&chunk);
+    }
+    drop(manifest_field);
+    let manifest_text = std::str::from_utf8(&manifest_bytes).map_err(|_| {
+        ApiError::multipart(
+            StatusCode::BAD_REQUEST,
+            "manifest_not_utf8",
+            "Publication manifest must be UTF-8",
+        )
+    })?;
+    let manifest: PublicationManifest = serde_json::from_str(manifest_text).map_err(|_| {
+        ApiError::multipart(
+            StatusCode::BAD_REQUEST,
+            "malformed_manifest",
+            "Publication manifest JSON is malformed or contains unknown fields",
+        )
+    })?;
+    let declared = validate_manifest(&manifest)?;
+
+    let mut staged = HashMap::with_capacity(declared.len());
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| {
+        ApiError::multipart(
+            StatusCode::BAD_REQUEST,
+            "multipart_stream_error",
+            "Multipart request stream was interrupted",
+        )
+    })? {
+        let name = field
+            .name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                ApiError::multipart(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_part_name",
+                    "Every artifact part must have a nonempty name",
+                )
+            })?
+            .to_owned();
+        if name == "manifest" {
+            return Err(ApiError::multipart(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "duplicate_manifest",
+                "The manifest part may appear only once",
+            ));
+        }
+        if !declared.contains(&name) {
+            return Err(ApiError::multipart(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unexpected_part",
+                "Multipart request contains an undeclared part",
+            ));
+        }
+        if staged.contains_key(&name) {
+            return Err(ApiError::multipart(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "duplicate_part",
+                "A declared artifact part appeared more than once",
+            ));
+        }
+        let mut writer =
+            with_store(state.clone(), |store| store.publication_staging_writer()).await?;
+        while let Some(chunk) = field.chunk().await.map_err(|_| {
+            ApiError::multipart(
+                StatusCode::BAD_REQUEST,
+                "multipart_stream_error",
+                "Multipart request stream was interrupted",
+            )
+        })? {
+            writer = write_staging_chunk(writer, chunk).await?;
+        }
+        staged.insert(name, finish_staging_writer(writer).await?);
+    }
+    if staged.len() != declared.len() {
+        return Err(ApiError::multipart(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "missing_part",
+            "One or more declared artifact parts are missing",
+        ));
+    }
+
+    let identity = PublicationIdentity {
+        integration_namespace: manifest.integration_namespace,
+        external_key: manifest.external_key,
+        project_label: manifest.project_label,
+        working_directory: manifest.working_directory,
+    };
+    let files = manifest
+        .files
+        .into_iter()
+        .map(|file| {
+            let support_assets = file
+                .support_assets
+                .into_iter()
+                .map(|asset| PublicationSupportAsset {
+                    relative_path: asset.relative_path,
+                    blob: staged
+                        .remove(&asset.part)
+                        .expect("validated part is staged"),
+                })
+                .collect();
+            PublicationFile {
+                filename: file.filename,
+                caption: file.caption,
+                blob: staged.remove(&file.part).expect("validated part is staged"),
+                support_assets,
+            }
+        })
+        .collect();
+    let request = PublicationRequest {
+        session_public_id: String::new(),
+        title: manifest.title,
+        commentary: manifest.commentary,
+        predecessor_post_id: manifest.predecessor_post_id,
+        files,
+    };
+    let published_at = daemon_unix_seconds()?;
+    let PublishedPublication { session, post } = with_store(state, move |store| {
+        store.publish_resolving_at(identity, request, published_at)
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PublicationResponse { session, post }),
+    ))
+}
+
+fn daemon_unix_seconds() -> Result<i64, ApiError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ApiError::internal())?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| ApiError::internal())
+}
+
+fn validate_manifest(manifest: &PublicationManifest) -> Result<HashSet<String>, ApiError> {
+    for (field, value) in [
+        (
+            "integration_namespace",
+            manifest.integration_namespace.as_str(),
+        ),
+        ("external_key", manifest.external_key.as_str()),
+        ("project_label", manifest.project_label.as_str()),
+        ("working_directory", manifest.working_directory.as_str()),
+        ("title", manifest.title.as_str()),
+        ("commentary", manifest.commentary.as_str()),
+    ] {
+        validate_nonblank(field, value)?;
+    }
+    if manifest.files.is_empty() {
+        return Err(ApiError::multipart(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "Publication requires at least one visible file",
+        ));
+    }
+    let count = manifest
+        .files
+        .iter()
+        .map(|file| 1 + file.support_assets.len())
+        .sum::<usize>();
+    if count > MAX_DECLARED_PARTS {
+        return Err(ApiError::multipart(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "manifest_complexity_exceeded",
+            "Publication declares more than 256 byte parts",
+        ));
+    }
+    let mut parts = HashSet::with_capacity(count);
+    for file in &manifest.files {
+        if file.part.is_empty() {
+            return Err(ApiError::multipart(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_part_name",
+                "Declared part names must be nonempty",
+            ));
+        }
+        if !parts.insert(file.part.clone()) {
+            return Err(ApiError::multipart(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "duplicate_part",
+                "Declared part names must be unique",
+            ));
+        }
+        let mut paths = HashSet::new();
+        for asset in &file.support_assets {
+            if asset.part.is_empty() {
+                return Err(ApiError::multipart(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_part_name",
+                    "Declared part names must be nonempty",
+                ));
+            }
+            if !parts.insert(asset.part.clone()) {
+                return Err(ApiError::multipart(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "duplicate_part",
+                    "Declared part names must be unique",
+                ));
+            }
+            if !paths.insert(asset.relative_path.as_str()) {
+                return Err(ApiError::multipart(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "duplicate_support_path",
+                    "Support paths must be unique within a visible file",
+                ));
+            }
+        }
+    }
+    Ok(parts)
+}
+
+async fn write_staging_chunk(
+    mut writer: PublicationStagingWriter,
+    chunk: Bytes,
+) -> Result<PublicationStagingWriter, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        writer.write_chunk(&chunk)?;
+        Ok::<_, StoreError>(writer)
+    })
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(ApiError::from)
+}
+
+async fn finish_staging_writer(
+    writer: PublicationStagingWriter,
+) -> Result<crate::storage::StagedPublicationBlob, ApiError> {
+    tokio::task::spawn_blocking(move || writer.finish())
+        .await
+        .map_err(|_| ApiError::internal())?
+        .map_err(ApiError::from)
 }
 
 async fn get_post(
@@ -351,6 +686,9 @@ impl ApiError {
             "JSON request body is malformed or contains unknown fields",
             json!({}),
         )
+    }
+    fn multipart(status: StatusCode, code: &'static str, message: &'static str) -> Self {
+        Self::new(status, code, message, json!({}))
     }
     fn unavailable() -> Self {
         Self::new(

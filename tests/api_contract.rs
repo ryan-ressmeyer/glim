@@ -4,10 +4,10 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     http::{Request, StatusCode},
 };
-use glim::storage::{PublicationFile, PublicationRequest, Store};
+use glim::storage::{PublicationFile, PublicationRequest, Store, StoreLimits};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -461,6 +461,379 @@ async fn internal_database_errors_are_sanitized() {
     assert!(!serialized.contains("sqlite"));
     assert!(!serialized.contains("no such table"));
     assert!(!serialized.contains(root.path().to_str().unwrap()));
+}
+
+fn multipart_body(boundary: &str, manifest: &Value, parts: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"manifest\"\r\nContent-Type: application/json\r\n\r\n{}\r\n", manifest).as_bytes());
+    for (name, bytes) in parts {
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"ignored-client-name\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+#[tokio::test]
+async fn multipart_publication_preserves_manifest_order_text_assets_and_exact_hashes() {
+    let root = TempDir::new().unwrap();
+    let app = glim::app_with_store(Store::open(root.path()).unwrap());
+    let manifest = json!({
+        "integration_namespace":"pi", "external_key":"stream", "project_label":"Glim",
+        "working_directory":"/identity/only", "title":"Streaming", "commentary":"line one\n\nline two",
+        "files":[
+            {"part":"second-arrival", "filename":"entry.md", "caption":"cap\nline", "support_assets":[{"part":"asset", "relative_path":"z-last.bin"},{"part":"asset-two", "relative_path":"a-first.bin"}]},
+            {"part":"first-arrival", "filename":"raw.bin", "caption":null, "support_assets":[]}
+        ]
+    });
+    let boundary = "glim-boundary";
+    let body = multipart_body(
+        boundary,
+        &manifest,
+        &[
+            ("first-arrival", b"raw"),
+            ("asset-two", b"two"),
+            ("asset", b"asset bytes"),
+            ("second-arrival", b"entry"),
+        ],
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/posts")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let payload: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(payload["session"]["external_key"], "stream");
+    assert_eq!(payload["post"]["commentary"], "line one\n\nline two");
+    assert_eq!(payload["post"]["files"][0]["filename"], "entry.md");
+    assert_eq!(payload["post"]["files"][0]["caption"], "cap\nline");
+    assert_eq!(
+        payload["post"]["files"][0]["blob"]["hash"],
+        "923fe53966c6cd9343e11af776cd4b05be315ea4b200b02e4d5dfb0f929b73bf"
+    );
+    assert_eq!(
+        payload["post"]["files"][0]["support_assets"][0]["relative_path"],
+        "z-last.bin"
+    );
+    assert_eq!(
+        payload["post"]["files"][0]["support_assets"][1]["relative_path"],
+        "a-first.bin"
+    );
+    assert_eq!(payload["post"]["files"][1]["filename"], "raw.bin");
+    let (status, page) = request(app, "GET", "/api/v1/posts", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["posts"][0], payload["post"]);
+}
+
+async fn post_multipart(app: axum::Router, boundary: &str, body: Vec<u8>) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/posts")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let payload =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    (status, payload)
+}
+
+fn minimal_manifest() -> Value {
+    json!({"integration_namespace":"pi","external_key":"errors","project_label":"Glim","working_directory":"/tmp/errors","title":"Title","commentary":"Commentary","files":[{"part":"file","filename":"x.bin","support_assets":[]}]})
+}
+
+fn assert_clean_publication_store(root: &TempDir) {
+    let db = rusqlite::Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    for table in ["projects", "sessions", "posts", "blobs"] {
+        assert_eq!(
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(root.path().join("blobs/publication-staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn multipart_manifest_and_part_contract_errors_are_typed_and_leave_no_state() {
+    let cases = vec![
+        (
+            "artifact-first",
+            b"--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nx\r\n--b--\r\n".to_vec(),
+            "manifest_must_be_first",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "invalid-utf8",
+            b"--b\r\nContent-Disposition: form-data; name=\"manifest\"\r\n\r\n\xff\r\n--b--\r\n"
+                .to_vec(),
+            "manifest_not_utf8",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "bad-json",
+            b"--b\r\nContent-Disposition: form-data; name=\"manifest\"\r\n\r\n{\r\n--b--\r\n"
+                .to_vec(),
+            "malformed_manifest",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "unknown",
+            multipart_body(
+                "b",
+                &json!({"integration_namespace":"pi","external_key":"x","project_label":"G","working_directory":"/x","title":"T","commentary":"C","files":[],"source_path":"/secret"}),
+                &[],
+            ),
+            "malformed_manifest",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "declared-empty-name",
+            multipart_body(
+                "b",
+                &json!({"integration_namespace":"pi","external_key":"x","project_label":"G","working_directory":"/x","title":"T","commentary":"C","files":[{"part":"","filename":"f"}]}),
+                &[],
+            ),
+            "invalid_part_name",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "missing",
+            multipart_body("b", &minimal_manifest(), &[]),
+            "missing_part",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "unexpected",
+            multipart_body("b", &minimal_manifest(), &[("other", b"x")]),
+            "unexpected_part",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "duplicate",
+            multipart_body("b", &minimal_manifest(), &[("file", b"x"), ("file", b"y")]),
+            "duplicate_part",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "second-manifest",
+            multipart_body("b", &minimal_manifest(), &[("manifest", b"{}")]),
+            "duplicate_manifest",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ];
+    for (name, body, code, status) in cases {
+        let root = TempDir::new().unwrap();
+        let app = glim::app_with_store(Store::open(root.path()).unwrap());
+        let (actual_status, payload) = post_multipart(app, "b", body).await;
+        assert_eq!(actual_status, status, "{name}: {payload}");
+        assert_eq!(payload["error"]["code"], code, "{name}");
+        assert_clean_publication_store(&root);
+    }
+}
+
+#[tokio::test]
+async fn manifest_size_and_declared_part_complexity_are_bounded() {
+    let root = TempDir::new().unwrap();
+    let app = glim::app_with_store(Store::open(root.path()).unwrap());
+    let huge = json!({"integration_namespace":"pi","external_key":"x","project_label":"G","working_directory":"/x","title":"T","commentary":"x".repeat(70_000),"files":[{"part":"f","filename":"f","support_assets":[]}]});
+    let (status, payload) = post_multipart(app, "b", multipart_body("b", &huge, &[])).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(payload["error"]["code"], "manifest_too_large");
+    assert_clean_publication_store(&root);
+
+    let root = TempDir::new().unwrap();
+    let app = glim::app_with_store(Store::open(root.path()).unwrap());
+    let files = (0..257)
+        .map(|i| json!({"part":format!("p{i}"),"filename":"f","support_assets":[]}))
+        .collect::<Vec<_>>();
+    let manifest = json!({"integration_namespace":"pi","external_key":"x","project_label":"G","working_directory":"/x","title":"T","commentary":"C","files":files});
+    let (status, payload) = post_multipart(app, "b", multipart_body("b", &manifest, &[])).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["error"]["code"], "manifest_complexity_exceeded");
+    assert_clean_publication_store(&root);
+}
+
+#[tokio::test]
+async fn multipart_upload_and_aggregate_limits_cleanup_all_stages_and_identity() {
+    for (limits, parts, expected_code) in [
+        (
+            StoreLimits {
+                max_upload_bytes: 3,
+                max_finalized_blob_bytes: 100,
+            },
+            vec![("file", b"abc".as_slice()), ("later", b"four".as_slice())],
+            "upload_limit_exceeded",
+        ),
+        (
+            StoreLimits {
+                max_upload_bytes: 3,
+                max_finalized_blob_bytes: 5,
+            },
+            vec![("file", b"abc".as_slice()), ("later", b"def".as_slice())],
+            "storage_limit_exceeded",
+        ),
+    ] {
+        let root = TempDir::new().unwrap();
+        let app = glim::app_with_store(Store::open_with_limits(root.path(), limits).unwrap());
+        let manifest = json!({"integration_namespace":"pi","external_key":"limit","project_label":"G","working_directory":"/limit","title":"T","commentary":"C","files":[{"part":"file","filename":"a","support_assets":[]},{"part":"later","filename":"b","support_assets":[]}]});
+        let (status, payload) =
+            post_multipart(app, "b", multipart_body("b", &manifest, &parts)).await;
+        assert!(matches!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::INSUFFICIENT_STORAGE
+        ));
+        assert_eq!(payload["error"]["code"], expected_code);
+        assert_clean_publication_store(&root);
+    }
+}
+
+#[tokio::test]
+async fn missing_predecessor_and_sql_failure_rollback_resolved_identity_and_blobs() {
+    let root = TempDir::new().unwrap();
+    let app = glim::app_with_store(Store::open(root.path()).unwrap());
+    let mut manifest = minimal_manifest();
+    manifest["predecessor_post_id"] = json!(999);
+    let (status, payload) = post_multipart(
+        app,
+        "b",
+        multipart_body("b", &manifest, &[("file", b"abc")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["error"]["code"], "post_not_found");
+    assert_clean_publication_store(&root);
+
+    let root = TempDir::new().unwrap();
+    let store = Store::open(root.path()).unwrap();
+    rusqlite::Connection::open(root.path().join("metadata.sqlite3")).unwrap().execute_batch(
+        "CREATE TRIGGER reject_http_publication BEFORE INSERT ON posts BEGIN SELECT RAISE(ABORT, 'forced'); END;"
+    ).unwrap();
+    let app = glim::app_with_store(store);
+    let (status, payload) = post_multipart(
+        app,
+        "b",
+        multipart_body("b", &minimal_manifest(), &[("file", b"abc")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(payload["error"]["code"], "storage_constraint_conflict");
+    assert_clean_publication_store(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_or_cancelled_multipart_does_not_hold_store_mutex_and_cleans_stage() {
+    use tokio_stream::wrappers::ReceiverStream;
+    let root = TempDir::new().unwrap();
+    let app = glim::app_with_store(Store::open(root.path()).unwrap());
+    let manifest = minimal_manifest();
+    let prefix = format!(
+        "--b\r\nContent-Disposition: form-data; name=\"manifest\"\r\n\r\n{manifest}\r\n--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\npartial"
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+    tx.send(Ok(Bytes::from(prefix))).await.unwrap();
+    let request_app = app.clone();
+    let task = tokio::spawn(async move {
+        request_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/posts")
+                    .header("content-type", "multipart/form-data; boundary=b")
+                    .body(Body::from_stream(ReceiverStream::new(rx)))
+                    .unwrap(),
+            )
+            .await
+    });
+    let staging = root.path().join("blobs/publication-staging");
+    for _ in 0..100 {
+        if std::fs::read_dir(&staging).unwrap().count() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        std::fs::read_dir(&staging).unwrap().count() > 0,
+        "stream never began staging"
+    );
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        request(app.clone(), "GET", "/api/v1/posts", None),
+    )
+    .await;
+    assert!(read.is_ok(), "paused multipart held the SQLite mutex");
+    task.abort();
+    drop(tx);
+    for _ in 0..100 {
+        if std::fs::read_dir(&staging).unwrap().count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_clean_publication_store(&root);
+}
+
+#[tokio::test]
+async fn interrupted_multipart_stream_returns_typed_error_and_cleans_stage() {
+    use tokio_stream::wrappers::ReceiverStream;
+    let root = TempDir::new().unwrap();
+    let app = glim::app_with_store(Store::open(root.path()).unwrap());
+    let prefix = format!(
+        "--b\r\nContent-Disposition: form-data; name=\"manifest\"\r\n\r\n{}\r\n--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\npartial",
+        minimal_manifest()
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    tx.send(Ok::<_, std::io::Error>(Bytes::from(prefix)))
+        .await
+        .unwrap();
+    tx.send(Err(std::io::Error::other("disconnected")))
+        .await
+        .unwrap();
+    drop(tx);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/posts")
+                .header("content-type", "multipart/form-data; boundary=b")
+                .body(Body::from_stream(ReceiverStream::new(rx)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(payload["error"]["code"], "multipart_stream_error");
+    assert_clean_publication_store(&root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

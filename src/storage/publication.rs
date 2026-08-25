@@ -9,10 +9,28 @@ use std::{
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-use super::{BlobHash, Store, StoreError, blob, unix_seconds_now};
+use super::{
+    BlobHash, INITIAL_PUBLIC_ID_LENGTH, PostRead, SessionRead, Store, StoreError, blob,
+    generate_public_id, unix_seconds_now,
+};
 
 const PUBLICATION_STAGING_DIRECTORY: &str = "publication-staging";
 const STREAM_BUFFER_SIZE: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct PublicationStagingWriter {
+    root: PathBuf,
+    staging_directory: PathBuf,
+    lock_path: PathBuf,
+    data_path: PathBuf,
+    journal_path: PathBuf,
+    lock_file: Option<File>,
+    data_file: Option<File>,
+    hasher: Option<Sha256>,
+    byte_size: u64,
+    max_upload_bytes: u64,
+    cleaned: bool,
+}
 
 #[derive(Debug)]
 pub struct StagedPublicationBlob {
@@ -42,6 +60,14 @@ pub struct PublicationFile {
     pub support_assets: Vec<PublicationSupportAsset>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationIdentity {
+    pub integration_namespace: String,
+    pub external_key: String,
+    pub project_label: String,
+    pub working_directory: String,
+}
+
 #[derive(Debug)]
 pub struct PublicationRequest {
     pub session_public_id: String,
@@ -49,6 +75,12 @@ pub struct PublicationRequest {
     pub commentary: String,
     pub predecessor_post_id: Option<i64>,
     pub files: Vec<PublicationFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPublication {
+    pub session: SessionRead,
+    pub post: PostRead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +100,22 @@ impl Store {
         &self,
         mut source: impl Read,
     ) -> Result<StagedPublicationBlob, StoreError> {
-        StagedPublicationBlob::create(&self.root, &mut source, self.limits.max_upload_bytes)
+        let mut writer = self.publication_staging_writer()?;
+        let mut buffer = [0_u8; STREAM_BUFFER_SIZE];
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            writer.write_chunk(&buffer[..read])?;
+        }
+        writer.finish()
+    }
+
+    pub(crate) fn publication_staging_writer(
+        &self,
+    ) -> Result<PublicationStagingWriter, StoreError> {
+        PublicationStagingWriter::create(&self.root, self.limits.max_upload_bytes)
     }
 
     pub fn publish(&mut self, request: PublicationRequest) -> Result<PostRecord, StoreError> {
@@ -80,22 +127,58 @@ impl Store {
         request: PublicationRequest,
         published_at: i64,
     ) -> Result<PostRecord, StoreError> {
+        self.publish_internal(None, request, published_at)
+    }
+
+    pub fn publish_resolving_at(
+        &mut self,
+        identity: PublicationIdentity,
+        request: PublicationRequest,
+        published_at: i64,
+    ) -> Result<PublishedPublication, StoreError> {
+        let record = self.publish_internal(Some(identity), request, published_at)?;
+        Ok(PublishedPublication {
+            session: self.session(&record.session_public_id)?,
+            post: self.post(record.id)?,
+        })
+    }
+
+    pub fn publish_resolving(
+        &mut self,
+        identity: PublicationIdentity,
+        request: PublicationRequest,
+    ) -> Result<PublishedPublication, StoreError> {
+        self.publish_resolving_at(identity, request, unix_seconds_now()?)
+    }
+
+    fn publish_internal(
+        &mut self,
+        identity: Option<PublicationIdentity>,
+        mut request: PublicationRequest,
+        published_at: i64,
+    ) -> Result<PostRecord, StoreError> {
         validate_request(&request, &self.root, self.limits.max_upload_bytes)?;
 
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let mut installed = Vec::new();
         let result = (|| {
-            let session_id = self
-                .connection
-                .query_row(
-                    "SELECT id FROM sessions WHERE public_id = ?1",
-                    [&request.session_public_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
-                .ok_or_else(|| StoreError::SessionNotFound {
-                    public_id: request.session_public_id.clone(),
-                })?;
+            let session_id = if let Some(identity) = identity.as_ref() {
+                let (session_id, public_id) =
+                    resolve_publication_identity(&self.connection, identity, published_at)?;
+                request.session_public_id = public_id;
+                session_id
+            } else {
+                self.connection
+                    .query_row(
+                        "SELECT id FROM sessions WHERE public_id = ?1",
+                        [&request.session_public_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| StoreError::SessionNotFound {
+                        public_id: request.session_public_id.clone(),
+                    })?
+            };
 
             validate_predecessor(&self.connection, request.predecessor_post_id, session_id)?;
 
@@ -220,14 +303,20 @@ impl Store {
                     ],
                 )?;
                 let entry_file_id = self.connection.last_insert_rowid();
-                for asset in &file.support_assets {
+                for (position, asset) in file.support_assets.iter().enumerate() {
                     let reference_id =
                         insert_reference(&self.connection, post_id, &asset.blob.hash)?;
                     self.connection.execute(
                         "INSERT INTO support_assets
-                         (post_id, entry_file_id, blob_reference_id, relative_path)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![post_id, entry_file_id, reference_id, asset.relative_path],
+                         (post_id, entry_file_id, blob_reference_id, relative_path, position)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            post_id,
+                            entry_file_id,
+                            reference_id,
+                            asset.relative_path,
+                            i64::try_from(position).expect("support asset count exceeds i64")
+                        ],
                     )?;
                 }
             }
@@ -278,6 +367,60 @@ impl Store {
             Some(error) => Err(error.into()),
             None => Err(original_error),
         }
+    }
+}
+
+fn resolve_publication_identity(
+    connection: &rusqlite::Connection,
+    identity: &PublicationIdentity,
+    created_at: i64,
+) -> Result<(i64, String), StoreError> {
+    connection.execute(
+        "INSERT INTO projects (label, working_directory) VALUES (?1, ?2)
+         ON CONFLICT(working_directory) DO UPDATE SET label = excluded.label",
+        params![identity.project_label, identity.working_directory],
+    )?;
+    let project_id = connection.query_row(
+        "SELECT id FROM projects WHERE working_directory = ?1",
+        [&identity.working_directory],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if let Some(found) = connection
+        .query_row(
+            "SELECT id, public_id FROM sessions
+             WHERE integration_namespace = ?1 AND external_key = ?2 AND project_id = ?3",
+            params![
+                identity.integration_namespace,
+                identity.external_key,
+                project_id
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        return Ok(found);
+    }
+
+    let mut length = INITIAL_PUBLIC_ID_LENGTH;
+    loop {
+        let public_id = generate_public_id(length)?;
+        let inserted = connection.execute(
+            "INSERT INTO sessions
+             (public_id, integration_namespace, external_key, project_id, created_at, last_activity_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(public_id) DO NOTHING",
+            params![
+                public_id,
+                identity.integration_namespace,
+                identity.external_key,
+                project_id,
+                created_at
+            ],
+        )?;
+        if inserted == 1 {
+            return Ok((connection.last_insert_rowid(), public_id));
+        }
+        length = length.checked_add(1).ok_or(StoreError::PublicIdExhausted)?;
     }
 }
 
@@ -402,15 +545,11 @@ fn insert_reference(
     Ok(connection.last_insert_rowid())
 }
 
-impl StagedPublicationBlob {
-    fn create(
-        root: &Path,
-        source: &mut impl Read,
-        max_upload_bytes: u64,
-    ) -> Result<Self, StoreError> {
+impl PublicationStagingWriter {
+    fn create(root: &Path, max_upload_bytes: u64) -> Result<Self, StoreError> {
         let staging_directory = root.join("blobs").join(PUBLICATION_STAGING_DIRECTORY);
         fs::create_dir_all(&staging_directory)?;
-        let (lock_path, data_path, journal_path, lock_file, mut data_file) = loop {
+        loop {
             let token = blob::random_hex_token()?;
             let lock_path = staging_directory.join(format!("{token}.lock"));
             let data_path = staging_directory.join(format!("{token}.part"));
@@ -425,79 +564,111 @@ impl StagedPublicationBlob {
                 Err(error) => return Err(error.into()),
             };
             lock_file.try_lock().map_err(io::Error::from)?;
-            match OpenOptions::new()
+            let data_file = match OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&data_path)
             {
-                Ok(data_file) => break (lock_path, data_path, journal_path, lock_file, data_file),
+                Ok(file) => file,
                 Err(error) => {
                     let _ = fs::remove_file(&lock_path);
                     return Err(error.into());
                 }
-            }
-        };
-
-        let mut hasher = Sha256::new();
-        let mut byte_size = 0_u64;
-        let mut buffer = [0_u8; STREAM_BUFFER_SIZE];
-        let staged_result = (|| {
-            loop {
-                let read = source.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                let attempted = byte_size
-                    .checked_add(u64::try_from(read).expect("usize read count exceeds u64"))
-                    .ok_or_else(|| io::Error::other("blob byte count overflow"))?;
-                if attempted > max_upload_bytes {
-                    return Err(StoreError::UploadLimitExceeded {
-                        limit: max_upload_bytes,
-                        attempted,
-                    });
-                }
-                data_file.write_all(&buffer[..read])?;
-                hasher.update(&buffer[..read]);
-                byte_size = attempted;
-            }
-            data_file.sync_all()?;
-            let hash = BlobHash::parse(&format!("{:x}", hasher.finalize()))
-                .expect("SHA-256 formatting is canonical");
-            write_journal_state(
-                &staging_directory,
-                &journal_path,
-                "staged",
-                &hash,
-                byte_size,
-            )?;
-            Ok(hash)
-        })();
-
-        match staged_result {
-            Ok(hash) => Ok(Self {
+            };
+            return Ok(Self {
                 root: root.to_owned(),
                 staging_directory,
                 lock_path,
                 data_path,
                 journal_path,
-                lock_file,
-                hash,
-                byte_size,
+                lock_file: Some(lock_file),
+                data_file: Some(data_file),
+                hasher: Some(Sha256::new()),
+                byte_size: 0,
+                max_upload_bytes,
                 cleaned: false,
-                retain_for_recovery: Cell::new(false),
-            }),
-            Err(error) => {
-                drop(data_file);
-                let _ = blob::remove_if_exists(&data_path);
-                let _ = blob::remove_if_exists(&journal_path.with_extension("next"));
-                let _ = blob::remove_if_exists(&journal_path);
-                let _ = blob::remove_if_exists(&lock_path);
-                let _ = blob::sync_directory(&staging_directory);
-                Err(error)
-            }
+            });
         }
     }
 
+    pub(crate) fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let attempted = self
+            .byte_size
+            .checked_add(u64::try_from(bytes.len()).expect("chunk size exceeds u64"))
+            .ok_or_else(|| io::Error::other("blob byte count overflow"))?;
+        if attempted > self.max_upload_bytes {
+            return Err(StoreError::UploadLimitExceeded {
+                limit: self.max_upload_bytes,
+                attempted,
+            });
+        }
+        self.data_file
+            .as_mut()
+            .expect("writer is active")
+            .write_all(bytes)?;
+        self.hasher
+            .as_mut()
+            .expect("writer is active")
+            .update(bytes);
+        self.byte_size = attempted;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<StagedPublicationBlob, StoreError> {
+        self.data_file
+            .as_mut()
+            .expect("writer is active")
+            .sync_all()?;
+        let hash = BlobHash::parse(&format!(
+            "{:x}",
+            self.hasher.take().expect("writer is active").finalize()
+        ))
+        .expect("SHA-256 formatting is canonical");
+        write_journal_state(
+            &self.staging_directory,
+            &self.journal_path,
+            "staged",
+            &hash,
+            self.byte_size,
+        )?;
+        self.data_file.take();
+        let staged = StagedPublicationBlob {
+            root: self.root.clone(),
+            staging_directory: self.staging_directory.clone(),
+            lock_path: self.lock_path.clone(),
+            data_path: self.data_path.clone(),
+            journal_path: self.journal_path.clone(),
+            lock_file: self.lock_file.take().expect("writer is active"),
+            hash,
+            byte_size: self.byte_size,
+            cleaned: false,
+            retain_for_recovery: Cell::new(false),
+        };
+        self.cleaned = true;
+        Ok(staged)
+    }
+
+    fn cleanup(&mut self) {
+        self.data_file.take();
+        let _ = blob::remove_if_exists(&self.data_path);
+        let _ = blob::remove_if_exists(&self.journal_path.with_extension("next"));
+        let _ = blob::remove_if_exists(&self.journal_path);
+        let _ = blob::remove_if_exists(&self.lock_path);
+        let _ = blob::sync_directory(&self.staging_directory);
+        self.cleaned = true;
+    }
+}
+
+impl Drop for PublicationStagingWriter {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            self.cleanup();
+        }
+        let _ = &self.lock_file;
+    }
+}
+
+impl StagedPublicationBlob {
     fn mark_finalizing(&self) -> Result<(), StoreError> {
         write_journal_state(
             &self.staging_directory,

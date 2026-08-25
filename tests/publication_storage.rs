@@ -8,7 +8,8 @@ use std::{
 };
 
 use glim::storage::{
-    PublicationFile, PublicationRequest, PublicationSupportAsset, Store, StoreError, StoreLimits,
+    PublicationFile, PublicationIdentity, PublicationRequest, PublicationSupportAsset, Store,
+    StoreError, StoreLimits,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -1070,6 +1071,171 @@ fn concurrent_publications_cannot_overcommit_quota_or_expose_partial_posts() {
         1
     );
     assert!(publication_staging_files(&root).is_empty());
+}
+
+fn atomic_request(store: &Store, title: &str, bytes: &[u8]) -> PublicationRequest {
+    one_file_request(store, "", title, "atomic commentary", bytes)
+}
+
+fn identity(key: &str, label: &str, directory: &str) -> PublicationIdentity {
+    PublicationIdentity {
+        integration_namespace: "pi".into(),
+        external_key: key.into(),
+        project_label: label.into(),
+        working_directory: directory.into(),
+    }
+}
+
+#[test]
+fn stateless_publication_resolves_reuses_and_updates_identity_atomically() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let first = store
+        .publish_resolving_at(
+            identity("same", "Old", "/project/a"),
+            atomic_request(&store, "One", b"one"),
+            10,
+        )
+        .unwrap();
+    let reused = store
+        .publish_resolving_at(
+            identity("same", "New", "/project/a"),
+            atomic_request(&store, "Two", b"two"),
+            20,
+        )
+        .unwrap();
+    let isolated = store
+        .publish_resolving_at(
+            identity("same", "Other", "/project/b"),
+            atomic_request(&store, "Three", b"three"),
+            30,
+        )
+        .unwrap();
+
+    assert_eq!(first.session.id, reused.session.id);
+    assert_eq!(reused.session.project.label, "New");
+    assert_ne!(first.session.id, isolated.session.id);
+    assert_eq!(reused.post.session_id, reused.session.id);
+    assert_eq!(reused.post.title, "Two");
+}
+
+#[test]
+fn stateless_publication_rolls_back_new_identity_and_label_on_quota_or_predecessor_failure() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open_with_limits(
+        root.path(),
+        StoreLimits {
+            max_upload_bytes: 16,
+            max_finalized_blob_bytes: 3,
+        },
+    )
+    .unwrap();
+    let accepted = store
+        .publish_resolving_at(
+            identity("existing", "Original", "/existing"),
+            atomic_request(&store, "Accepted", b"abc"),
+            1,
+        )
+        .unwrap();
+
+    let quota = store.publish_resolving_at(
+        identity("new", "New", "/new"),
+        atomic_request(&store, "Rejected", b"def"),
+        2,
+    );
+    assert!(matches!(
+        quota,
+        Err(StoreError::GlobalBlobBudgetExceeded { .. })
+    ));
+    let mut cross = atomic_request(&store, "Cross", b"abc");
+    cross.predecessor_post_id = Some(accepted.post.id);
+    let conflict = store.publish_resolving_at(identity("other", "Changed", "/existing"), cross, 3);
+    assert!(matches!(
+        conflict,
+        Err(StoreError::CrossSessionPredecessor { .. })
+    ));
+
+    let connection = database(&root);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT label FROM projects WHERE working_directory='/existing'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "Original"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM posts", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(publication_staging_files(&root).is_empty());
+}
+
+#[test]
+fn concurrent_stateless_identity_publications_converge_on_one_session() {
+    let root = TempDir::new().unwrap();
+    Store::open(root.path()).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = [b"same".as_slice(), b"same".as_slice()]
+        .into_iter()
+        .map(|bytes| {
+            let path = root.path().to_owned();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut store = Store::open(path).unwrap();
+                let request = atomic_request(&store, "Concurrent", bytes);
+                barrier.wait();
+                store
+                    .publish_resolving_at(identity("shared", "Glim", "/same"), request, 10)
+                    .unwrap()
+                    .session
+                    .id
+            })
+        })
+        .collect::<Vec<_>>();
+    let ids = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids[0], ids[1]);
+    let connection = database(&root);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM posts", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 
 #[test]

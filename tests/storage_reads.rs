@@ -127,9 +127,9 @@ fn reconstructs_session_and_nested_immutable_post_without_refreshing_activity() 
             .iter()
             .map(|a| a.relative_path.as_str())
             .collect::<Vec<_>>(),
-        ["a.png", "z.png"]
+        ["z.png", "a.png"]
     );
-    assert_eq!(post.files[0].support_assets[0].blob.byte_size, 5);
+    assert_eq!(post.files[0].support_assets[0].blob.byte_size, 1);
     assert_eq!(
         store.post(revision.id).unwrap().predecessor_post_id,
         Some(first.id)

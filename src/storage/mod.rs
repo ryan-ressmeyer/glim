@@ -14,15 +14,17 @@ mod read;
 
 pub use blob::{BlobHash, BlobIntegrityError, BlobRecord, InvalidBlobHash};
 pub use lifecycle::LifecycleReport;
+pub(crate) use publication::PublicationStagingWriter;
 pub use publication::{
-    PostRecord, PublicationFile, PublicationRequest, PublicationSupportAsset, StagedPublicationBlob,
+    PostRecord, PublicationFile, PublicationIdentity, PublicationRequest, PublicationSupportAsset,
+    PublishedPublication, StagedPublicationBlob,
 };
 pub use read::{
     BlobRead, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageRequest, PostFileRead, PostPage, PostRead,
     ProjectRead, SessionRead, SupportAssetRead,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
 const PUBLIC_ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const INITIAL_PUBLIC_ID_LENGTH: usize = 6;
@@ -133,6 +135,21 @@ const MIGRATIONS: &[Migration] = &[
             BEGIN
                 SELECT RAISE(ABORT, 'posts are immutable');
             END;
+        "#,
+    },
+    Migration {
+        version: 4,
+        sql: r#"
+            ALTER TABLE support_assets ADD COLUMN position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0);
+            UPDATE support_assets AS current
+            SET position = (
+                SELECT COUNT(*) FROM support_assets AS prior
+                WHERE prior.entry_file_id = current.entry_file_id
+                  AND (prior.relative_path < current.relative_path
+                       OR (prior.relative_path = current.relative_path AND prior.id < current.id))
+            );
+            CREATE UNIQUE INDEX support_assets_entry_position
+            ON support_assets(entry_file_id, position);
         "#,
     },
 ];
@@ -754,7 +771,7 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::InvalidMigrationPlan {
-                expected: 3,
+                expected: 4,
                 found: 0
             }
         ));

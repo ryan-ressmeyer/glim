@@ -19,7 +19,7 @@ These policies apply when the corresponding interfaces are introduced. Phase 0 h
 
 ### Phase 2A v1 contract
 
-The checked contract is `docs/openapi-v1.json`. It covers the Phase 2A health, session resolution and lookup, post lookup and scoped listing, heartbeat, and close operations. Publication transport and artifact-byte serving are not part of this contract.
+The checked contract is `docs/openapi-v1.json`. It covers health, session resolution and lookup, post lookup and scoped listing, heartbeat, close, and Phase 2B multipart publication. Artifact-byte serving is not part of this contract.
 
 All v1 JSON fields use `snake_case`. Request objects reject unknown fields. Errors use one envelope with a stable `error.code`, a human-readable `error.message`, and an object-valued `error.details`. Unknown v1 routes and unsupported methods use the same JSON envelope; malformed v1 paths, queries, and JSON bodies return enveloped `400` responses. Raw SQLite messages, internal paths, and debug representations are not API fields.
 
@@ -27,7 +27,15 @@ A visible-session heartbeat has no request body. The daemon records its wall-clo
 
 Post lists use bounded reverse-publication ordering. The daemon orders posts by `published_at DESC, id DESC`; an exclusive `published_at:post_id` cursor continues after the final post in a page. The default page size is 20 and the maximum is 100. Clients must treat cursors as server-issued values even though the v1 encoding is documented.
 
-Working directories returned with project metadata are identity values supplied during session resolution. The daemon does not read them as source paths. The compatibility `glim::app()` constructor exposes the complete route surface but returns `503 storage_unavailable` for stateful routes. Daemon root and configuration wiring remain a later implementation slice; tests and configured embeddings use `glim::app_with_store(Store)`.
+Working directories returned with project metadata are identity values supplied during session resolution. The daemon does not read them as source paths. The compatibility `glim::app()` constructor exposes the complete route surface but returns `503 storage_unavailable` for stateful routes. Tests and configured embeddings use `glim::app_with_store(Store)`.
+
+### Phase 2B publication and daemon additions
+
+`POST /api/v1/posts` accepts streaming `multipart/form-data`. The first part is a UTF-8 JSON part named `manifest`, limited to 64 KiB. The manifest rejects unknown fields and declares at most 256 uniquely named byte parts. Every declared part must appear exactly once after the manifest; multipart arrival order does not affect visible-file or support-asset order. Stored filenames and support paths come from the manifest. Client content-disposition filenames, declared MIME values, working directories, and other host paths do not grant filesystem-read authority.
+
+The daemon stages each byte part incrementally under the configured per-file upload limit. It resolves the project and session in the same immediate SQLite transaction that checks revisions and quota, finalizes blobs, and inserts the post. The response is `201 application/json` with `session` and `post` read models. Multipart parsing, validation, interruption, quota, revision, filesystem, and database failures use the v1 error envelope.
+
+The runnable binary opens a persistent store before binding `127.0.0.1:3030`. Store-root selection uses `GLIM_STORE_ROOT` first as a development and test override, then nonblank `XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. Startup fails when none is usable. Every leaf store root newly created by the daemon has mode `0700` on Linux, including a new explicit override. An existing explicit override retains its permissions. Phase 4 still owns final configuration precedence, production limits, binding options, authentication, and service management.
 
 ## CLI JSON schemas
 

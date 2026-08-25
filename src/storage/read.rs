@@ -245,7 +245,7 @@ fn load_post(
         let raw_assets = connection.prepare(
             "SELECT a.relative_path, b.hash, b.byte_size FROM support_assets a
              JOIN blob_references r ON r.id = a.blob_reference_id JOIN blobs b ON b.hash = r.blob_hash
-             WHERE a.entry_file_id = ?1 ORDER BY a.relative_path ASC, a.id ASC"
+             WHERE a.entry_file_id = ?1 ORDER BY a.position ASC"
         )?.query_map(params![file_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
         })?.collect::<Result<Vec<_>, _>>()?;

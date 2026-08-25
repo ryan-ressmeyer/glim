@@ -1,4 +1,5 @@
 pub mod api;
+pub mod daemon;
 pub mod storage;
 
 pub const PHASE_2A_ROUTES: &[(&str, &str)] = &[
@@ -10,6 +11,7 @@ pub const PHASE_2A_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/v1/sessions/{public_id}/heartbeat"),
     ("GET", "/api/v1/projects/{project_id}/posts"),
     ("GET", "/api/v1/posts"),
+    ("POST", "/api/v1/posts"),
     ("GET", "/api/v1/posts/{post_id}"),
 ];
 

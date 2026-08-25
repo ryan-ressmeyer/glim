@@ -53,6 +53,32 @@ fn version_one_sessions_migrate_with_fresh_equal_activity_timestamps() {
                  hash TEXT PRIMARY KEY,
                  byte_size INTEGER NOT NULL CHECK (byte_size >= 0)
              );
+             CREATE TABLE blob_references (
+                 id INTEGER PRIMARY KEY,
+                 post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                 blob_hash TEXT NOT NULL REFERENCES blobs(hash),
+                 UNIQUE (id, post_id)
+             );
+             CREATE TABLE post_files (
+                 id INTEGER PRIMARY KEY,
+                 post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                 blob_reference_id INTEGER NOT NULL UNIQUE,
+                 position INTEGER NOT NULL CHECK (position >= 0),
+                 filename TEXT NOT NULL,
+                 caption TEXT,
+                 UNIQUE (id, post_id), UNIQUE (post_id, position),
+                 FOREIGN KEY (blob_reference_id, post_id) REFERENCES blob_references(id, post_id)
+             );
+             CREATE TABLE support_assets (
+                 id INTEGER PRIMARY KEY,
+                 post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                 entry_file_id INTEGER NOT NULL,
+                 blob_reference_id INTEGER NOT NULL UNIQUE,
+                 relative_path TEXT NOT NULL,
+                 UNIQUE (entry_file_id, relative_path),
+                 FOREIGN KEY (entry_file_id, post_id) REFERENCES post_files(id, post_id),
+                 FOREIGN KEY (blob_reference_id, post_id) REFERENCES blob_references(id, post_id)
+             );
              INSERT INTO projects (id, label, working_directory)
              VALUES (1, 'Glim', '/tmp/glim');
              INSERT INTO sessions (id, public_id, integration_namespace, external_key, project_id)
@@ -65,8 +91,8 @@ fn version_one_sessions_migrate_with_fresh_equal_activity_timestamps() {
     drop(connection);
 
     let reopened = Store::open(root.path()).unwrap();
-    assert_eq!(CURRENT_SCHEMA_VERSION, 3);
-    assert_eq!(reopened.schema_version().unwrap(), 3);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+    assert_eq!(reopened.schema_version().unwrap(), 4);
     drop(reopened);
 
     let connection = database(&root);

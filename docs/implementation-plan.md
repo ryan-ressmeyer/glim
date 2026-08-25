@@ -72,7 +72,13 @@ The placeholder binary on `main` marks the planning baseline. Feature work shoul
 
 Phase 2A defines the checked OpenAPI 3.1 contract and implements storage read models plus stateful daemon endpoints for session resolution and lookup, scoped post listing, post lookup, visible-session heartbeat, and session close. Lists are bounded and cursor-based. Storage reads preserve immutable nested post data and do not refresh session activity. Heartbeats use daemon-owned wall-clock time. Every v1 routing and extraction failure uses the JSON error envelope. `app_with_store(Store)` runs synchronous SQLite operations on Tokio's blocking pool behind one shared mutex; `app()` retains the same frontend and health behavior while stateful routes return a stable unavailable error.
 
-This foundation does not satisfy the Phase 2 exit criteria. Publication transport, CLI behavior, content validation, authentication modes, and cancellation cleanup remain pending.
+This foundation does not satisfy the Phase 2 exit criteria.
+
+### Phase 2B streaming publication completed
+
+Phase 2B wires the runnable daemon to a persistent per-user store and adds `POST /api/v1/posts`. The endpoint requires a bounded manifest-first multipart request, stages artifact chunks without holding the shared SQLite mutex, and cleans incomplete stages when parsing fails or a request is cancelled. Publication resolves or creates its project and session inside the same immediate transaction used for predecessor checks, quota enforcement, blob finalization, post insertion, and activity updates. The checked OpenAPI artifact documents the multipart contract, limits, response, and stable error codes.
+
+Phase 2 remains incomplete. CLI publication, source-asset discovery, MIME sniffing and validation, artifact-byte serving, authentication modes, and final configuration precedence remain pending.
 
 ### Scope
 
