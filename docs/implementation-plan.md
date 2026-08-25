@@ -124,7 +124,9 @@ The first Phase 3 slice serves routed session, project, and global feeds from th
 
 The rich-renderer slice adds native video and audio controls without autoplay. An observer pauses offscreen media and releases each source outside a 1,000-pixel vertical margin, then restores the source without starting playback. The bundled PDF.js renderer requests the artifact URL with 64 KiB range chunks and disabled eval support. It creates ordered placeholders for every page, materializes pages within a 1,500-pixel vertical margin, renders at feed width, and keeps at most three canvases per artifact with deterministic least-recently-used eviction. Disconnect and renderer replacement cancel page work, release media and canvas resources, destroy PDF loading tasks, and suppress expected cancellation rejections. Vite emits the bundled worker at `/assets/pdf.worker.mjs`, and Rust embeds that asset with the application script.
 
-These slices do not add SSE, viewport-aware post insertion, heartbeat, close actions, or scripted HTML. Those behaviors remain in the live-feed and HTML renderer slices below, so the Phase 3 exit criteria are not yet satisfied.
+The HTML-renderer slice fetches each entry through its visible artifact route and parses it in a detached document. It removes untrusted base and policy elements, nested frames and plugins, active forms, and external navigation. Declarative resources resolve only through the file's listed support assets. HTML then renders in a unique-origin iframe with scripts disabled, no lifted sandbox tokens, and a deterministic content security policy. An explicit warning can reload the artifact with only `allow-scripts`. Connection APIs and undeclared subresources remain blocked, but a script can navigate its own frame and thereby make a network request. The warning discloses this browser-platform limitation. Disconnects, reconnects, and failures abort entry fetches and destroy iframe browsing contexts.
+
+These slices do not add SSE, viewport-aware post insertion, heartbeat, or close actions. Those behaviors remain in the live-feed slice below, so the Phase 3 exit criteria are not yet satisfied.
 
 ### Scope
 
@@ -146,7 +148,7 @@ These slices do not add SSE, viewport-aware post insertion, heartbeat, close act
 4. Raw text and highlighted code in resizable virtualized panes.
 5. Structured JSON and CSV panes.
 6. PDF.js page-by-page rendering with lazy materialization.
-7. Sandboxed HTML with scripts enabled, unique origin, and network-blocking CSP.
+7. Sandboxed HTML with scripts disabled by default, explicit `allow-scripts` opt-in, unique origin, and a restrictive CSP.
 8. Download fallback for unsupported files.
 
 ### Test-first scenarios
@@ -156,7 +158,8 @@ These slices do not add SSE, viewport-aware post insertion, heartbeat, close act
 - Hidden or disconnected pages do not keep a session active.
 - Offscreen media pauses and releases bounded resources.
 - Range responses handle valid, invalid, suffix, and partial requests.
-- Malicious Markdown, SVG, and HTML cannot access viewer credentials, other posts, or the network.
+- Malicious Markdown and SVG cannot access viewer credentials, other posts, or the network.
+- HTML has no viewer origin privilege; its default mode blocks scripts and network access, while explicit script mode blocks ordinary network APIs and discloses self-navigation egress.
 - PDF, text, JSON, and CSV renderers remain usable within configured file limits.
 - Keyboard and touch interactions work for resizing, fullscreen, zoom, and the new-content indicator.
 

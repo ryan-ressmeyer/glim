@@ -197,6 +197,142 @@ function artifactUrl(postId: number, position: number): string {
   return `${API}/posts/${postId}/files/${position}/content`;
 }
 
+function supportScope(postId: number, file: PostFile): string {
+  return `${API}/posts/${postId}/files/${file.position}/support/`;
+}
+
+function htmlResourceResolver(postId: number, file: PostFile): (value: string) => string | null {
+  const stored = new Set(file.support_assets.map((asset) => asset.relative_path));
+  const scope = supportScope(postId, file);
+  return (raw) => {
+    if (!raw || raw !== raw.trim() || raw.includes("?") || raw.includes("\\") || raw.startsWith("#")) return null;
+    const hashIndex = raw.indexOf("#");
+    const path = hashIndex === -1 ? raw : raw.slice(0, hashIndex);
+    const fragment = hashIndex === -1 ? "" : raw.slice(hashIndex);
+    const firstSegment = path.split("/", 1)[0];
+    if (!path || firstSegment.includes(":") || path.startsWith("/")) return null;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(path);
+    } catch {
+      return null;
+    }
+    if (!decoded || decoded.split("/").some((part) => !part || part === "." || part === "..")
+      || !stored.has(decoded) || Array.from(fragment).some((character) => character.charCodeAt(0) < 32)) return null;
+    const encoded = decoded.split("/").map(encodeURIComponent).join("/");
+    return `${scope}${encoded}${fragment}`;
+  };
+}
+
+function htmlCsp(postId: number, file: PostFile, scripts: boolean): string {
+  const scope = new URL(supportScope(postId, file), window.location.href).href;
+  const scriptSource = scripts ? `'unsafe-inline' ${scope}` : "'none'";
+  return [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "connect-src 'none'",
+    "form-action 'none'",
+    "frame-src 'none'",
+    "object-src 'none'",
+    `script-src ${scriptSource}`,
+    `style-src 'unsafe-inline' data: ${scope}`,
+    `img-src data: ${scope}`,
+    `media-src data: ${scope}`,
+    `font-src data: ${scope}`,
+    "worker-src 'none'",
+  ].join("; ");
+}
+
+function safeDataResource(raw: string, kind: "image" | "media" | "style"): string | null {
+  const lower = raw.toLowerCase();
+  if (kind === "image" && lower.startsWith("data:image/")) return raw;
+  if (kind === "media" && (lower.startsWith("data:audio/") || lower.startsWith("data:video/"))) return raw;
+  if (kind === "style" && lower.startsWith("data:text/css")) return raw;
+  return null;
+}
+
+function rewriteHtmlResource(
+  value: string,
+  resolveSupport: (value: string) => string | null,
+  dataKind?: "image" | "media" | "style",
+): string | null {
+  return resolveSupport(value) ?? (dataKind ? safeDataResource(value, dataKind) : null);
+}
+
+function sanitizeHtmlDocument(source: string, data: ArtifactData, scripts: boolean): string {
+  const documentValue = new DOMParser().parseFromString(source, "text/html");
+  const resolveSupport = htmlResourceResolver(data.postId, data.file);
+
+  documentValue.querySelectorAll("base, iframe, frame, object, embed").forEach((value) => value.remove());
+  documentValue.querySelectorAll("meta").forEach((value) => {
+    const directive = value.getAttribute("http-equiv")?.trim().toLowerCase();
+    const name = value.getAttribute("name")?.trim().toLowerCase();
+    if (directive === "refresh" || directive === "content-security-policy" || name === "referrer") value.remove();
+  });
+  documentValue.querySelectorAll<HTMLElement>("form").forEach((form) => {
+    form.removeAttribute("action");
+    form.removeAttribute("method");
+    form.removeAttribute("target");
+  });
+  documentValue.querySelectorAll<HTMLElement>("input, button, select, textarea").forEach((control) => {
+    control.setAttribute("disabled", "");
+    control.removeAttribute("formaction");
+    control.removeAttribute("formtarget");
+  });
+  documentValue.querySelectorAll<HTMLAnchorElement>("a[href], area[href]").forEach((anchor) => {
+    const href = anchor.getAttribute("href") ?? "";
+    if (!href.startsWith("#")) anchor.removeAttribute("href");
+    anchor.removeAttribute("target");
+    anchor.removeAttribute("ping");
+  });
+
+  documentValue.querySelectorAll<HTMLLinkElement>("link").forEach((link) => {
+    const isStylesheet = link.relList.contains("stylesheet");
+    const replacement = isStylesheet
+      ? rewriteHtmlResource(link.getAttribute("href") ?? "", resolveSupport, "style")
+      : null;
+    if (!isStylesheet || !replacement) link.remove();
+    else link.setAttribute("href", replacement);
+  });
+
+  const srcRules: Array<[string, "image" | "media" | undefined]> = [
+    ["script[src]", undefined],
+    ["img[src]", "image"],
+    ["source[src]", "media"],
+    ["video[src]", "media"],
+    ["audio[src]", "media"],
+    ["track[src]", "media"],
+    ["input[src]", "image"],
+  ];
+  for (const [selector, dataKind] of srcRules) {
+    documentValue.querySelectorAll<HTMLElement>(selector).forEach((value) => {
+      const replacement = rewriteHtmlResource(value.getAttribute("src") ?? "", resolveSupport, dataKind);
+      if (replacement) value.setAttribute("src", replacement);
+      else value.removeAttribute("src");
+    });
+  }
+  documentValue.querySelectorAll<HTMLElement>("video[poster]").forEach((video) => {
+    const replacement = rewriteHtmlResource(video.getAttribute("poster") ?? "", resolveSupport, "image");
+    if (replacement) video.setAttribute("poster", replacement);
+    else video.removeAttribute("poster");
+  });
+  documentValue.querySelectorAll<HTMLElement>("img[srcset], source[srcset]").forEach((value) => {
+    const rewritten = (value.getAttribute("srcset") ?? "").split(",").flatMap((candidate) => {
+      const parts = candidate.trim().split(/\s+/);
+      const replacement = parts[0] ? resolveSupport(parts[0]) : null;
+      return replacement ? [`${replacement}${parts.length > 1 ? ` ${parts.slice(1).join(" ")}` : ""}`] : [];
+    });
+    if (rewritten.length > 0) value.setAttribute("srcset", rewritten.join(", "));
+    else value.removeAttribute("srcset");
+  });
+
+  const csp = documentValue.createElement("meta");
+  csp.setAttribute("http-equiv", "Content-Security-Policy");
+  csp.setAttribute("content", htmlCsp(data.postId, data.file, scripts));
+  documentValue.head.prepend(csp);
+  return `<!doctype html>\n${documentValue.documentElement.outerHTML}`;
+}
+
 function downloadLink(data: ArtifactData, label = `Open or download ${data.file.filename}`): HTMLAnchorElement {
   const link = element("a", label);
   link.href = artifactUrl(data.postId, data.file.position);
@@ -310,6 +446,9 @@ const artifactStyles = `
   .pdf-page { align-items: start; background: #f1f5f9; display: grid; justify-items: center; min-height: 8rem; width: 100%; }
   .pdf-page canvas { display: block; height: auto; max-width: 100%; width: 100%; }
   .pdf-page button { margin: 2rem; }
+  .html-frame { border: 1px solid #cbd5e1; display: block; height: min(60vh, 42rem); max-height: 75vh; min-height: 18rem; width: 100%; }
+  .script-warning { background: #fff7ed; border: 1px solid #fdba74; margin-bottom: .75rem; padding: .75rem; }
+  .script-warning button { display: block; margin-top: .5rem; }
   .download { display: inline-block; margin-top: .5rem; }
 `;
 
@@ -331,6 +470,7 @@ class GlimArtifact extends HTMLElement {
     const generation = ++this.renderGeneration;
     this.controller?.abort();
     this.releaseRichResources();
+    this.destroyHtmlContexts();
     this.removeImageSources();
     this.closeZoom?.(false);
     const root = this.root();
@@ -345,6 +485,7 @@ class GlimArtifact extends HTMLElement {
     this.renderGeneration += 1;
     this.controller?.abort();
     this.releaseRichResources();
+    this.destroyHtmlContexts();
     this.removeImageSources();
     this.closeZoom?.(false);
   }
@@ -420,6 +561,11 @@ class GlimArtifact extends HTMLElement {
       case "csv": {
         const text = await this.fetchText(data, generation);
         if (text !== null && this.isRenderActive(generation)) this.renderCsv(root, text, data);
+        return;
+      }
+      case "html": {
+        const text = await this.fetchText(data, generation);
+        if (text !== null && this.isRenderActive(generation)) this.renderHtml(root, text, data, generation);
         return;
       }
       case "download":
@@ -712,6 +858,48 @@ class GlimArtifact extends HTMLElement {
     root.append(downloadLink(data));
   }
 
+  private renderHtml(root: ShadowRoot, source: string, data: ArtifactData, generation: number) {
+    const warning = element("div");
+    warning.className = "script-warning";
+    warning.dataset.scriptWarning = "";
+    warning.append(document.createTextNode(
+      "Scripts are disabled. Enabling scripts lets this document navigate its own frame and thereby make a network request.",
+    ));
+    const enable = element("button", "Enable sandboxed scripts");
+    enable.type = "button";
+    enable.dataset.enableScripts = "";
+    warning.append(enable);
+
+    const createFrame = (scripts: boolean) => {
+      const frame = element("iframe");
+      frame.className = "html-frame";
+      frame.title = `Rendered HTML: ${data.file.filename}`;
+      frame.referrerPolicy = "no-referrer";
+      frame.setAttribute("sandbox", scripts ? "allow-scripts" : "");
+      frame.srcdoc = sanitizeHtmlDocument(source, data, scripts);
+      return frame;
+    };
+    let frame = createFrame(false);
+    enable.addEventListener("click", () => {
+      if (!this.isRenderActive(generation) || enable.disabled) return;
+      enable.disabled = true;
+      const replacement = createFrame(true);
+      frame.srcdoc = "";
+      frame.removeAttribute("src");
+      frame.replaceWith(replacement);
+      frame = replacement;
+    });
+    root.append(warning, frame, downloadLink(data));
+  }
+
+  private destroyHtmlContexts() {
+    this.shadowRoot?.querySelectorAll<HTMLIFrameElement>("iframe").forEach((frame) => {
+      frame.srcdoc = "";
+      frame.removeAttribute("src");
+      frame.remove();
+    });
+  }
+
   private removeImageSources() {
     this.shadowRoot?.querySelectorAll("img[src]").forEach((image) => image.removeAttribute("src"));
   }
@@ -720,6 +908,7 @@ class GlimArtifact extends HTMLElement {
     const data = this.data;
     if (!data || !this.isConnected) return;
     this.releaseRichResources();
+    this.destroyHtmlContexts();
     const root = this.root();
     root.replaceChildren(root.querySelector("style")!);
     const error = element("div", `Could not render ${data.file.filename}`);

@@ -131,7 +131,9 @@ JSON uses a structured, resizable scroll pane. CSV uses a resizable, scrollable 
 
 ### HTML
 
-HTML runs in a unique sandboxed iframe. Scripts may execute, but the document has no same-origin privilege and a restrictive content security policy blocks network access. All required resources must be included in the post snapshot.
+HTML renders inline in a unique sandboxed iframe with scripts disabled by default. The renderer parses the entry document without attaching it, removes untrusted document policies, nested browsing and plugin elements, disables forms and external navigation, and rewrites declared resources to the exact support-asset routes for that file. A deterministic content security policy blocks connections, forms, frames, objects, undeclared subresources, and scripts in the default mode.
+
+Each artifact includes a warning control that reloads the iframe with only `allow-scripts` added to the sandbox. Script mode permits inline scripts and scripts from that artifact's exact support path. It does not add same-origin access or permit forms, popups, downloads, modals, or top-level navigation. The content security policy keeps `connect-src 'none'` and continues to block undeclared subresources. A script can still navigate its own frame and thereby make a network request because browsers do not provide a sandbox token that blocks self-navigation while allowing scripts. The warning discloses this limitation, and script mode is never automatic.
 
 ### Unsupported files
 

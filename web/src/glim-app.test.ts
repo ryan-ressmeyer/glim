@@ -632,22 +632,162 @@ describe("glim-app public route and element behavior", () => {
     expect(cleanup).toHaveBeenCalled();
   });
 
-  test("uses pending cards and filename-oriented fallback links without active embedding", async () => {
-    const pendingPost = post(60, {
-      files: [file(0, "html", "page.html"), file(1, "download", "archive.bin")],
-    });
+  test("renders HTML in a script-free sandbox with only declared resources and inert navigation surfaces", async () => {
+    const htmlFile = {
+      ...file(0, "html", "page.html"),
+      support_assets: [
+        { relative_path: "styles/main.css" },
+        { relative_path: "scripts/app.js" },
+        { relative_path: "images/a b.png" },
+        { relative_path: "media/movie.mp4" },
+        { relative_path: "media/sound.mp3" },
+        { relative_path: "media/captions.vtt" },
+        { relative_path: "media/poster.jpg" },
+      ],
+    };
+    const htmlPost = post(60, { files: [htmlFile] });
+    const html = `<!doctype html><html><head>
+      <base href="https://attacker.test/">
+      <meta http-equiv="refresh" content="0;url=https://attacker.test/">
+      <meta http-equiv="content-security-policy" content="default-src *">
+      <meta name="referrer" content="unsafe-url">
+      <link rel="stylesheet" href="styles/main.css">
+      <link rel="icon" href="images/a%20b.png">
+      <script src="scripts/app.js"></script>
+    </head><body>
+      <img id="safe" src="images/a%20b.png" srcset="images/a%20b.png 1x, ../secret.png 2x, https://attacker.test/x.png 3x">
+      <img id="data" src="data:image/png;base64,AAAA">
+      <img id="remote" src="//attacker.test/x.png"><img id="malformed" src="images/%ZZ.png">
+      <video src="media/movie.mp4" poster="media/poster.jpg"><source src="media/movie.mp4"><track src="media/captions.vtt"></video>
+      <audio id="declared-audio" src="media/sound.mp3"></audio><audio id="cross-post" src="/api/v1/posts/999/files/0/content"></audio>
+      <form action="https://attacker.test/submit"><input src="images/a%20b.png"><button formaction="https://attacker.test/other">Send</button></form>
+      <a id="fragment" href="#result">Result</a><a id="external" href="https://attacker.test/">Leave</a>
+      <iframe src="images/a%20b.png"></iframe><frame src="images/a%20b.png"><object data="images/a%20b.png"></object><embed src="images/a%20b.png">
+    </body></html>`;
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
-      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [pendingPost], next_cursor: null });
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [htmlPost], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/60/files/0/content") return new Response(html);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+
+    const element = mount();
+    await vi.waitFor(() => expect(element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector("iframe[srcdoc]")).toBeTruthy());
+    const artifact = element.shadowRoot?.querySelector<HTMLElement>("glim-artifact")!;
+    const iframe = artifact.shadowRoot?.querySelector<HTMLIFrameElement>("iframe[srcdoc]")!;
+    const renderedDocument = new DOMParser().parseFromString(iframe.srcdoc, "text/html");
+    const support = "/api/v1/posts/60/files/0/support/";
+    const csp = renderedDocument.querySelector<HTMLMetaElement>('meta[http-equiv="Content-Security-Policy"]')?.content ?? "";
+
+    expect(iframe.getAttribute("sandbox")).toBe("");
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(iframe.referrerPolicy).toBe("no-referrer");
+    expect(iframe.title).toContain("page.html");
+    expect(csp).toContain("script-src 'none'");
+    expect(csp).toContain("connect-src 'none'");
+    expect(csp).toContain(support);
+    expect(csp).not.toContain("attacker.test");
+    expect(renderedDocument.querySelectorAll("base, iframe, frame, object, embed")).toHaveLength(0);
+    expect(renderedDocument.querySelectorAll('meta[http-equiv="refresh"]')).toHaveLength(0);
+    expect(renderedDocument.querySelector('meta[name="referrer"]')).toBeNull();
+    expect(Array.from(renderedDocument.querySelectorAll("meta[http-equiv]")).filter(
+      (meta) => meta.getAttribute("http-equiv")?.toLowerCase() === "content-security-policy",
+    )).toHaveLength(1);
+    expect(renderedDocument.querySelector<HTMLLinkElement>('link[rel="stylesheet"]')?.getAttribute("href")).toBe(`${support}styles/main.css`);
+    expect(renderedDocument.querySelector('link[rel="icon"]')).toBeNull();
+    expect(renderedDocument.querySelector<HTMLScriptElement>("script")?.getAttribute("src")).toBe(`${support}scripts/app.js`);
+    expect(renderedDocument.querySelector<HTMLImageElement>("#safe")?.getAttribute("src")).toBe(`${support}images/a%20b.png`);
+    expect(renderedDocument.querySelector<HTMLImageElement>("#safe")?.getAttribute("srcset")).toBe(`${support}images/a%20b.png 1x`);
+    expect(renderedDocument.querySelector<HTMLImageElement>("#data")?.getAttribute("src")).toBe("data:image/png;base64,AAAA");
+    expect(renderedDocument.querySelector<HTMLImageElement>("#remote")?.hasAttribute("src")).toBe(false);
+    expect(renderedDocument.querySelector<HTMLImageElement>("#malformed")?.hasAttribute("src")).toBe(false);
+    expect(renderedDocument.querySelector<HTMLVideoElement>("video")?.getAttribute("src")).toBe(`${support}media/movie.mp4`);
+    expect(renderedDocument.querySelector<HTMLVideoElement>("video")?.getAttribute("poster")).toBe(`${support}media/poster.jpg`);
+    expect(renderedDocument.querySelector<HTMLSourceElement>("source")?.getAttribute("src")).toBe(`${support}media/movie.mp4`);
+    expect(renderedDocument.querySelector<HTMLTrackElement>("track")?.getAttribute("src")).toBe(`${support}media/captions.vtt`);
+    expect(renderedDocument.querySelector<HTMLAudioElement>("#declared-audio")?.getAttribute("src")).toBe(`${support}media/sound.mp3`);
+    expect(renderedDocument.querySelector<HTMLAudioElement>("#cross-post")?.hasAttribute("src")).toBe(false);
+    expect(renderedDocument.querySelector<HTMLInputElement>("input")?.getAttribute("src")).toBe(`${support}images/a%20b.png`);
+    expect(renderedDocument.querySelector<HTMLFormElement>("form")?.hasAttribute("action")).toBe(false);
+    expect(renderedDocument.querySelectorAll("form input:not([disabled]), form button:not([disabled])")).toHaveLength(0);
+    expect(renderedDocument.querySelector("button")?.hasAttribute("formaction")).toBe(false);
+    expect(renderedDocument.querySelector<HTMLAnchorElement>("#fragment")?.getAttribute("href")).toBe("#result");
+    expect(renderedDocument.querySelector<HTMLAnchorElement>("#external")?.hasAttribute("href")).toBe(false);
+    expect(artifact.shadowRoot?.querySelector<HTMLAnchorElement>("[download]")?.download).toBe("page.html");
+  });
+
+  test("enables only sandboxed scripts after an explicit navigation-risk warning and destroys HTML contexts", async () => {
+    const htmlPost = post(61, {
+      files: [{ ...file(0, "html", "interactive.html"), support_assets: [{ relative_path: "app.js" }] }],
+    });
+    let resolveDelayedText: ((text: string) => void) | undefined;
+    let contentRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [htmlPost], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/61/files/0/content") {
+        contentRequests += 1;
+        if (contentRequests === 1) return new Response('<script src="app.js"></script>');
+        return { ok: true, text: () => new Promise<string>((resolve) => { resolveDelayedText = resolve; }) } as Response;
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+
+    const element = mount();
+    await vi.waitFor(() => expect(element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector("iframe[srcdoc]")).toBeTruthy());
+    const artifact = element.shadowRoot?.querySelector<HTMLElement>("glim-artifact")!;
+    const safeFrame = artifact.shadowRoot?.querySelector<HTMLIFrameElement>("iframe[srcdoc]")!;
+    const safeCsp = new DOMParser().parseFromString(safeFrame.srcdoc, "text/html")
+      .querySelector<HTMLMetaElement>('meta[http-equiv="Content-Security-Policy"]')!.content;
+    const warning = artifact.shadowRoot?.querySelector<HTMLElement>("[data-script-warning]")!;
+    expect(warning.textContent?.toLowerCase()).toContain("navigate its own frame");
+    expect(warning.textContent?.toLowerCase()).toContain("network request");
+    expect(safeFrame.getAttribute("sandbox")).toBe("");
+
+    artifact.shadowRoot?.querySelector<HTMLButtonElement>("[data-enable-scripts]")?.click();
+    await vi.waitFor(() => expect(artifact.shadowRoot?.querySelector<HTMLIFrameElement>("iframe[srcdoc]")?.getAttribute("sandbox")).toBe("allow-scripts"));
+    const scriptFrame = artifact.shadowRoot?.querySelector<HTMLIFrameElement>("iframe[srcdoc]")!;
+    const scriptCsp = new DOMParser().parseFromString(scriptFrame.srcdoc, "text/html")
+      .querySelector<HTMLMetaElement>('meta[http-equiv="Content-Security-Policy"]')!.content;
+    expect(scriptFrame.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(scriptFrame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    const exactSupportScope = "http://localhost:3000/api/v1/posts/61/files/0/support/";
+    expect(scriptCsp).toContain(`script-src 'unsafe-inline' ${exactSupportScope}`);
+    expect(scriptCsp).not.toContain("'self'");
+    expect(scriptCsp).toContain("connect-src 'none'");
+    expect(scriptCsp.replace(`script-src 'unsafe-inline' ${exactSupportScope}`, "script-src 'none'"))
+      .toBe(safeCsp);
+    expect(contentRequests).toBe(1);
+
+    artifact.remove();
+    expect(scriptFrame.srcdoc).toBe("");
+    expect(scriptFrame.getAttribute("src")).toBeNull();
+
+    const parent = element.shadowRoot?.querySelector(".files > li")!;
+    parent.append(artifact);
+    await vi.waitFor(() => expect(resolveDelayedText).toBeDefined());
+    expect(artifact.shadowRoot?.querySelector("iframe[srcdoc]")).toBeNull();
+    artifact.remove();
+    resolveDelayedText?.("<p>late</p>");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(artifact.shadowRoot?.querySelector("iframe[srcdoc]")).toBeNull();
+  });
+
+  test("uses filename-oriented download fallback for unsupported files", async () => {
+    const fallbackPost = post(62, { files: [file(0, "download", "archive.bin")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [fallbackPost], next_cursor: null });
       if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
       throw new Error(`unexpected fetch ${String(input)}`);
     }));
 
     const element = mount();
-    await rendered(element, "Renderer pending");
-    expect(element.shadowRoot?.querySelectorAll("iframe, embed, object")).toHaveLength(0);
-    const downloads = Array.from(element.shadowRoot!.querySelectorAll<HTMLElement>("glim-artifact"))
-      .flatMap((artifact) => Array.from(artifact.shadowRoot?.querySelectorAll<HTMLAnchorElement>("[download]") ?? []));
-    expect(downloads.map((link) => link.download)).toEqual(["page.html", "archive.bin"]);
+    await rendered(element, "Open or download archive.bin");
+    const download = element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector<HTMLAnchorElement>("[download]");
+    expect(download?.download).toBe("archive.bin");
+    expect(download?.href).toContain("/api/v1/posts/62/files/0/content");
   });
 
   test("shows renderer-local fetch failure fallback and aborts artifact fetches on disconnect", async () => {
