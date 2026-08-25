@@ -10,7 +10,7 @@
     "build": "vite build",
     "check": "npm run typecheck && npm test && npm run build",
     "test": "vitest run",
-    "test:chromium": "npm run build && node tests/chromium-html-opt-in.mjs",
+    "test:chromium": "npm run build && node tests/chromium-html-opt-in.mjs && node tests/chromium-live-feed.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

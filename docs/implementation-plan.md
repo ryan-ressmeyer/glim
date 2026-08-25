@@ -118,7 +118,7 @@ Phase 2D adds the canonical JSON and one-file publication interfaces, one-value 
 
 ## Phase 3: Live browser feed
 
-### Static viewer and rich-renderer slices completed
+### Phase 3 completed
 
 The first Phase 3 slice serves routed session, project, and global feeds from the embedded frontend. It adds bounded cursor pagination, cached session provenance, scoped navigation, sanitized Markdown commentary, and safe static renderers for images, SVG, Markdown artifacts, text, JSON, CSV, and downloads. The feed remains intentionally fully expanded.
 
@@ -126,7 +126,9 @@ The rich-renderer slice adds native video and audio controls without autoplay. A
 
 The HTML-renderer slice fetches each entry through its visible artifact route and parses it in a detached document. It removes untrusted base and policy elements, nested frames and plugins, active forms, and external navigation. Declarative resources resolve only through the file's listed support assets. HTML then renders in a unique-origin iframe with scripts disabled, no lifted sandbox tokens, and a deterministic content security policy. An explicit warning can reload the artifact with only `allow-scripts`. Connection APIs and undeclared subresources remain blocked, but a script can navigate its own frame and thereby make a network request. The warning discloses this browser-platform limitation. Disconnects, reconnects, and failures abort entry fetches and destroy iframe browsing contexts.
 
-These slices do not add SSE, viewport-aware post insertion, heartbeat, or close actions. Those behaviors remain in the live-feed slice below, so the Phase 3 exit criteria are not yet satisfied.
+The final live-feed slice adds scoped SSE publication and closure events, 100-post durable replay, 256-event broadcast fan-out, and reset recovery for stale or lagging clients. Browser connections begin before the initial page load, validate events through the page contract, deduplicate post IDs, and order posts by publication time and ID. Existing renderer nodes move without recreation when ordering changes.
+
+Top-of-page viewers receive posts immediately. Scrolled viewers retain at most 100 pending posts and use an accessible new-content control to merge them. Larger bursts trigger latest-page reconciliation. Session pages send 30-second heartbeats only while visible and connected to an open SSE stream. A confirmed close action stops SSE and heartbeat work, removes renderer resources, and reports retryable failures without displaying daemon output. Session closure events close matching session views and reconcile project or global views. These behaviors complete the Phase 3 scope and exit criteria.
 
 ### Scope
 

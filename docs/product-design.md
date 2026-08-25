@@ -97,7 +97,11 @@ The daemon determines media type through content sniffing and validates it again
 
 The session feed is reverse chronological. Every visible artifact in a post renders inline in agent-specified order.
 
-When a user is at the top, a new post appears immediately and shifts prior posts downward. When the user has scrolled away, the browser preserves the viewport and shows a new-content indicator. Activating the indicator returns to the new posts.
+When a user is at the top, a new post appears immediately and shifts prior posts downward. When the user has scrolled away, the browser preserves the viewport and shows a new-content indicator. Activating the indicator returns to the new posts. The browser retains at most 100 pending posts; a larger burst triggers latest-page reconciliation.
+
+Scoped server-sent event streams use post IDs as event IDs. The daemon retains 256 live events and replays at most 100 durable posts after reconnection. A client that exceeds either bound receives a reset event and reconciles from the latest page. Session closure events stop matching session views and prompt project or global views to reconcile removed posts.
+
+A visible session page sends a heartbeat every 30 seconds only while its event stream is open. Hiding the page, losing the stream, closing the session, or disconnecting the component stops heartbeat work. Session pages require native destructive confirmation before closing.
 
 Complete inline rendering is intentional. Visually heavy posts encourage agents to publish focused figures and demonstrations. The browser may defer offscreen work, release media decoders, or virtualize text without changing the complete presentation.
 

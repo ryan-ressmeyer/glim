@@ -19,6 +19,9 @@ const MEDIA_RELEASE_MARGIN = "1000px 0px";
 const PDF_LAZY_MARGIN = "1500px 0px";
 const PDF_RANGE_CHUNK_BYTES = 64 * 1024;
 const PDF_MAX_MATERIALIZED_PAGES = 3;
+// Live delivery is lossy beyond these bounds; reconciliation replaces accumulation.
+const LIVE_PENDING_LIMIT = 100;
+const HEARTBEAT_INTERVAL_MS = 30_000;
 GlobalWorkerOptions.workerSrc = PDF_WORKER_URL;
 const PUBLIC_ID_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const INITIAL_PUBLIC_ID_LENGTH = 6;
@@ -132,6 +135,11 @@ function pageEndpoint(route: Route): string | null {
   if (route.kind === "session") return `${API}/sessions/${route.publicId}/posts`;
   if (route.kind === "project") return `${API}/projects/${route.projectId}/posts`;
   return null;
+}
+
+function eventEndpoint(route: Route): string | null {
+  const endpoint = pageEndpoint(route);
+  return endpoint ? `${endpoint}/events` : null;
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(name: K, text?: string): HTMLElementTagNameMap[K] {
@@ -380,30 +388,43 @@ function isGitProvenance(value: unknown): value is GitProvenance {
     && rootValid && branchValid && commitValid;
 }
 
+function isPost(value: unknown): value is Post {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const postValue = value as Record<string, unknown>;
+  return Object.keys(postValue).every((key) => [
+    "id", "session_id", "session_public_id", "title", "commentary", "predecessor_post_id",
+    "published_at", "git", "files",
+  ].includes(key))
+    && isPositiveSafeInteger(postValue.id)
+    && isPositiveSafeInteger(postValue.session_id)
+    && isPublicId(postValue.session_public_id)
+    && typeof postValue.title === "string"
+    && typeof postValue.commentary === "string"
+    && isDateSeconds(postValue.published_at)
+    && (postValue.predecessor_post_id === null || isPositiveSafeInteger(postValue.predecessor_post_id))
+    && (postValue.git === null || isGitProvenance(postValue.git))
+    && Array.isArray(postValue.files)
+    && postValue.files.every((file, index) => isPostFile(file) && file.position === index);
+}
+
 function isPage(value: unknown): value is Page {
-  if (!value || typeof value !== "object") return false;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
-  if (!Array.isArray(candidate.posts)
+  if (!Object.keys(candidate).every((key) => ["posts", "next_cursor"].includes(key))
+    || !Array.isArray(candidate.posts)
     || !(candidate.next_cursor === null || (typeof candidate.next_cursor === "string" && candidate.next_cursor.length > 0))) return false;
   const sessionIds = new Map<string, number>();
   return candidate.posts.every((raw) => {
-    if (!raw || typeof raw !== "object") return false;
-    const postValue = raw as Record<string, unknown>;
-    if (!isPositiveSafeInteger(postValue.id)
-      || !isPositiveSafeInteger(postValue.session_id)
-      || !isPublicId(postValue.session_public_id)
-      || typeof postValue.title !== "string"
-      || typeof postValue.commentary !== "string"
-      || !isDateSeconds(postValue.published_at)
-      || !(postValue.predecessor_post_id === null || isPositiveSafeInteger(postValue.predecessor_post_id))
-      || !(postValue.git === null || isGitProvenance(postValue.git))
-      || !Array.isArray(postValue.files)
-      || !postValue.files.every((file, index) => isPostFile(file) && file.position === index)) return false;
-    const previousSessionId = sessionIds.get(postValue.session_public_id);
-    if (previousSessionId !== undefined && previousSessionId !== postValue.session_id) return false;
-    sessionIds.set(postValue.session_public_id, postValue.session_id);
+    if (!isPost(raw)) return false;
+    const previousSessionId = sessionIds.get(raw.session_public_id);
+    if (previousSessionId !== undefined && previousSessionId !== raw.session_id) return false;
+    sessionIds.set(raw.session_public_id, raw.session_id);
     return true;
   });
+}
+
+function comparePosts(left: Post, right: Post): number {
+  return right.published_at - left.published_at || right.id - left.id;
 }
 
 function isSession(value: unknown): value is Session {
@@ -935,6 +956,8 @@ const appStyles = `
   .filename { font-weight: 650; }
   .caption { margin: .35rem 0 .75rem; white-space: pre-wrap; }
   .state { border: 1px solid #d8dee9; border-radius: .75rem; padding: 2rem; text-align: center; }
+  .live-notice { background: #e8f0ff; padding: .75rem; position: fixed; right: 1rem; top: .5rem; z-index: 2; }
+  .danger { color: #9f1239; }
   button { font: inherit; padding: .45rem .8rem; }
   @media (max-width: 36rem) { main { padding: .75rem; } article { border-radius: 0; margin-inline: -.75rem; } }
 `;
@@ -953,6 +976,16 @@ class GlimApp extends HTMLElement {
   private main?: HTMLElement;
   private navigation?: HTMLElement;
   private connectionGeneration = 0;
+  private events?: EventSource;
+  private pendingPosts = new Map<number, Post>();
+  private heartbeatTimer?: number;
+  private heartbeatController?: AbortController;
+  private heartbeatInFlight = false;
+  private streamOpen = false;
+  private reconciling = false;
+  private needsLiveReconciliation = false;
+  private closed = false;
+  private readonly visibilityHandler = () => this.syncHeartbeat();
 
   constructor() {
     super();
@@ -971,16 +1004,211 @@ class GlimApp extends HTMLElement {
       this.showState("Page not found");
       return;
     }
+    this.closed = false;
+    this.startLive(generation);
     this.load(false, generation).catch(() => undefined);
   }
 
   disconnectedCallback() {
     this.connectionGeneration += 1;
     this.controller?.abort();
+    this.stopLive();
   }
 
   private isAppActive(generation: number, signal?: AbortSignal): boolean {
     return generation === this.connectionGeneration && this.isConnected && !signal?.aborted;
+  }
+
+  private startLive(generation: number) {
+    const endpoint = eventEndpoint(this.route);
+    if (!endpoint || typeof EventSource === "undefined") return;
+    this.events?.close();
+    const source = new EventSource(endpoint);
+    this.events = source;
+    source.onopen = () => {
+      if (!this.isAppActive(generation) || this.events !== source) return;
+      this.streamOpen = true;
+      this.syncHeartbeat();
+    };
+    source.onerror = () => {
+      if (!this.isAppActive(generation) || this.events !== source) return;
+      this.streamOpen = false;
+      this.stopHeartbeat();
+    };
+    source.addEventListener("post", ((event: MessageEvent<string>) => {
+      if (!this.isAppActive(generation) || this.events !== source || this.closed) return;
+      let value: unknown;
+      try { value = JSON.parse(event.data); } catch { this.reconcileLatest(generation); return; }
+      if (!isPost(value) || (event.lastEventId !== "" && event.lastEventId !== String(value.id))) {
+        this.reconcileLatest(generation);
+        return;
+      }
+      this.receivePost(value, generation);
+    }) as EventListener);
+    source.addEventListener("reset", (() => {
+      if (this.isAppActive(generation) && this.events === source) this.reconcileLatest(generation);
+    }) as EventListener);
+    source.addEventListener("session-closed", ((event: MessageEvent<string>) => {
+      if (!this.isAppActive(generation) || this.events !== source) return;
+      let value: unknown;
+      try { value = JSON.parse(event.data); } catch { this.reconcileLatest(generation); return; }
+      if (!value || typeof value !== "object") { this.reconcileLatest(generation); return; }
+      const closure = value as Record<string, unknown>;
+      if (!isPositiveSafeInteger(closure.project_id) || !isPublicId(closure.session_public_id)) {
+        this.reconcileLatest(generation);
+        return;
+      }
+      if (this.route.kind === "session" && closure.session_public_id === this.route.publicId) {
+        this.showClosed();
+        return;
+      }
+      this.posts = this.posts.filter((post) => post.session_public_id !== closure.session_public_id);
+      this.postIds = new Set(this.posts.map((post) => post.id));
+      for (const [id, post] of this.pendingPosts) {
+        if (post.session_public_id === closure.session_public_id) this.pendingPosts.delete(id);
+      }
+      this.renderFeed();
+      this.reconcileLatest(generation);
+    }) as EventListener);
+    document.addEventListener("visibilitychange", this.visibilityHandler);
+  }
+
+  private stopLive() {
+    this.events?.close();
+    this.events = undefined;
+    this.streamOpen = false;
+    document.removeEventListener("visibilitychange", this.visibilityHandler);
+    this.stopHeartbeat();
+    this.pendingPosts.clear();
+    this.needsLiveReconciliation = false;
+  }
+
+  private receivePost(value: Post, generation: number) {
+    if (this.needsLiveReconciliation || this.postIds.has(value.id) || this.pendingPosts.has(value.id)) return;
+    if (window.scrollY <= 8) {
+      this.postIds.add(value.id);
+      this.posts.push(value);
+      this.posts.sort(comparePosts);
+      this.renderFeed();
+      void this.loadProvenance(generation, this.controller?.signal ?? new AbortController().signal);
+      return;
+    }
+    if (this.pendingPosts.size >= LIVE_PENDING_LIMIT) {
+      this.pendingPosts.clear();
+      this.needsLiveReconciliation = true;
+      this.showLiveNotice("New content exceeded the live queue; reload the latest posts", true);
+      return;
+    }
+    this.pendingPosts.set(value.id, value);
+    this.showLiveNotice(`${this.pendingPosts.size} new ${this.pendingPosts.size === 1 ? "post" : "posts"}`, false);
+  }
+
+  private showLiveNotice(message: string, reset: boolean) {
+    this.main?.querySelector("[data-live-notice]")?.remove();
+    const notice = element("div");
+    notice.className = "live-notice";
+    notice.dataset.liveNotice = "";
+    notice.setAttribute("aria-live", "polite");
+    const button = element("button", message);
+    button.type = "button";
+    button.dataset.newPosts = "";
+    button.addEventListener("click", () => {
+      if (reset) {
+        this.reconcileLatest(this.connectionGeneration);
+        return;
+      }
+      const pending = [...this.pendingPosts.values()];
+      this.pendingPosts.clear();
+      for (const post of pending) {
+        if (!this.postIds.has(post.id)) { this.postIds.add(post.id); this.posts.push(post); }
+      }
+      this.posts.sort(comparePosts);
+      notice.remove();
+      this.renderFeed();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      const newest = this.main?.querySelector<HTMLElement>("article");
+      if (newest) { newest.tabIndex = -1; newest.focus(); }
+    });
+    notice.append(button);
+    this.main?.querySelector(".feed")?.before(notice);
+    if (!notice.isConnected) this.main?.append(notice);
+  }
+
+  private reconcileLatest(generation: number) {
+    if (this.reconciling || !this.isAppActive(generation)) return;
+    const endpoint = pageEndpoint(this.route);
+    if (!endpoint) return;
+    this.reconciling = true;
+    void fetch(endpoint).then(async (response) => {
+      if (response.status === 404 && this.route.kind === "project" && this.isAppActive(generation)) {
+        this.posts = [];
+        this.postIds.clear();
+        this.pendingPosts.clear();
+        this.renderFeed();
+        return null;
+      }
+      if (!response.ok) throw new Error("reconciliation failed");
+      const payload: unknown = await response.json();
+      if (payload === null) return;
+      if (!this.isAppActive(generation) || !isPage(payload)) throw new Error("malformed reconciliation");
+      const latestIds = new Set(payload.posts.map((post) => post.id));
+      const oldestLatest = payload.posts.at(-1);
+      if (oldestLatest) this.posts = this.posts.filter((post) => comparePosts(post, oldestLatest) >= 0 || latestIds.has(post.id));
+      else this.posts = [];
+      for (const post of payload.posts) {
+        const index = this.posts.findIndex((candidate) => candidate.id === post.id);
+        if (index >= 0) this.posts[index] = post;
+        else this.posts.push(post);
+      }
+      this.posts.sort(comparePosts);
+      this.postIds = new Set(this.posts.map((post) => post.id));
+      this.pendingPosts.clear();
+      this.needsLiveReconciliation = false;
+      this.main?.querySelector("[data-live-notice]")?.remove();
+      this.renderFeed();
+    }).catch(() => this.showLiveNotice("Live updates need a retry", true))
+      .finally(() => { this.reconciling = false; });
+  }
+
+  private syncHeartbeat() {
+    if (this.route.kind !== "session" || !this.streamOpen || document.visibilityState !== "visible" || this.closed) {
+      this.stopHeartbeat();
+      return;
+    }
+    if (this.heartbeatTimer === undefined) {
+      void this.sendHeartbeat();
+      this.heartbeatTimer = window.setInterval(() => { void this.sendHeartbeat(); }, HEARTBEAT_INTERVAL_MS);
+    }
+  }
+
+  private async sendHeartbeat() {
+    if (this.route.kind !== "session" || this.heartbeatInFlight || !this.streamOpen || document.visibilityState !== "visible") return;
+    this.heartbeatInFlight = true;
+    const controller = new AbortController();
+    this.heartbeatController = controller;
+    try { await fetch(`${API}/sessions/${this.route.publicId}/heartbeat`, { method: "POST", signal: controller.signal }); }
+    catch { /* Heartbeats never replace a usable feed. */ }
+    finally {
+      if (this.heartbeatController === controller) {
+        this.heartbeatController = undefined;
+        this.heartbeatInFlight = false;
+      }
+    }
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer !== undefined) window.clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+    this.heartbeatController?.abort();
+    this.heartbeatController = undefined;
+    this.heartbeatInFlight = false;
+  }
+
+  private showClosed() {
+    this.closed = true;
+    this.stopLive();
+    this.controller?.abort();
+    this.showState("Session closed");
   }
 
   private renderShell() {
@@ -1018,10 +1246,34 @@ class GlimApp extends HTMLElement {
     const globalLink = element("a", "Global feed");
     globalLink.href = "/feed";
     this.navigation.append(globalLink);
+    if (this.route.kind === "session") {
+      const close = element("button", "Close session");
+      close.type = "button";
+      close.className = "danger";
+      close.dataset.closeSession = "";
+      close.addEventListener("click", () => { void this.closeSession(close); });
+      this.navigation.append(close);
+    }
+  }
+
+  private async closeSession(button: HTMLButtonElement) {
+    if (this.route.kind !== "session" || button.disabled
+      || !window.confirm("Close this session and permanently remove its posts?")) return;
+    button.disabled = true;
+    try {
+      const response = await fetch(`${API}/sessions/${this.route.publicId}`, { method: "DELETE" });
+      if (!response.ok) throw new Error("close failed");
+      this.showClosed();
+    } catch {
+      button.disabled = false;
+      const status = element("span", " Could not close the session. Try again.");
+      status.setAttribute("role", "status");
+      button.after(status);
+    }
   }
 
   private showState(message: string, retry = false) {
-    this.main?.querySelectorAll(".state, .feed").forEach((value) => value.remove());
+    this.main?.querySelectorAll(".state, .feed, [data-live-notice]").forEach((value) => value.remove());
     const state = element("section", message);
     state.className = "state";
     state.setAttribute("aria-live", "polite");
@@ -1087,6 +1339,7 @@ class GlimApp extends HTMLElement {
         added += 1;
       }
     }
+    this.posts.sort(comparePosts);
     this.nextCursor = payload.next_cursor;
     this.renderFeed();
     if (more && added === 0 && requestedCursor !== null && payload.next_cursor === requestedCursor) {
@@ -1132,8 +1385,14 @@ class GlimApp extends HTMLElement {
       this.main?.append(feed);
     }
     feed.querySelectorAll("[data-load-more], [data-pagination-state]").forEach((value) => value.remove());
-    for (const post of this.posts) {
-      if (!feed.querySelector(`#post-${post.id}`)) feed.append(this.renderPost(post));
+    const expectedIds = new Set(this.posts.map((post) => `post-${post.id}`));
+    feed.querySelectorAll<HTMLElement>("article").forEach((article) => {
+      if (!expectedIds.has(article.id)) article.remove();
+    });
+    for (const [index, post] of this.posts.entries()) {
+      const article = feed.querySelector<HTMLElement>(`#post-${post.id}`) ?? this.renderPost(post);
+      const current = feed.querySelectorAll("article")[index];
+      if (current !== article) feed.insertBefore(article, current ?? null);
     }
     if (this.nextCursor) {
       const button = element("button", "Load older posts");

@@ -91,6 +91,34 @@ async function rendered(element: HTMLElement, text: string) {
   await vi.waitFor(() => expect(composedText(element)).toContain(text));
 }
 
+class FakeEventSource {
+  static instances: FakeEventSource[] = [];
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 2;
+  readonly CONNECTING = 0;
+  readonly OPEN = 1;
+  readonly CLOSED = 2;
+  readyState = FakeEventSource.CONNECTING;
+  onopen: ((event: Event) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  private listeners = new Map<string, Array<(event: MessageEvent) => void>>();
+
+  constructor(readonly url: string) { FakeEventSource.instances.push(this); }
+  addEventListener(type: string, listener: EventListener) {
+    const values = this.listeners.get(type) ?? [];
+    values.push(listener as (event: MessageEvent) => void);
+    this.listeners.set(type, values);
+  }
+  close() { this.readyState = FakeEventSource.CLOSED; }
+  open() { this.readyState = FakeEventSource.OPEN; this.onopen?.(new Event("open")); }
+  error() { this.readyState = FakeEventSource.CONNECTING; this.onerror?.(new Event("error")); }
+  emit(type: string, data: unknown, lastEventId = "") {
+    const event = new MessageEvent(type, { data: JSON.stringify(data), lastEventId });
+    this.listeners.get(type)?.forEach((listener) => listener(event));
+  }
+}
+
 class TestIntersectionObserver {
   static instances: TestIntersectionObserver[] = [];
   readonly observed = new Set<Element>();
@@ -117,6 +145,8 @@ describe("glim-app public route and element behavior", () => {
   beforeEach(() => {
     setPath("/feed");
     TestIntersectionObserver.instances = [];
+    FakeEventSource.instances = [];
+    vi.stubGlobal("EventSource", FakeEventSource);
   });
 
   afterEach(() => {
@@ -1031,6 +1061,201 @@ describe("glim-app public route and element behavior", () => {
 
     expect(element.shadowRoot?.querySelector("article")).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("orders and deduplicates live posts while preserving existing renderer nodes", async () => {
+    const initial = post(2, { published_at: 100 });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [initial], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(0);
+
+    const app = mount();
+    await rendered(app, "Post 2");
+    expect(FakeEventSource.instances[0].url).toBe("/api/v1/posts/events");
+    const existing = app.shadowRoot?.querySelector("#post-2");
+    FakeEventSource.instances[0].emit("post", post(3, { published_at: 100 }), "3");
+    FakeEventSource.instances[0].emit("post", post(3, { published_at: 100 }), "3");
+    await rendered(app, "Post 3");
+
+    expect(Array.from(app.shadowRoot?.querySelectorAll("article") ?? []).map((value) => value.id)).toEqual(["post-3", "post-2"]);
+    expect(app.shadowRoot?.querySelector("#post-2")).toBe(existing);
+  });
+
+  test("queues bounded live content away from the top and merges it on activation", async () => {
+    let scrollY = 500;
+    vi.spyOn(window, "scrollY", "get").mockImplementation(() => scrollY);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    const app = mount();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("post", post(2), "2");
+    await rendered(app, "1 new post");
+    expect(app.shadowRoot?.querySelector("#post-2")).toBeNull();
+
+    scrollY = 0;
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-new-posts]")?.click();
+    await rendered(app, "Post 2");
+    expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({ top: 0 }));
+    expect(app.shadowRoot?.activeElement?.id).toBe("post-2");
+  });
+
+  test("heartbeats only for a visible open session stream and stops on errors", async () => {
+    vi.useFakeTimers();
+    setPath("/sessions/2zY8Ab");
+    let visibility: DocumentVisibilityState = "visible";
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return jsonResponse({ posts: [], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url.endsWith("/heartbeat")) return jsonResponse({ updated: true, last_activity_at: 3 });
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    FakeEventSource.instances[0].open();
+    await vi.waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/heartbeat"))).toBe(true));
+    const count = fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/heartbeat")).length;
+    visibility = "hidden";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/heartbeat"))).toHaveLength(count);
+    visibility = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/heartbeat"))).toHaveLength(count + 1));
+    FakeEventSource.instances[0].error();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/heartbeat"))).toHaveLength(count + 1);
+    app.remove();
+    vi.useRealTimers();
+  });
+
+  test("removes closed-session posts when global reconciliation is empty", async () => {
+    let pageRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        pageRequests += 1;
+        return jsonResponse({ posts: pageRequests === 1 ? [post(1)] : [], next_cursor: null });
+      }
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 1");
+
+    FakeEventSource.instances[0].emit("session-closed", { project_id: 42, session_public_id: "2zY8Ab" });
+
+    await rendered(app, "No posts in this feed");
+    expect(app.shadowRoot?.querySelector("article")).toBeNull();
+  });
+
+  test("keeps queue overflow in reconciliation mode when more posts arrive", async () => {
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(500);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 1");
+    for (let id = 2; id <= 102; id += 1) FakeEventSource.instances[0].emit("post", post(id), String(id));
+    FakeEventSource.instances[0].emit("post", post(103), "103");
+
+    await rendered(app, "reload the latest posts");
+    expect(composedText(app)).not.toContain("1 new post");
+    expect(app.shadowRoot?.querySelector("#post-103")).toBeNull();
+  });
+
+  test("an aborted heartbeat cannot release a newer request's in-flight guard", async () => {
+    vi.useFakeTimers();
+    setPath("/sessions/2zY8Ab");
+    let visibility: DocumentVisibilityState = "visible";
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
+    let heartbeatRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return Promise.resolve(jsonResponse({ posts: [], next_cursor: null }));
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      if (url.endsWith("/heartbeat")) {
+        heartbeatRequests += 1;
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    FakeEventSource.instances[0].open();
+    await vi.waitFor(() => expect(heartbeatRequests).toBe(1));
+
+    visibility = "hidden";
+    document.dispatchEvent(new Event("visibilitychange"));
+    visibility = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.waitFor(() => expect(heartbeatRequests).toBe(2));
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(heartbeatRequests).toBe(2);
+    app.remove();
+    vi.useRealTimers();
+  });
+
+  test("removes a deleted project feed after a session-closed event", async () => {
+    setPath("/projects/42");
+    let pageRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/projects/42/posts") {
+        pageRequests += 1;
+        return pageRequests === 1
+          ? jsonResponse({ posts: [post(1)], next_cursor: null })
+          : jsonResponse({ error: { code: "project_not_found" } }, 404);
+      }
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("session-closed", { project_id: 42, session_public_id: "2zY8Ab" });
+    await rendered(app, "No posts in this feed");
+    expect(app.shadowRoot?.querySelector("article")).toBeNull();
+  });
+
+  test("requires native confirmation before closing a session and shows the closed state", async () => {
+    setPath("/sessions/2zY8Ab");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE") return jsonResponse({ sessions_deleted: 1 });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url.endsWith("/heartbeat")) return jsonResponse({ updated: true, last_activity_at: 3 });
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const confirm = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    Object.defineProperty(window, "confirm", { configurable: true, value: confirm });
+    const app = mount();
+    await rendered(app, "Post 1");
+    const close = app.shadowRoot?.querySelector<HTMLButtonElement>("[data-close-session]")!;
+    close.click();
+    expect(confirm).toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+    close.click();
+    await rendered(app, "Session closed");
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(true);
+    expect(FakeEventSource.instances[0].readyState).toBe(FakeEventSource.CLOSED);
+    expect(app.shadowRoot?.querySelector("article")).toBeNull();
   });
 
   test("reconnects app and artifact elements without duplicating durable content", async () => {

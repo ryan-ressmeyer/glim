@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     io::SeekFrom,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -15,12 +16,19 @@ use axum::{
     },
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    sync::{broadcast, mpsc},
+};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 
 use crate::storage::{
@@ -31,18 +39,53 @@ use crate::storage::{
 
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_DECLARED_PARTS: usize = 256;
+/// Live publication fan-out is intentionally lossy; lagging clients receive `reset`.
+const LIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
+/// A reconnect may replay at most this many durable posts before receiving `reset`.
+const LIVE_REPLAY_LIMIT: usize = 100;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ApiState {
     store: Option<Arc<Mutex<Store>>>,
+    events: broadcast::Sender<LiveEvent>,
+}
+
+impl Default for ApiState {
+    fn default() -> Self {
+        let (events, _) = broadcast::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+        Self {
+            store: None,
+            events,
+        }
+    }
 }
 
 impl ApiState {
     pub(crate) fn with_store(store: Store) -> Self {
         Self {
             store: Some(Arc::new(Mutex::new(store))),
+            ..Self::default()
         }
     }
+}
+
+#[derive(Clone)]
+enum LiveEvent {
+    Post {
+        project_id: i64,
+        post: crate::storage::PostRead,
+    },
+    SessionClosed {
+        project_id: i64,
+        session_public_id: String,
+    },
+}
+
+#[derive(Clone)]
+enum FeedScope {
+    Global,
+    Project(i64),
+    Session(String),
 }
 
 pub(crate) fn routes() -> Router<ApiState> {
@@ -53,8 +96,11 @@ pub(crate) fn routes() -> Router<ApiState> {
             get(get_session).delete(close_session),
         )
         .route("/sessions/{public_id}/posts", get(session_posts))
+        .route("/sessions/{public_id}/posts/events", get(session_events))
         .route("/sessions/{public_id}/heartbeat", post(heartbeat))
         .route("/projects/{project_id}/posts", get(project_posts))
+        .route("/projects/{project_id}/posts/events", get(project_events))
+        .route("/posts/events", get(global_events))
         .route("/posts", get(global_posts))
         .route(
             "/posts",
@@ -439,13 +485,19 @@ async fn publish_post(
         files,
     };
     let published_at = daemon_unix_seconds()?;
+    let events = state.events.clone();
     let PublishedPublication { session, post } = with_store(state, move |store| {
-        store.publish_resolving_classified_at(
+        let publication = store.publish_resolving_classified_at(
             identity,
             request,
             published_at,
             Some(declared_media_types),
-        )
+        )?;
+        let _ = events.send(LiveEvent::Post {
+            project_id: publication.session.project.id,
+            post: publication.post.clone(),
+        });
+        Ok(publication)
     })
     .await?;
     Ok((
@@ -804,6 +856,149 @@ async fn global_posts(
     ))
 }
 
+async fn global_events(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    live_events(state, headers, FeedScope::Global).await
+}
+
+async fn project_events(
+    State(state): State<ApiState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    live_events(
+        state,
+        headers,
+        FeedScope::Project(positive_id(&project_id)?),
+    )
+    .await
+}
+
+async fn session_events(
+    State(state): State<ApiState>,
+    Path(public_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    live_events(state, headers, FeedScope::Session(public_id)).await
+}
+
+async fn live_events(
+    state: ApiState,
+    headers: HeaderMap,
+    scope: FeedScope,
+) -> Result<Response, ApiError> {
+    let after_id = match headers.get("last-event-id") {
+        None => 0,
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "malformed_last_event_id",
+                    "Last-Event-ID must be a positive integer",
+                    json!({}),
+                )
+            })?,
+    };
+    // Subscribe first: a commit racing durable replay can duplicate, but cannot disappear.
+    let mut receiver = state.events.subscribe();
+    let replay_scope = scope.clone();
+    let replay = with_store(state.clone(), move |store| match replay_scope {
+        FeedScope::Global => store.global_posts_after(after_id, LIVE_REPLAY_LIMIT + 1),
+        FeedScope::Project(project_id) => {
+            store.project_posts_after(project_id, after_id, LIVE_REPLAY_LIMIT + 1)
+        }
+        FeedScope::Session(public_id) => {
+            store.session_posts_after(&public_id, after_id, LIVE_REPLAY_LIMIT + 1)
+        }
+    })
+    .await?;
+    let (sender, stream) = mpsc::channel::<Result<Event, Infallible>>(32);
+    tokio::spawn(async move {
+        if replay.len() > LIVE_REPLAY_LIMIT {
+            if sender.send(Ok(reset_event("replay_limit"))).await.is_err() {
+                return;
+            }
+        } else {
+            for post in replay {
+                if sender.send(Ok(post_event(&post))).await.is_err() {
+                    return;
+                }
+            }
+        }
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event_matches(&scope, &event) => {
+                    let encoded = match event {
+                        LiveEvent::Post { post, .. } => post_event(&post),
+                        LiveEvent::SessionClosed { project_id, session_public_id } => Event::default()
+                            .event("session-closed")
+                            .json_data(json!({"project_id": project_id, "session_public_id": session_public_id}))
+                            .expect("trusted closure event serializes"),
+                    };
+                    if sender.send(Ok(encoded)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    receiver = receiver.resubscribe();
+                    if sender.send(Ok(reset_event("channel_lag"))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+    Ok(Sse::new(ReceiverStream::new(stream))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response())
+}
+
+fn event_matches(scope: &FeedScope, event: &LiveEvent) -> bool {
+    match (scope, event) {
+        (FeedScope::Global, _) => true,
+        (
+            FeedScope::Project(expected),
+            LiveEvent::Post { project_id, .. } | LiveEvent::SessionClosed { project_id, .. },
+        ) => expected == project_id,
+        (FeedScope::Session(expected), LiveEvent::Post { post, .. }) => {
+            expected == &post.session_public_id
+        }
+        (
+            FeedScope::Session(expected),
+            LiveEvent::SessionClosed {
+                session_public_id, ..
+            },
+        ) => expected == session_public_id,
+    }
+}
+
+fn post_event(post: &crate::storage::PostRead) -> Event {
+    Event::default()
+        .event("post")
+        .id(post.id.to_string())
+        .json_data(post)
+        .expect("validated post serializes")
+}
+
+fn reset_event(reason: &'static str) -> Event {
+    Event::default()
+        .event("reset")
+        .json_data(json!({"reason": reason}))
+        .expect("trusted reset event serializes")
+}
+
 async fn heartbeat(
     State(state): State<ApiState>,
     Path(public_id): Path<String>,
@@ -830,9 +1025,23 @@ async fn close_session(
     State(state): State<ApiState>,
     Path(public_id): Path<String>,
 ) -> Result<Json<LifecycleReport>, ApiError> {
-    Ok(Json(
-        with_store(state, move |store| store.close_session(&public_id)).await?,
-    ))
+    let events = state.events.clone();
+    let close_id = public_id.clone();
+    let report = with_store(state, move |store| {
+        let context = store.session(&close_id).ok();
+        let report = store.close_session(&close_id)?;
+        if report.sessions_deleted > 0
+            && let Some(session) = context
+        {
+            let _ = events.send(LiveEvent::SessionClosed {
+                project_id: session.project.id,
+                session_public_id: close_id,
+            });
+        }
+        Ok(report)
+    })
+    .await?;
+    Ok(Json(report))
 }
 
 fn page_request(query: Result<Query<PageQuery>, QueryRejection>) -> Result<PageRequest, ApiError> {

@@ -153,6 +153,70 @@ impl Store {
         self.posts_page("1 = ?", 1_i64, page)
     }
 
+    pub(crate) fn session_posts_after(
+        &self,
+        public_id: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PostRead>, StoreError> {
+        let session = self.session(public_id)?;
+        self.posts_after("p.session_id = ?", session.id, after_id, limit)
+    }
+
+    pub(crate) fn project_posts_after(
+        &self,
+        project_id: i64,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PostRead>, StoreError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(StoreError::ProjectNotFound { project_id });
+        }
+        self.posts_after("s.project_id = ?", project_id, after_id, limit)
+    }
+
+    pub(crate) fn global_posts_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PostRead>, StoreError> {
+        self.posts_after("1 = ?", 1, after_id, limit)
+    }
+
+    fn posts_after(
+        &self,
+        scope: &str,
+        scope_value: i64,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PostRead>, StoreError> {
+        let sql = format!(
+            "SELECT p.id FROM posts p JOIN sessions s ON s.id = p.session_id
+             WHERE {scope} AND p.id > ? ORDER BY p.id ASC LIMIT ?"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let ids = statement
+            .query_map(
+                params![
+                    scope_value,
+                    after_id,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                load_post(&self.connection, id)?.ok_or(StoreError::PostNotFound { post_id: id })
+            })
+            .collect()
+    }
+
     pub(crate) fn open_visible_artifact(
         &self,
         post_id: i64,
