@@ -39,6 +39,8 @@ The placeholder binary on `main` marks the planning baseline. Feature work shoul
 - Track publication activity and visible-viewer heartbeats without treating background reads as activity.
 - Enforce a configurable per-file upload ceiling while streaming each staging file.
 - Enforce one configurable global physical blob budget charged by unique finalized bytes. Deduplicated content adds no usage.
+- Stage independent publication streams in lock-backed journals and atomically publish immutable posts, ordered visible files, nested support assets, occurrence references, revision links, publication timestamps, and session activity.
+- Recover publication crashes from bounded journals without scanning finalized blobs. Remove uncommitted final links, retain committed referenced blobs, and leave active writers untouched.
 
 ### Test-first scenarios
 
@@ -54,6 +56,9 @@ The placeholder binary on `main` marks the planning baseline. Feature work shoul
 - Concurrent unique blob finalization cannot overcommit the global budget.
 - Startup recovery removes an uncommitted final file and staging journal when adopting it would exceed the configured global budget.
 - Temporary staging remains bounded per upload but is outside finalized-store accounting; ordinary filesystem-full errors remain possible.
+- Publication validation rejects blank titles or commentary, empty visible-file lists, invalid revision links, and duplicate support paths with stable storage errors.
+- Aggregate publication quota checks count distinct new hashes once under the same serialized transaction as finalization and metadata insertion.
+- Publication recovery distinguishes staged, pre-commit finalizing, and committed-before-cleanup states without adopting uncommitted publication blobs as standalone blobs.
 
 ### Exit criteria
 

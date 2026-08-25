@@ -9,11 +9,15 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 mod blob;
 mod lifecycle;
+mod publication;
 
 pub use blob::{BlobHash, BlobIntegrityError, BlobRecord, InvalidBlobHash};
 pub use lifecycle::LifecycleReport;
+pub use publication::{
+    PostRecord, PublicationFile, PublicationRequest, PublicationSupportAsset, StagedPublicationBlob,
+};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
 const PUBLIC_ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const INITIAL_PUBLIC_ID_LENGTH: usize = 6;
@@ -110,6 +114,22 @@ const MIGRATIONS: &[Migration] = &[
             );
         "#,
     },
+    Migration {
+        version: 3,
+        sql: r#"
+            DROP TRIGGER posts_are_immutable;
+
+            ALTER TABLE posts ADD COLUMN published_at INTEGER NOT NULL DEFAULT 0;
+            UPDATE posts
+            SET published_at = CAST(strftime('%s', 'now') AS INTEGER);
+
+            CREATE TRIGGER posts_are_immutable
+            BEFORE UPDATE ON posts
+            BEGIN
+                SELECT RAISE(ABORT, 'posts are immutable');
+            END;
+        "#,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -189,6 +209,7 @@ impl Store {
 
         connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         apply_migrations(&mut connection, version, MIGRATIONS)?;
+        publication::recover_publication_staging(&connection, &root)?;
         blob::recover_blob_store(&connection, &root, limits.max_finalized_blob_bytes)?;
         blob::drain_blob_deletion_queue(&connection, &root)?;
 
@@ -424,6 +445,19 @@ pub enum StoreError {
         current: u64,
         additional: u64,
     },
+    BlankPublicationTitle,
+    BlankPublicationCommentary,
+    PublicationRequiresFile,
+    PredecessorNotFound {
+        post_id: i64,
+    },
+    CrossSessionPredecessor {
+        post_id: i64,
+    },
+    DuplicateSupportPath {
+        relative_path: String,
+    },
+    PublicationStagingStoreMismatch,
 }
 
 impl fmt::Display for StoreError {
@@ -459,6 +493,33 @@ impl fmt::Display for StoreError {
                 formatter,
                 "global finalized blob budget exceeded: limit {limit}, current usage {current}, additional unique bytes {additional}"
             ),
+            Self::BlankPublicationTitle => {
+                formatter.write_str("publication title must not be blank")
+            }
+            Self::BlankPublicationCommentary => {
+                formatter.write_str("publication commentary must not be blank")
+            }
+            Self::PublicationRequiresFile => {
+                formatter.write_str("publication requires at least one visible file")
+            }
+            Self::PredecessorNotFound { post_id } => {
+                write!(formatter, "predecessor post {post_id} was not found")
+            }
+            Self::CrossSessionPredecessor { post_id } => {
+                write!(
+                    formatter,
+                    "predecessor post {post_id} belongs to another session"
+                )
+            }
+            Self::DuplicateSupportPath { relative_path } => {
+                write!(
+                    formatter,
+                    "duplicate support path under one entry: {relative_path}"
+                )
+            }
+            Self::PublicationStagingStoreMismatch => {
+                formatter.write_str("staged publication blob belongs to another store")
+            }
         }
     }
 }
@@ -475,7 +536,14 @@ impl Error for StoreError {
             | Self::PublicIdExhausted
             | Self::SessionNotFound { .. }
             | Self::UploadLimitExceeded { .. }
-            | Self::GlobalBlobBudgetExceeded { .. } => None,
+            | Self::GlobalBlobBudgetExceeded { .. }
+            | Self::BlankPublicationTitle
+            | Self::BlankPublicationCommentary
+            | Self::PublicationRequiresFile
+            | Self::PredecessorNotFound { .. }
+            | Self::CrossSessionPredecessor { .. }
+            | Self::DuplicateSupportPath { .. }
+            | Self::PublicationStagingStoreMismatch => None,
         }
     }
 }
@@ -542,7 +610,10 @@ fn apply_migration(transaction: Transaction<'_>, migration: Migration) -> rusqli
 
 #[cfg(test)]
 mod tests {
-    use super::{Migration, Store, StoreError, apply_migrations, generate_public_id_with_fill};
+    use super::{
+        MIGRATIONS, Migration, Store, StoreError, apply_migration, apply_migrations,
+        generate_public_id_with_fill,
+    };
     use rusqlite::Connection;
 
     #[test]
@@ -648,7 +719,7 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::InvalidMigrationPlan {
-                expected: 2,
+                expected: 3,
                 found: 0
             }
         ));
@@ -712,6 +783,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 0);
+    }
+
+    #[test]
+    fn failed_publication_timestamp_migration_restores_the_v2_trigger_and_version() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE posts (
+                     id INTEGER PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     published_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TRIGGER posts_are_immutable
+                 BEFORE UPDATE ON posts
+                 BEGIN
+                     SELECT RAISE(ABORT, 'posts are immutable');
+                 END;
+                 INSERT INTO posts (id, title) VALUES (1, 'Legacy');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+
+        let error = apply_migration(connection.transaction().unwrap(), MIGRATIONS[2]).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate column name"));
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        let immutable = connection
+            .execute("UPDATE posts SET title = 'Changed' WHERE id = 1", [])
+            .unwrap_err();
+        assert!(matches!(
+            immutable,
+            rusqlite::Error::SqliteFailure(_, Some(ref message))
+                if message == "posts are immutable"
+        ));
     }
 
     #[test]

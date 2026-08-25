@@ -33,6 +33,22 @@ fn version_one_sessions_migrate_with_fresh_equal_activity_timestamps() {
                  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                  UNIQUE (integration_namespace, external_key, project_id)
              );
+             CREATE TABLE posts (
+                 id INTEGER PRIMARY KEY,
+                 session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 title TEXT NOT NULL,
+                 commentary TEXT NOT NULL,
+                 predecessor_post_id INTEGER,
+                 UNIQUE (id, session_id),
+                 FOREIGN KEY (predecessor_post_id, session_id)
+                     REFERENCES posts(id, session_id),
+                 CHECK (predecessor_post_id IS NULL OR predecessor_post_id <> id)
+             );
+             CREATE TRIGGER posts_are_immutable
+             BEFORE UPDATE ON posts
+             BEGIN
+                 SELECT RAISE(ABORT, 'posts are immutable');
+             END;
              CREATE TABLE blobs (
                  hash TEXT PRIMARY KEY,
                  byte_size INTEGER NOT NULL CHECK (byte_size >= 0)
@@ -41,14 +57,16 @@ fn version_one_sessions_migrate_with_fresh_equal_activity_timestamps() {
              VALUES (1, 'Glim', '/tmp/glim');
              INSERT INTO sessions (id, public_id, integration_namespace, external_key, project_id)
              VALUES (1, 'legacy', 'pi', 'old', 1);
+             INSERT INTO posts (id, session_id, title, commentary)
+             VALUES (1, 1, 'Legacy', 'Result');
              PRAGMA user_version = 1;",
         )
         .unwrap();
     drop(connection);
 
     let reopened = Store::open(root.path()).unwrap();
-    assert_eq!(CURRENT_SCHEMA_VERSION, 2);
-    assert_eq!(reopened.schema_version().unwrap(), 2);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 3);
+    assert_eq!(reopened.schema_version().unwrap(), 3);
     drop(reopened);
 
     let connection = database(&root);
@@ -61,6 +79,22 @@ fn version_one_sessions_migrate_with_fresh_equal_activity_timestamps() {
         .unwrap();
     assert_eq!(created_at, last_activity_at);
     assert!(created_at > 0);
+    assert!(
+        connection
+            .query_row("SELECT published_at FROM posts WHERE id = 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+            > 0
+    );
+    let immutable = connection
+        .execute("UPDATE posts SET published_at = 0 WHERE id = 1", [])
+        .unwrap_err();
+    assert!(matches!(
+        immutable,
+        rusqlite::Error::SqliteFailure(_, Some(ref message))
+            if message == "posts are immutable"
+    ));
 }
 
 #[test]

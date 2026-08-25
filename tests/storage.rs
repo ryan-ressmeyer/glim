@@ -271,6 +271,119 @@ fn reopening_current_store_preserves_representative_metadata() {
 }
 
 #[test]
+fn version_two_posts_migrate_with_a_signed_publication_timestamp() {
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path()).unwrap();
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE projects (
+                 id INTEGER PRIMARY KEY,
+                 label TEXT NOT NULL,
+                 working_directory TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE sessions (
+                 id INTEGER PRIMARY KEY,
+                 public_id TEXT NOT NULL UNIQUE,
+                 integration_namespace TEXT NOT NULL,
+                 external_key TEXT NOT NULL,
+                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 created_at INTEGER NOT NULL DEFAULT 0,
+                 last_activity_at INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE (integration_namespace, external_key, project_id)
+             );
+             CREATE TABLE posts (
+                 id INTEGER PRIMARY KEY,
+                 session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 title TEXT NOT NULL,
+                 commentary TEXT NOT NULL,
+                 predecessor_post_id INTEGER,
+                 UNIQUE (id, session_id),
+                 FOREIGN KEY (predecessor_post_id, session_id)
+                     REFERENCES posts(id, session_id),
+                 CHECK (predecessor_post_id IS NULL OR predecessor_post_id <> id)
+             );
+             CREATE TRIGGER posts_are_immutable
+             BEFORE UPDATE ON posts
+             BEGIN
+                 SELECT RAISE(ABORT, 'posts are immutable');
+             END;
+             CREATE TABLE blobs (
+                 hash TEXT PRIMARY KEY,
+                 byte_size INTEGER NOT NULL CHECK (byte_size >= 0)
+             );
+             CREATE TABLE blob_references (
+                 id INTEGER PRIMARY KEY,
+                 post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                 blob_hash TEXT NOT NULL REFERENCES blobs(hash),
+                 UNIQUE (id, post_id)
+             );
+             CREATE TABLE post_files (
+                 id INTEGER PRIMARY KEY,
+                 post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                 blob_reference_id INTEGER NOT NULL UNIQUE,
+                 position INTEGER NOT NULL CHECK (position >= 0),
+                 filename TEXT NOT NULL,
+                 caption TEXT,
+                 UNIQUE (id, post_id),
+                 UNIQUE (post_id, position),
+                 FOREIGN KEY (blob_reference_id, post_id)
+                     REFERENCES blob_references(id, post_id)
+             );
+             CREATE TABLE support_assets (
+                 id INTEGER PRIMARY KEY,
+                 post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                 entry_file_id INTEGER NOT NULL,
+                 blob_reference_id INTEGER NOT NULL UNIQUE,
+                 relative_path TEXT NOT NULL,
+                 UNIQUE (entry_file_id, relative_path),
+                 FOREIGN KEY (entry_file_id, post_id)
+                     REFERENCES post_files(id, post_id),
+                 FOREIGN KEY (blob_reference_id, post_id)
+                     REFERENCES blob_references(id, post_id)
+             );
+             CREATE TABLE blob_deletion_queue (
+                 blob_hash TEXT PRIMARY KEY REFERENCES blobs(hash) ON DELETE CASCADE
+             );
+             INSERT INTO projects (id, label, working_directory)
+             VALUES (1, 'Legacy', '/tmp/legacy');
+             INSERT INTO sessions
+                 (id, public_id, integration_namespace, external_key, project_id,
+                  created_at, last_activity_at)
+             VALUES (1, 'legacy', 'pi', 'old', 1, 10, 10);
+             INSERT INTO posts (id, session_id, title, commentary)
+             VALUES (1, 1, 'Legacy', 'Result');
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = Store::open(root.path()).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    drop(reopened);
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    let published_at = connection
+        .query_row("SELECT published_at FROM posts WHERE id = 1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert!(published_at > 0);
+
+    for update in [
+        "UPDATE posts SET title = 'Changed' WHERE id = 1",
+        "UPDATE posts SET published_at = 0 WHERE id = 1",
+    ] {
+        let error = connection.execute(update, []).unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(_, Some(ref message))
+                if message == "posts are immutable"
+        ));
+    }
+}
+
+#[test]
 fn newer_schema_version_returns_typed_incompatibility_error() {
     let root = TempDir::new().unwrap();
     std::fs::create_dir_all(root.path()).unwrap();

@@ -331,7 +331,7 @@ impl Drop for StagedBlob {
     }
 }
 
-fn random_hex_token() -> Result<String, StoreError> {
+pub(super) fn random_hex_token() -> Result<String, StoreError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(StoreError::Random)?;
     let mut token = String::with_capacity(bytes.len() * 2);
@@ -342,18 +342,18 @@ fn random_hex_token() -> Result<String, StoreError> {
     Ok(token)
 }
 
-fn blob_path(root: &Path, hash: &BlobHash) -> PathBuf {
+pub(super) fn blob_path(root: &Path, hash: &BlobHash) -> PathBuf {
     root.join(BLOB_DIRECTORY)
         .join(&hash.as_str()[..2])
         .join(&hash.as_str()[2..4])
         .join(hash.as_str())
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-fn remove_if_exists(path: &Path) -> io::Result<()> {
+pub(super) fn remove_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -361,7 +361,11 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-fn verify_file_size(path: &Path, hash: &BlobHash, expected: u64) -> Result<(), StoreError> {
+pub(super) fn verify_file_size(
+    path: &Path,
+    hash: &BlobHash,
+    expected: u64,
+) -> Result<(), StoreError> {
     let metadata = fs::metadata(path)?;
     if !metadata.is_file() {
         return Err(StoreError::Integrity(BlobIntegrityError::NotAFile {
@@ -525,7 +529,7 @@ fn insert_and_verify_blob_metadata(
     })
 }
 
-fn finalized_unique_blob_bytes(connection: &Connection) -> Result<u64, StoreError> {
+pub(super) fn finalized_unique_blob_bytes(connection: &Connection) -> Result<u64, StoreError> {
     let mut statement = connection.prepare("SELECT byte_size FROM blobs ORDER BY hash")?;
     let sizes = statement.query_map([], |row| row.get::<_, i64>(0))?;
     let mut total = 0_u64;
