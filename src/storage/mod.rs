@@ -126,19 +126,53 @@ pub struct SessionRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalUsage {
+    pub finalized_unique_blob_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivityReport {
     pub updated: bool,
     pub last_activity_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreLimits {
+    pub max_upload_bytes: u64,
+    pub max_finalized_blob_bytes: u64,
+}
+
+impl StoreLimits {
+    pub const fn unlimited() -> Self {
+        Self {
+            max_upload_bytes: u64::MAX,
+            max_finalized_blob_bytes: u64::MAX,
+        }
+    }
+}
+
+impl Default for StoreLimits {
+    fn default() -> Self {
+        Self::unlimited()
+    }
 }
 
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
     root: PathBuf,
+    limits: StoreLimits,
 }
 
 impl Store {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_limits(root, StoreLimits::unlimited())
+    }
+
+    pub fn open_with_limits(
+        root: impl AsRef<Path>,
+        limits: StoreLimits,
+    ) -> Result<Self, StoreError> {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root)?;
         let mut connection = Connection::open(root.join(DATABASE_FILENAME))?;
@@ -155,10 +189,14 @@ impl Store {
 
         connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         apply_migrations(&mut connection, version, MIGRATIONS)?;
-        blob::recover_blob_store(&connection, &root)?;
+        blob::recover_blob_store(&connection, &root, limits.max_finalized_blob_bytes)?;
         blob::drain_blob_deletion_queue(&connection, &root)?;
 
-        Ok(Self { connection, root })
+        Ok(Self {
+            connection,
+            root,
+            limits,
+        })
     }
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {
@@ -364,11 +402,28 @@ pub enum StoreError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
     Integrity(BlobIntegrityError),
-    SchemaTooNew { found: u32, supported: u32 },
-    InvalidMigrationPlan { expected: u32, found: u32 },
+    SchemaTooNew {
+        found: u32,
+        supported: u32,
+    },
+    InvalidMigrationPlan {
+        expected: u32,
+        found: u32,
+    },
     Random(getrandom::Error),
     PublicIdExhausted,
-    SessionNotFound { public_id: String },
+    SessionNotFound {
+        public_id: String,
+    },
+    UploadLimitExceeded {
+        limit: u64,
+        attempted: u64,
+    },
+    GlobalBlobBudgetExceeded {
+        limit: u64,
+        current: u64,
+        additional: u64,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -392,6 +447,18 @@ impl fmt::Display for StoreError {
             Self::SessionNotFound { public_id } => {
                 write!(formatter, "session {public_id} was not found")
             }
+            Self::UploadLimitExceeded { limit, attempted } => write!(
+                formatter,
+                "upload byte limit exceeded: limit {limit}, attempted {attempted}"
+            ),
+            Self::GlobalBlobBudgetExceeded {
+                limit,
+                current,
+                additional,
+            } => write!(
+                formatter,
+                "global finalized blob budget exceeded: limit {limit}, current usage {current}, additional unique bytes {additional}"
+            ),
         }
     }
 }
@@ -406,7 +473,9 @@ impl Error for StoreError {
             | Self::InvalidMigrationPlan { .. }
             | Self::Random(_)
             | Self::PublicIdExhausted
-            | Self::SessionNotFound { .. } => None,
+            | Self::SessionNotFound { .. }
+            | Self::UploadLimitExceeded { .. }
+            | Self::GlobalBlobBudgetExceeded { .. } => None,
         }
     }
 }

@@ -87,7 +87,9 @@ For Markdown and HTML entry documents, the CLI collects allowlisted relative res
 
 The daemon identifies blobs with SHA-256 encoded as 64 lowercase hexadecimal characters. Stored paths use two levels of two-character hash prefixes for bounded directory fan-out. Posts may share one stored blob, and purge removes a blob only after its final reference disappears. SQLite transactions coordinate metadata and blob-reference updates.
 
-Configurable per-file and per-session byte limits reject a new publication before it becomes visible. Glimse never evicts older visible posts to make room.
+A configurable global physical blob budget counts each unique finalized blob once. Deduplicated uploads consume no additional finalized-store budget. A separate configurable per-file upload ceiling bounds each staging write and guards against abusive uploads. Temporary staging may consume bounded transient disk space outside finalized-store accounting, and ordinary filesystem-full errors remain possible.
+
+The publication API will reject a whole publication before it becomes visible when any file exceeds the upload ceiling or its new unique blobs would exceed the global budget. Glimse never evicts older visible posts to make room. Production default byte values remain undecided.
 
 The daemon determines media type through content sniffing and validates it against the filename and declared type. Dangerous mismatches fail publication. Safe explicit overrides may select a text language for highlighting.
 

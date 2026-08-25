@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use glim::storage::{CURRENT_SCHEMA_VERSION, Store, StoreError};
+use glim::storage::{CURRENT_SCHEMA_VERSION, Store, StoreError, StoreLimits};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -341,6 +341,48 @@ fn closing_the_final_reference_deletes_blob_metadata_and_file_and_repeats_cleanl
     let repeated = store.close_session(&session.public_id).unwrap();
     assert_eq!(repeated.sessions_deleted, 0);
     assert_eq!(repeated.blobs_deleted, 0);
+}
+
+#[test]
+fn deleting_final_reference_releases_budget_for_later_unique_blob() {
+    let root = TempDir::new().unwrap();
+    let mut original = Store::open(root.path()).unwrap();
+    let first = original.store_blob(Cursor::new(b"longer")).unwrap();
+    let session = original
+        .resolve_session("pi", "release", "Glim", "/tmp/glim")
+        .unwrap();
+    let connection = database(&root);
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON")
+        .unwrap();
+    attach_blob(&connection, session.id, 1, first.hash().as_str());
+    drop(connection);
+    drop(original);
+    let mut store = Store::open_with_limits(
+        root.path(),
+        StoreLimits {
+            max_upload_bytes: 6,
+            max_finalized_blob_bytes: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        store.physical_usage().unwrap().finalized_unique_blob_bytes,
+        6
+    );
+
+    store.close_session(&session.public_id).unwrap();
+
+    assert_eq!(
+        store.physical_usage().unwrap().finalized_unique_blob_bytes,
+        0
+    );
+    let later = store.store_blob(Cursor::new(b"later")).unwrap();
+    assert_eq!(later.byte_size(), 5);
+    assert_eq!(
+        store.physical_usage().unwrap().finalized_unique_blob_bytes,
+        5
+    );
 }
 
 #[test]

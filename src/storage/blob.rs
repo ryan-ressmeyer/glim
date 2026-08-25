@@ -9,7 +9,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-use super::{Store, StoreError};
+use super::{PhysicalUsage, Store, StoreError};
 
 const BLOB_DIRECTORY: &str = "blobs";
 const STAGING_DIRECTORY: &str = "staging";
@@ -139,11 +139,18 @@ impl Store {
             if read == 0 {
                 break;
             }
-            staged.file_mut().write_all(&buffer[..read])?;
-            hasher.update(&buffer[..read]);
-            byte_size = byte_size
+            let attempted = byte_size
                 .checked_add(u64::try_from(read).expect("usize read count exceeds u64"))
                 .ok_or_else(|| io::Error::other("blob byte count overflow"))?;
+            if attempted > self.limits.max_upload_bytes {
+                return Err(StoreError::UploadLimitExceeded {
+                    limit: self.limits.max_upload_bytes,
+                    attempted,
+                });
+            }
+            staged.file_mut().write_all(&buffer[..read])?;
+            hasher.update(&buffer[..read]);
+            byte_size = attempted;
         }
         staged.sync_journal()?;
 
@@ -154,9 +161,16 @@ impl Store {
             &hash,
             byte_size,
             staged.data_path(),
+            self.limits.max_finalized_blob_bytes,
         )?;
         staged.cleanup()?;
         Ok(record)
+    }
+
+    pub fn physical_usage(&self) -> Result<PhysicalUsage, StoreError> {
+        Ok(PhysicalUsage {
+            finalized_unique_blob_bytes: finalized_unique_blob_bytes(&self.connection)?,
+        })
     }
 
     pub fn blob_record(&self, hash: &BlobHash) -> Result<Option<BlobRecord>, StoreError> {
@@ -391,6 +405,7 @@ fn finalize_blob(
     hash: &BlobHash,
     byte_size: u64,
     staged_path: &Path,
+    max_finalized_blob_bytes: u64,
 ) -> Result<BlobRecord, StoreError> {
     connection.execute_batch("BEGIN IMMEDIATE")?;
     let final_path = blob_path(root, hash);
@@ -398,7 +413,8 @@ fn finalize_blob(
     let mut installed_new = false;
 
     let result = (|| {
-        let record = insert_and_verify_blob_metadata(connection, hash, byte_size)?;
+        let record =
+            insert_and_verify_blob_metadata(connection, hash, byte_size, max_finalized_blob_bytes)?;
         fs::create_dir_all(final_parent)?;
         match fs::hard_link(staged_path, &final_path) {
             Ok(()) => {
@@ -461,38 +477,79 @@ fn insert_and_verify_blob_metadata(
     connection: &Connection,
     hash: &BlobHash,
     byte_size: u64,
+    max_finalized_blob_bytes: u64,
 ) -> Result<BlobRecord, StoreError> {
-    connection.execute(
-        "INSERT INTO blobs (hash, byte_size) VALUES (?1, ?2)
-         ON CONFLICT(hash) DO NOTHING",
-        params![hash.as_str(), sqlite_byte_size(byte_size)?],
-    )?;
+    let recorded = connection
+        .query_row(
+            "SELECT byte_size FROM blobs WHERE hash = ?1",
+            [hash.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|recorded| sqlite_size_to_u64(hash, recorded, byte_size))
+        .transpose()?;
+
+    if let Some(recorded) = recorded {
+        if recorded != byte_size {
+            return Err(StoreError::Integrity(BlobIntegrityError::SizeMismatch {
+                hash: hash.clone(),
+                recorded,
+                actual: byte_size,
+            }));
+        }
+    } else {
+        let current = finalized_unique_blob_bytes(connection)?;
+        if byte_size > 0
+            && current
+                .checked_add(byte_size)
+                .is_none_or(|total| total > max_finalized_blob_bytes)
+        {
+            return Err(StoreError::GlobalBlobBudgetExceeded {
+                limit: max_finalized_blob_bytes,
+                current,
+                additional: byte_size,
+            });
+        }
+        connection.execute(
+            "INSERT INTO blobs (hash, byte_size) VALUES (?1, ?2)",
+            params![hash.as_str(), sqlite_byte_size(byte_size)?],
+        )?;
+    }
     connection.execute(
         "DELETE FROM blob_deletion_queue WHERE blob_hash = ?1",
         [hash.as_str()],
     )?;
-    let recorded = connection.query_row(
-        "SELECT byte_size FROM blobs WHERE hash = ?1",
-        [hash.as_str()],
-        |row| row.get::<_, i64>(0),
-    )?;
-    let recorded = u64::try_from(recorded).map_err(|_| {
-        StoreError::Integrity(BlobIntegrityError::SizeMismatch {
-            hash: hash.clone(),
-            recorded: 0,
-            actual: byte_size,
-        })
-    })?;
-    if recorded != byte_size {
-        return Err(StoreError::Integrity(BlobIntegrityError::SizeMismatch {
-            hash: hash.clone(),
-            recorded,
-            actual: byte_size,
-        }));
-    }
     Ok(BlobRecord {
         hash: hash.clone(),
         byte_size,
+    })
+}
+
+fn finalized_unique_blob_bytes(connection: &Connection) -> Result<u64, StoreError> {
+    let mut statement = connection.prepare("SELECT byte_size FROM blobs ORDER BY hash")?;
+    let sizes = statement.query_map([], |row| row.get::<_, i64>(0))?;
+    let mut total = 0_u64;
+    for size in sizes {
+        let size = u64::try_from(size?).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "negative blob byte count in metadata",
+            )
+        })?;
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| io::Error::other("finalized blob usage exceeds u64"))?;
+    }
+    Ok(total)
+}
+
+fn sqlite_size_to_u64(hash: &BlobHash, recorded: i64, actual: u64) -> Result<u64, StoreError> {
+    u64::try_from(recorded).map_err(|_| {
+        StoreError::Integrity(BlobIntegrityError::SizeMismatch {
+            hash: hash.clone(),
+            recorded: 0,
+            actual,
+        })
     })
 }
 
@@ -554,13 +611,22 @@ pub(super) fn drain_blob_deletion_queue(
     result
 }
 
-pub(super) fn recover_blob_store(connection: &Connection, root: &Path) -> Result<(), StoreError> {
+pub(super) fn recover_blob_store(
+    connection: &Connection,
+    root: &Path,
+    max_finalized_blob_bytes: u64,
+) -> Result<(), StoreError> {
     let staging = root.join(BLOB_DIRECTORY).join(STAGING_DIRECTORY);
     fs::create_dir_all(&staging)?;
-    recover_staging(connection, root, &staging)
+    recover_staging(connection, root, &staging, max_finalized_blob_bytes)
 }
 
-fn recover_staging(connection: &Connection, root: &Path, staging: &Path) -> Result<(), StoreError> {
+fn recover_staging(
+    connection: &Connection,
+    root: &Path,
+    staging: &Path,
+    max_finalized_blob_bytes: u64,
+) -> Result<(), StoreError> {
     for entry in fs::read_dir(staging)? {
         let path = entry?.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("part") {
@@ -577,7 +643,14 @@ fn recover_staging(connection: &Connection, root: &Path, staging: &Path) -> Resu
             Err(error) => return Err(error.into()),
         };
         match lock_file.try_lock() {
-            Ok(()) => recover_staged_blob(connection, root, staging, &path, &lock_path)?,
+            Ok(()) => recover_staged_blob(
+                connection,
+                root,
+                staging,
+                &path,
+                &lock_path,
+                max_finalized_blob_bytes,
+            )?,
             Err(fs::TryLockError::WouldBlock) => {}
             Err(fs::TryLockError::Error(error)) => return Err(error.into()),
         }
@@ -611,6 +684,7 @@ fn recover_staged_blob(
     staging: &Path,
     staged_path: &Path,
     lock_path: &Path,
+    max_finalized_blob_bytes: u64,
 ) -> Result<(), StoreError> {
     let hash = hash_file(staged_path)?;
     let byte_size = fs::metadata(staged_path)?.len();
@@ -618,8 +692,19 @@ fn recover_staged_blob(
     if final_path.exists() {
         verify_file_size(&final_path, &hash, byte_size)?;
         connection.execute_batch("BEGIN IMMEDIATE")?;
+        let mut metadata_existed = false;
         let result = (|| {
-            insert_and_verify_blob_metadata(connection, &hash, byte_size)?;
+            metadata_existed = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE hash = ?1)",
+                [hash.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            insert_and_verify_blob_metadata(
+                connection,
+                &hash,
+                byte_size,
+                max_finalized_blob_bytes,
+            )?;
             connection.execute_batch("COMMIT")?;
             Ok(())
         })();
@@ -627,7 +712,12 @@ fn recover_staged_blob(
             if !connection.is_autocommit() {
                 let _ = connection.execute_batch("ROLLBACK");
             }
-            return Err(error);
+            if matches!(error, StoreError::GlobalBlobBudgetExceeded { .. }) && !metadata_existed {
+                remove_if_exists(&final_path)?;
+                sync_directory(final_path.parent().expect("blob path has a parent"))?;
+            } else {
+                return Err(error);
+            }
         }
     }
     remove_if_exists(staged_path)?;

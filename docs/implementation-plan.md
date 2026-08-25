@@ -37,7 +37,8 @@ The placeholder binary on `main` marks the planning baseline. Feature work shoul
 - Implement explicit session close as an atomic metadata and blob purge.
 - Implement seven-day inactivity calculation and a deterministic garbage-collection operation.
 - Track publication activity and visible-viewer heartbeats without treating background reads as activity.
-- Enforce configurable per-file and per-session storage limits before committing a post.
+- Enforce a configurable per-file upload ceiling while streaming each staging file.
+- Enforce one configurable global physical blob budget charged by unique finalized bytes. Deduplicated content adds no usage.
 
 ### Test-first scenarios
 
@@ -49,8 +50,10 @@ The placeholder binary on `main` marks the planning baseline. Feature work shoul
 - Closing one session retains blobs referenced by another session.
 - Closing the final referencing session removes the blob and session record.
 - Inactivity purge respects publication and visible-viewer activity.
-- Limit violations reject the full transaction and preserve the existing feed.
-- Startup recovers or removes interrupted temporary writes safely.
+- Per-file ceiling violations leave no staging file, finalized blob, or metadata.
+- Concurrent unique blob finalization cannot overcommit the global budget.
+- Startup recovery removes an uncommitted final file and staging journal when adopting it would exceed the configured global budget.
+- Temporary staging remains bounded per upload but is outside finalized-store accounting; ordinary filesystem-full errors remain possible.
 
 ### Exit criteria
 
@@ -65,6 +68,7 @@ The placeholder binary on `main` marks the planning baseline. Feature work shoul
 - Define versioned request, response, and error schemas for health, session resolution, publication, listing, revision lookup, heartbeat, and close.
 - Implement authenticated and unauthenticated loopback API modes.
 - Implement streaming multipart publication so the CLI uploads bytes rather than granting path access.
+- Reject the whole publication when any upload exceeds the per-file ceiling or its additional unique finalized bytes exceed the global budget.
 - Add content sniffing and extension/declaration validation.
 - Implement minimal project and Git provenance collection in the CLI.
 - Parse Markdown and HTML resource references in the CLI, collect contained allowlisted assets, and reject traversal or symlink escape.
@@ -222,7 +226,7 @@ The implementation should choose these only when a failing test or phase require
 - Rust crate boundaries and third-party crates;
 - exact SQL tables and indexes;
 - API paths and JSON field names;
-- default byte limits and browser virtualization thresholds;
+- production default byte values for the global physical blob budget, per-file upload ceiling, and browser virtualization thresholds;
 - visual theme and component styling;
 - Base58 versus Base62 public IDs;
 - token transport details;
