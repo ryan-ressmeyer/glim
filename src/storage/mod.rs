@@ -8,23 +8,26 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 mod blob;
+mod classification;
 mod lifecycle;
 mod publication;
 mod read;
 
 pub use blob::{BlobHash, BlobIntegrityError, BlobRecord, InvalidBlobHash};
+pub use classification::ArtifactRenderer;
 pub use lifecycle::LifecycleReport;
 pub(crate) use publication::PublicationStagingWriter;
 pub use publication::{
     PostRecord, PublicationFile, PublicationIdentity, PublicationRequest, PublicationSupportAsset,
     PublishedPublication, StagedPublicationBlob,
 };
+pub(crate) use read::AssociatedArtifact;
 pub use read::{
     BlobRead, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageRequest, PostFileRead, PostPage, PostRead,
     ProjectRead, SessionRead, SupportAssetRead,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
 const PUBLIC_ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const INITIAL_PUBLIC_ID_LENGTH: usize = 6;
@@ -150,6 +153,14 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE UNIQUE INDEX support_assets_entry_position
             ON support_assets(entry_file_id, position);
+        "#,
+    },
+    Migration {
+        version: 5,
+        sql: r#"
+            ALTER TABLE post_files ADD COLUMN media_type TEXT NOT NULL DEFAULT 'application/octet-stream';
+            ALTER TABLE post_files ADD COLUMN renderer TEXT NOT NULL DEFAULT 'download'
+                CHECK (renderer IN ('image','svg','pdf','video','audio','markdown','text','json','csv','html','download'));
         "#,
     },
 ];
@@ -497,7 +508,12 @@ pub enum StoreError {
     DuplicateSupportPath {
         relative_path: String,
     },
+    InvalidSupportPath {
+        relative_path: String,
+    },
     PublicationStagingStoreMismatch,
+    ArtifactClassificationFailed,
+    ArtifactNotFound,
 }
 
 impl fmt::Display for StoreError {
@@ -565,9 +581,16 @@ impl fmt::Display for StoreError {
                     "duplicate support path under one entry: {relative_path}"
                 )
             }
+            Self::InvalidSupportPath { relative_path } => {
+                write!(formatter, "invalid relative support path: {relative_path}")
+            }
             Self::PublicationStagingStoreMismatch => {
                 formatter.write_str("staged publication blob belongs to another store")
             }
+            Self::ArtifactClassificationFailed => {
+                formatter.write_str("artifact media declaration contradicts its filename or bytes")
+            }
+            Self::ArtifactNotFound => formatter.write_str("associated artifact was not found"),
         }
     }
 }
@@ -595,7 +618,10 @@ impl Error for StoreError {
             | Self::PredecessorNotFound { .. }
             | Self::CrossSessionPredecessor { .. }
             | Self::DuplicateSupportPath { .. }
-            | Self::PublicationStagingStoreMismatch => None,
+            | Self::InvalidSupportPath { .. }
+            | Self::PublicationStagingStoreMismatch
+            | Self::ArtifactClassificationFailed
+            | Self::ArtifactNotFound => None,
         }
     }
 }
@@ -771,7 +797,7 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::InvalidMigrationPlan {
-                expected: 4,
+                expected: 5,
                 found: 0
             }
         ));

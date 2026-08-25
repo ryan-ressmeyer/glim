@@ -78,7 +78,11 @@ This foundation does not satisfy the Phase 2 exit criteria.
 
 Phase 2B wires the runnable daemon to a persistent per-user store and adds `POST /api/v1/posts`. The endpoint requires a bounded manifest-first multipart request, stages artifact chunks without holding the shared SQLite mutex, and cleans incomplete stages when parsing fails or a request is cancelled. Publication resolves or creates its project and session inside the same immediate transaction used for predecessor checks, quota enforcement, blob finalization, post insertion, and activity updates. The checked OpenAPI artifact documents the multipart contract, limits, response, and stable error codes.
 
-Phase 2 remains incomplete. CLI publication, source-asset discovery, MIME sniffing and validation, artifact-byte serving, authentication modes, and final configuration precedence remain pending.
+### Phase 2C artifact classification and delivery completed
+
+Phase 2C validates visible-file media declarations against manifest filenames and bounded byte prefixes. Schema v5 persists the effective media type and a closed renderer classification; older files migrate to the download fallback without scanning finalized bytes. Versioned `GET` and `HEAD` routes stream visible files and associated nested support assets from validated open blob handles after releasing the store mutex. The routes implement one RFC 9110 byte range, immutable caching, sanitized dispositions, nosniff, restrictive sandbox policy, exact association lookup, and traversal-resistant support paths.
+
+Phase 2 remains incomplete. CLI publication, source-asset discovery, authentication modes, and final configuration precedence remain pending.
 
 ### Scope
 
@@ -86,7 +90,7 @@ Phase 2 remains incomplete. CLI publication, source-asset discovery, MIME sniffi
 - Implement authenticated and unauthenticated loopback API modes.
 - Implement streaming multipart publication so the CLI uploads bytes rather than granting path access.
 - Reject the whole publication when any upload exceeds the per-file ceiling or its additional unique finalized bytes exceed the global budget.
-- Add content sniffing and extension/declaration validation.
+- [Completed in Phase 2C] Add content sniffing and extension/declaration validation.
 - Implement minimal project and Git provenance collection in the CLI.
 - Parse Markdown and HTML resource references in the CLI, collect contained allowlisted assets, and reject traversal or symlink escape.
 - Implement canonical JSON-on-stdin publication and JSON output.

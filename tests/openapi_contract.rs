@@ -5,9 +5,9 @@ use axum::{
     http::{Request, StatusCode},
 };
 use glim::{
-    PHASE_2A_ROUTES,
+    API_V1_ROUTES,
     api::{ErrorBody, ErrorEnvelope, ResolveSessionRequest},
-    storage::SessionRead,
+    storage::{PostFileRead, SessionRead},
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -24,11 +24,11 @@ fn openapi_paths_and_methods_exactly_match_current_api_routes() {
             item.as_object()
                 .unwrap()
                 .keys()
-                .filter(|method| ["get", "post", "delete"].contains(&method.as_str()))
+                .filter(|method| ["get", "head", "post", "delete"].contains(&method.as_str()))
                 .map(move |method| (method.to_uppercase(), path.clone()))
         })
         .collect::<BTreeSet<_>>();
-    let implemented = PHASE_2A_ROUTES
+    let implemented = API_V1_ROUTES
         .iter()
         .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
         .collect::<BTreeSet<_>>();
@@ -66,6 +66,20 @@ fn representative_fixtures_match_the_rust_serde_contracts() {
         "Glim"
     );
 
+    let file: PostFileRead = serde_json::from_value(json!({
+        "position":0, "filename":"plot.png", "caption":null, "media_type":"image/png", "renderer":"image",
+        "blob":{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","byte_size":8}, "support_assets":[]
+    })).unwrap();
+    assert_eq!(serde_json::to_value(file).unwrap()["renderer"], "image");
+    assert!(serde_json::from_value::<PostFileRead>(json!({
+        "position":0, "filename":"x", "caption":null, "media_type":"application/octet-stream", "renderer":"other",
+        "blob":{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","byte_size":0}, "support_assets":[]
+    })).is_err());
+    assert!(serde_json::from_value::<PostFileRead>(json!({
+        "position":0, "filename":"x", "caption":null, "media_type":"application/octet-stream", "renderer":"download",
+        "blob":{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","byte_size":0}, "support_assets":[], "unknown":true
+    })).is_err());
+
     let error = ErrorEnvelope {
         error: ErrorBody {
             code: "post_not_found".into(),
@@ -101,6 +115,29 @@ fn representative_fixtures_match_the_rust_serde_contracts() {
             "missing {schema}"
         );
     }
+    let visible = &document["paths"]["/api/v1/posts/{post_id}/files/{position}/content"];
+    let support =
+        &document["paths"]["/api/v1/posts/{post_id}/files/{position}/support/{asset_path}"];
+    for operation in [
+        &visible["get"],
+        &visible["head"],
+        &support["get"],
+        &support["head"],
+    ] {
+        for status in ["400", "404", "416", "500", "503"] {
+            assert!(
+                operation["responses"].get(status).is_some(),
+                "artifact operation missing {status}"
+            );
+        }
+        assert!(
+            operation["responses"]["200"]["content"]
+                .get("*/*")
+                .is_some(),
+            "artifact response must document dynamic content type"
+        );
+    }
+
     let heartbeat = &document["paths"]["/api/v1/sessions/{public_id}/heartbeat"]["post"];
     assert!(heartbeat.get("requestBody").is_none());
     assert!(!document.to_string().contains("occurred_at"));
@@ -114,12 +151,14 @@ async fn every_documented_operation_is_recognized_by_the_actual_router() {
         let uri = path
             .replace("{public_id}", "missing")
             .replace("{project_id}", "1")
-            .replace("{post_id}", "1");
+            .replace("{post_id}", "1")
+            .replace("{position}", "0")
+            .replace("{asset_path}", "nested/asset.png");
         for method in item
             .as_object()
             .unwrap()
             .keys()
-            .filter(|key| ["get", "post", "delete"].contains(&key.as_str()))
+            .filter(|key| ["get", "head", "post", "delete"].contains(&key.as_str()))
         {
             let method_value =
                 axum::http::Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();

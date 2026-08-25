@@ -86,7 +86,7 @@ fn publication_preserves_content_order_timestamp_and_advances_activity() {
                         }],
                     },
                     PublicationFile {
-                        filename: "raw.csv".to_owned(),
+                        filename: "raw.txt".to_owned(),
                         caption: None,
                         blob: second,
                         support_assets: vec![],
@@ -145,7 +145,7 @@ fn publication_preserves_content_order_timestamp_and_advances_activity() {
         files,
         [
             (0, "index.md".to_owned(), Some("Entry document".to_owned())),
-            (1, "raw.csv".to_owned(), None),
+            (1, "raw.txt".to_owned(), None),
         ]
     );
     assert_eq!(
@@ -224,7 +224,7 @@ fn duplicate_content_has_one_physical_blob_and_one_reference_per_occurrence() {
                 commentary: "Result".to_owned(),
                 predecessor_post_id: None,
                 files: vec![PublicationFile {
-                    filename: "entry.html".to_owned(),
+                    filename: "entry.txt".to_owned(),
                     caption: None,
                     blob: first,
                     support_assets: vec![PublicationSupportAsset {

@@ -62,6 +62,10 @@ pub struct BlobRecord {
 }
 
 impl BlobRecord {
+    pub(super) fn from_parts(hash: BlobHash, byte_size: u64) -> Self {
+        Self { hash, byte_size }
+    }
+
     pub fn hash(&self) -> &BlobHash {
         &self.hash
     }

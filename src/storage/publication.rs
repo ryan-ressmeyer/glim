@@ -37,7 +37,7 @@ pub struct StagedPublicationBlob {
     root: PathBuf,
     staging_directory: PathBuf,
     lock_path: PathBuf,
-    data_path: PathBuf,
+    pub(super) data_path: PathBuf,
     journal_path: PathBuf,
     lock_file: File,
     hash: BlobHash,
@@ -127,7 +127,7 @@ impl Store {
         request: PublicationRequest,
         published_at: i64,
     ) -> Result<PostRecord, StoreError> {
-        self.publish_internal(None, request, published_at)
+        self.publish_internal(None, request, published_at, None)
     }
 
     pub fn publish_resolving_at(
@@ -136,7 +136,18 @@ impl Store {
         request: PublicationRequest,
         published_at: i64,
     ) -> Result<PublishedPublication, StoreError> {
-        let record = self.publish_internal(Some(identity), request, published_at)?;
+        self.publish_resolving_classified_at(identity, request, published_at, None)
+    }
+
+    pub(crate) fn publish_resolving_classified_at(
+        &mut self,
+        identity: PublicationIdentity,
+        request: PublicationRequest,
+        published_at: i64,
+        declared_media_types: Option<Vec<Option<String>>>,
+    ) -> Result<PublishedPublication, StoreError> {
+        let record =
+            self.publish_internal(Some(identity), request, published_at, declared_media_types)?;
         Ok(PublishedPublication {
             session: self.session(&record.session_public_id)?,
             post: self.post(record.id)?,
@@ -156,8 +167,21 @@ impl Store {
         identity: Option<PublicationIdentity>,
         mut request: PublicationRequest,
         published_at: i64,
+        declared_media_types: Option<Vec<Option<String>>>,
     ) -> Result<PostRecord, StoreError> {
         validate_request(&request, &self.root, self.limits.max_upload_bytes)?;
+        let classifications = request
+            .files
+            .iter()
+            .enumerate()
+            .map(|(position, file)| {
+                let declared = declared_media_types
+                    .as_ref()
+                    .and_then(|values| values.get(position))
+                    .and_then(Option::as_deref);
+                super::classification::classify_staged(&file.blob, &file.filename, declared)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let mut installed = Vec::new();
@@ -290,16 +314,24 @@ impl Store {
 
             for (position, file) in request.files.iter().enumerate() {
                 let reference_id = insert_reference(&self.connection, post_id, &file.blob.hash)?;
+                let classification = &classifications[position];
+                let renderer = serde_json::to_value(classification.renderer)
+                    .expect("renderer serializes")
+                    .as_str()
+                    .expect("renderer is a string")
+                    .to_owned();
                 self.connection.execute(
                     "INSERT INTO post_files
-                     (post_id, blob_reference_id, position, filename, caption)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     (post_id, blob_reference_id, position, filename, caption, media_type, renderer)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         post_id,
                         reference_id,
                         i64::try_from(position).expect("publication file count exceeds i64"),
                         file.filename,
-                        file.caption
+                        file.caption,
+                        classification.media_type,
+                        renderer
                     ],
                 )?;
                 let entry_file_id = self.connection.last_insert_rowid();
@@ -451,6 +483,18 @@ fn validate_request(
         let mut paths = HashSet::new();
         for asset in &file.support_assets {
             validate_staged_blob(&asset.blob, root, max_upload_bytes)?;
+            if asset.relative_path.starts_with('/')
+                || asset.relative_path.contains('\\')
+                || asset.relative_path.chars().any(char::is_control)
+                || asset
+                    .relative_path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(StoreError::InvalidSupportPath {
+                    relative_path: asset.relative_path.clone(),
+                });
+            }
             if !paths.insert(asset.relative_path.as_str()) {
                 return Err(StoreError::DuplicateSupportPath {
                     relative_path: asset.relative_path.clone(),

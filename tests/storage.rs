@@ -384,6 +384,45 @@ fn version_two_posts_migrate_with_a_signed_publication_timestamp() {
 }
 
 #[test]
+fn version_four_files_migrate_to_conservative_download_classification() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let session = store
+        .resolve_session("pi", "v4", "Legacy", "/legacy-v4")
+        .unwrap();
+    let blob = store
+        .stage_publication_blob(std::io::Cursor::new(b"# historical"))
+        .unwrap();
+    let post_id = store
+        .publish_at(
+            glim::storage::PublicationRequest {
+                session_public_id: session.public_id,
+                title: "Legacy".into(),
+                commentary: "Historical".into(),
+                predecessor_post_id: None,
+                files: vec![glim::storage::PublicationFile {
+                    filename: "entry.md".into(),
+                    caption: None,
+                    blob,
+                    support_assets: vec![],
+                }],
+            },
+            1,
+        )
+        .unwrap()
+        .id;
+    drop(store);
+    let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    connection.execute_batch("ALTER TABLE post_files DROP COLUMN renderer; ALTER TABLE post_files DROP COLUMN media_type; PRAGMA user_version = 4;").unwrap();
+    drop(connection);
+
+    let reopened = Store::open(root.path()).unwrap();
+    let file = &reopened.post(post_id).unwrap().files[0];
+    assert_eq!(file.media_type, "application/octet-stream");
+    assert_eq!(file.renderer, glim::storage::ArtifactRenderer::Download);
+}
+
+#[test]
 fn populated_version_three_store_backfills_deterministic_support_asset_positions() {
     let root = TempDir::new().unwrap();
     std::fs::create_dir_all(root.path()).unwrap();
@@ -394,8 +433,18 @@ fn populated_version_three_store_backfills_deterministic_support_asset_positions
     drop(connection);
 
     let reopened = Store::open(root.path()).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 4);
+    assert_eq!(reopened.schema_version().unwrap(), 5);
     let post = reopened.post(1).unwrap();
+    assert!(
+        post.files
+            .iter()
+            .all(|file| file.media_type == "application/octet-stream")
+    );
+    assert!(
+        post.files
+            .iter()
+            .all(|file| file.renderer == glim::storage::ArtifactRenderer::Download)
+    );
     let read_paths = post
         .files
         .iter()

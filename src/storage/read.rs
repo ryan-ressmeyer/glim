@@ -1,9 +1,9 @@
-use std::io;
+use std::{fs::File, io};
 
 use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
-use super::{Store, StoreError};
+use super::{ArtifactRenderer, BlobHash, BlobRecord, Store, StoreError};
 
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
 pub const MAX_PAGE_LIMIT: u32 = 100;
@@ -45,10 +45,13 @@ pub struct SupportAssetRead {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostFileRead {
     pub position: u32,
     pub filename: String,
     pub caption: Option<String>,
+    pub media_type: String,
+    pub renderer: ArtifactRenderer,
     pub blob: BlobRead,
     pub support_assets: Vec<SupportAssetRead>,
 }
@@ -69,6 +72,14 @@ pub struct PostRead {
 pub struct PostPage {
     pub posts: Vec<PostRead>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AssociatedArtifact {
+    pub file: File,
+    pub filename: String,
+    pub media_type: String,
+    pub byte_size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +150,75 @@ impl Store {
 
     pub fn global_posts(&self, page: PageRequest) -> Result<PostPage, StoreError> {
         self.posts_page("1 = ?", 1_i64, page)
+    }
+
+    pub(crate) fn open_visible_artifact(
+        &self,
+        post_id: i64,
+        position: u32,
+    ) -> Result<AssociatedArtifact, StoreError> {
+        let found = self
+            .connection
+            .query_row(
+                "SELECT f.filename, f.media_type, b.hash, b.byte_size FROM post_files f
+             JOIN blob_references r ON r.id=f.blob_reference_id JOIN blobs b ON b.hash=r.blob_hash
+             WHERE f.post_id=?1 AND f.position=?2",
+                params![post_id, i64::from(position)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::ArtifactNotFound)?;
+        self.open_associated(found.0, found.1, found.2, found.3)
+    }
+
+    pub(crate) fn open_support_artifact(
+        &self,
+        post_id: i64,
+        position: u32,
+        relative_path: &str,
+    ) -> Result<AssociatedArtifact, StoreError> {
+        let found = self.connection.query_row(
+            "SELECT a.relative_path, b.hash, b.byte_size FROM support_assets a
+             JOIN post_files f ON f.id=a.entry_file_id JOIN blob_references r ON r.id=a.blob_reference_id
+             JOIN blobs b ON b.hash=r.blob_hash WHERE a.post_id=?1 AND f.position=?2 AND a.relative_path=?3",
+            params![post_id, i64::from(position), relative_path],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+        ).optional()?.ok_or(StoreError::ArtifactNotFound)?;
+        let hash = BlobHash::parse(&found.1).map_err(|_| invalid_metadata("blob hash"))?;
+        let byte_size = u64::try_from(found.2).map_err(|_| invalid_metadata("blob byte size"))?;
+        let file = self.open_blob(&BlobRecord::from_parts(hash, byte_size))?;
+        let media_type = super::classification::safe_support_media_type(&found.0, &file)?;
+        Ok(AssociatedArtifact {
+            file,
+            filename: found.0,
+            media_type,
+            byte_size,
+        })
+    }
+
+    fn open_associated(
+        &self,
+        filename: String,
+        media_type: String,
+        hash: String,
+        byte_size: i64,
+    ) -> Result<AssociatedArtifact, StoreError> {
+        let hash = BlobHash::parse(&hash).map_err(|_| invalid_metadata("blob hash"))?;
+        let byte_size = u64::try_from(byte_size).map_err(|_| invalid_metadata("blob byte size"))?;
+        let file = self.open_blob(&BlobRecord::from_parts(hash, byte_size))?;
+        Ok(AssociatedArtifact {
+            file,
+            filename,
+            media_type,
+            byte_size,
+        })
     }
 
     fn posts_page(
@@ -223,7 +303,7 @@ fn load_post(
     ).optional()? else { return Ok(None); };
     let raw_files = connection
         .prepare(
-            "SELECT f.id, f.position, f.filename, f.caption, b.hash, b.byte_size
+            "SELECT f.id, f.position, f.filename, f.caption, f.media_type, f.renderer, b.hash, b.byte_size
          FROM post_files f JOIN blob_references r ON r.id = f.blob_reference_id
          JOIN blobs b ON b.hash = r.blob_hash WHERE f.post_id = ?1 ORDER BY f.position ASC",
         )?
@@ -234,12 +314,14 @@ fn load_post(
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut files = Vec::with_capacity(raw_files.len());
-    for (file_id, position, filename, caption, hash, byte_size) in raw_files {
+    for (file_id, position, filename, caption, media_type, renderer, hash, byte_size) in raw_files {
         let position = u32::try_from(position).map_err(|_| invalid_metadata("file position"))?;
         let byte_size = u64::try_from(byte_size).map_err(|_| invalid_metadata("blob byte size"))?;
         let raw_assets = connection.prepare(
@@ -262,10 +344,14 @@ fn load_post(
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
+        let renderer = serde_json::from_value(serde_json::Value::String(renderer))
+            .map_err(|_| invalid_metadata("file renderer"))?;
         files.push(PostFileRead {
             position,
             filename,
             caption,
+            media_type,
+            renderer,
             blob: BlobRead { hash, byte_size },
             support_assets,
         });

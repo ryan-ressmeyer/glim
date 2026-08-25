@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::SeekFrom,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,13 +13,15 @@ use axum::{
         multipart::MultipartRejection,
         rejection::{BytesRejection, JsonRejection, QueryRejection},
     },
-    http::{Request, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 use crate::storage::{
     ActivityReport, LifecycleReport, PageRequest, PublicationFile, PublicationIdentity,
@@ -58,6 +61,14 @@ pub(crate) fn routes() -> Router<ApiState> {
             post(publish_post).route_layer(DefaultBodyLimit::disable()),
         )
         .route("/posts/{post_id}", get(get_post))
+        .route(
+            "/posts/{post_id}/files/{position}/content",
+            get(visible_artifact).head(visible_artifact),
+        )
+        .route(
+            "/posts/{post_id}/files/{position}/support/{*asset_path}",
+            get(support_artifact).head(support_artifact),
+        )
 }
 
 pub(crate) async fn route_not_found(OriginalUri(uri): OriginalUri) -> impl IntoResponse {
@@ -73,7 +84,17 @@ pub(crate) async fn root_not_found(OriginalUri(uri): OriginalUri) -> Response {
 }
 
 pub(crate) async fn validate_v1_path(request: Request<Body>, next: Next) -> Response {
-    if is_v1_path(request.uri().path()) && has_malformed_percent(request.uri().path()) {
+    let path = request.uri().path();
+    if is_v1_path(path) && artifact_path_is_unsafe(path) {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_path",
+            "Artifact path is malformed",
+            json!({}),
+        )
+        .into_response();
+    }
+    if is_v1_path(path) && has_malformed_percent(path) {
         return ApiError::new(
             StatusCode::BAD_REQUEST,
             "malformed_path",
@@ -83,6 +104,22 @@ pub(crate) async fn validate_v1_path(request: Request<Body>, next: Next) -> Resp
         .into_response();
     }
     next.run(request).await
+}
+
+fn artifact_path_is_unsafe(path: &str) -> bool {
+    if !path.contains("/support/") {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    lower.contains("%2f")
+        || lower.contains("%5c")
+        || path.contains("//")
+        || path.split('/').any(|segment| {
+            segment == "."
+                || segment == ".."
+                || segment.eq_ignore_ascii_case("%2e")
+                || segment.eq_ignore_ascii_case("%2e%2e")
+        })
 }
 
 fn is_v1_path(path: &str) -> bool {
@@ -211,6 +248,7 @@ pub struct ManifestFile {
     pub part: String,
     pub filename: String,
     pub caption: Option<String>,
+    pub media_type: Option<String>,
     #[serde(default)]
     pub support_assets: Vec<ManifestSupportAsset>,
 }
@@ -364,6 +402,11 @@ async fn publish_post(
         project_label: manifest.project_label,
         working_directory: manifest.working_directory,
     };
+    let declared_media_types = manifest
+        .files
+        .iter()
+        .map(|file| file.media_type.clone())
+        .collect();
     let files = manifest
         .files
         .into_iter()
@@ -395,7 +438,12 @@ async fn publish_post(
     };
     let published_at = daemon_unix_seconds()?;
     let PublishedPublication { session, post } = with_store(state, move |store| {
-        store.publish_resolving_at(identity, request, published_at)
+        store.publish_resolving_classified_at(
+            identity,
+            request,
+            published_at,
+            Some(declared_media_types),
+        )
     })
     .await?;
     Ok((
@@ -509,6 +557,199 @@ async fn finish_staging_writer(
         .await
         .map_err(|_| ApiError::internal())?
         .map_err(ApiError::from)
+}
+
+async fn visible_artifact(
+    State(state): State<ApiState>,
+    method: Method,
+    headers: HeaderMap,
+    Path((post_id, position)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let post_id = positive_id(&post_id)?;
+    let position = position.parse::<u32>().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_path",
+            "File position must be a nonnegative integer",
+            json!({}),
+        )
+    })?;
+    let artifact = with_store(state, move |store| {
+        store.open_visible_artifact(post_id, position)
+    })
+    .await?;
+    artifact_response(method, headers, artifact).await
+}
+
+async fn support_artifact(
+    State(state): State<ApiState>,
+    method: Method,
+    headers: HeaderMap,
+    Path((post_id, position, asset_path)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let post_id = positive_id(&post_id)?;
+    let position = position.parse::<u32>().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_path",
+            "File position must be a nonnegative integer",
+            json!({}),
+        )
+    })?;
+    if asset_path.is_empty()
+        || asset_path.contains('\\')
+        || asset_path.chars().any(char::is_control)
+        || asset_path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_path",
+            "Support asset path is malformed",
+            json!({}),
+        ));
+    }
+    let requested = asset_path.clone();
+    let artifact = with_store(state, move |store| {
+        store.open_support_artifact(post_id, position, &requested)
+    })
+    .await?;
+    artifact_response(method, headers, artifact).await
+}
+
+async fn artifact_response(
+    method: Method,
+    headers: HeaderMap,
+    artifact: crate::storage::AssociatedArtifact,
+) -> Result<Response, ApiError> {
+    let range = parse_range(headers.get(header::RANGE), artifact.byte_size);
+    let (status, start, length, content_range) = match range {
+        Ok(Some((start, end))) => (
+            StatusCode::PARTIAL_CONTENT,
+            start,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{}", artifact.byte_size)),
+        ),
+        Ok(None) => (StatusCode::OK, 0, artifact.byte_size, None),
+        Err(()) => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            artifact_headers(response.headers_mut(), &artifact, 0)?;
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{}", artifact.byte_size))
+                    .map_err(|_| ApiError::internal())?,
+            );
+            return Ok(response);
+        }
+    };
+    let mut response_headers = HeaderMap::new();
+    artifact_headers(&mut response_headers, &artifact, length)?;
+    if let Some(value) = content_range {
+        response_headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&value).map_err(|_| ApiError::internal())?,
+        );
+    }
+    let mut response = if method == Method::HEAD || length == 0 {
+        Response::new(Body::empty())
+    } else {
+        let mut file = tokio::fs::File::from_std(artifact.file);
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(StoreError::from)?;
+        Response::new(Body::from_stream(ReaderStream::new(file.take(length))))
+    };
+    *response.status_mut() = status;
+    *response.headers_mut() = response_headers;
+    Ok(response)
+}
+
+fn artifact_headers(
+    headers: &mut HeaderMap,
+    artifact: &crate::storage::AssociatedArtifact,
+    length: u64,
+) -> Result<(), ApiError> {
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&artifact.media_type).map_err(|_| ApiError::internal())?,
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&length.to_string()).map_err(|_| ApiError::internal())?,
+    );
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    let disposition = if artifact.media_type == "application/octet-stream" {
+        "attachment"
+    } else {
+        "inline"
+    };
+    let mut safe_name: String = artifact
+        .filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe_name.is_empty() {
+        safe_name.push_str("download");
+    }
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("{disposition}; filename=\"{safe_name}\""))
+            .map_err(|_| ApiError::internal())?,
+    );
+    Ok(())
+}
+
+fn parse_range(header: Option<&HeaderValue>, length: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(value) = header else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| ())?;
+    let spec = value.strip_prefix("bytes=").ok_or(())?;
+    if spec.contains(',') {
+        return Err(());
+    }
+    let (first, last) = spec.split_once('-').ok_or(())?;
+    if first.is_empty() {
+        let suffix = last.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 || length == 0 {
+            return Err(());
+        }
+        let start = length.saturating_sub(suffix);
+        return Ok(Some((start, length - 1)));
+    }
+    let start = first.parse::<u64>().map_err(|_| ())?;
+    if start >= length {
+        return Err(());
+    }
+    let end = if last.is_empty() {
+        length - 1
+    } else {
+        last.parse::<u64>().map_err(|_| ())?.min(length - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
 }
 
 async fn get_post(
@@ -759,10 +1000,23 @@ impl From<StoreError> for ApiError {
                 "Storage budget would be exceeded",
                 json!({"limit": limit, "current": current, "additional": additional}),
             ),
+            StoreError::ArtifactNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "artifact_not_found",
+                "Associated artifact was not found",
+                json!({}),
+            ),
+            StoreError::ArtifactClassificationFailed => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "artifact_classification_failed",
+                "Artifact bytes contradict the filename or declared media type",
+                json!({}),
+            ),
             StoreError::BlankPublicationTitle
             | StoreError::BlankPublicationCommentary
             | StoreError::PublicationRequiresFile
-            | StoreError::DuplicateSupportPath { .. } => Self::new(
+            | StoreError::DuplicateSupportPath { .. }
+            | StoreError::InvalidSupportPath { .. } => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_failed",
                 "Publication validation failed",

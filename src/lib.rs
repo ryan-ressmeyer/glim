@@ -2,7 +2,7 @@ pub mod api;
 pub mod daemon;
 pub mod storage;
 
-pub const PHASE_2A_ROUTES: &[(&str, &str)] = &[
+pub const API_V1_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/health"),
     ("POST", "/api/v1/sessions"),
     ("GET", "/api/v1/sessions/{public_id}"),
@@ -13,6 +13,16 @@ pub const PHASE_2A_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/posts"),
     ("POST", "/api/v1/posts"),
     ("GET", "/api/v1/posts/{post_id}"),
+    ("GET", "/api/v1/posts/{post_id}/files/{position}/content"),
+    ("HEAD", "/api/v1/posts/{post_id}/files/{position}/content"),
+    (
+        "GET",
+        "/api/v1/posts/{post_id}/files/{position}/support/{asset_path}",
+    ),
+    (
+        "HEAD",
+        "/api/v1/posts/{post_id}/files/{position}/support/{asset_path}",
+    ),
 ];
 
 use axum::{

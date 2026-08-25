@@ -91,8 +91,8 @@ fn version_one_sessions_migrate_with_fresh_equal_activity_timestamps() {
     drop(connection);
 
     let reopened = Store::open(root.path()).unwrap();
-    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
-    assert_eq!(reopened.schema_version().unwrap(), 4);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 5);
+    assert_eq!(reopened.schema_version().unwrap(), 5);
     drop(reopened);
 
     let connection = database(&root);

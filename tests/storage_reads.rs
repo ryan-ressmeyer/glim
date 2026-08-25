@@ -70,7 +70,7 @@ fn reconstructs_session_and_nested_immutable_post_without_refreshing_activity() 
                         ],
                     },
                     PublicationFile {
-                        filename: "second.csv".into(),
+                        filename: "second.txt".into(),
                         caption: None,
                         blob: second,
                         support_assets: vec![],
@@ -117,7 +117,7 @@ fn reconstructs_session_and_nested_immutable_post_without_refreshing_activity() 
             .iter()
             .map(|f| f.filename.as_str())
             .collect::<Vec<_>>(),
-        ["entry.md", "second.csv"]
+        ["entry.md", "second.txt"]
     );
     assert_eq!(post.files[0].caption.as_deref(), Some("caption\ncontinued"));
     assert_eq!(post.files[0].blob.byte_size, 7);
