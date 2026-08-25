@@ -10,11 +10,16 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 mod blob;
 mod lifecycle;
 mod publication;
+mod read;
 
 pub use blob::{BlobHash, BlobIntegrityError, BlobRecord, InvalidBlobHash};
 pub use lifecycle::LifecycleReport;
 pub use publication::{
     PostRecord, PublicationFile, PublicationRequest, PublicationSupportAsset, StagedPublicationBlob,
+};
+pub use read::{
+    BlobRead, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageRequest, PostFileRead, PostPage, PostRead,
+    ProjectRead, SessionRead, SupportAssetRead,
 };
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
@@ -150,7 +155,7 @@ pub struct PhysicalUsage {
     pub finalized_unique_blob_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActivityReport {
     pub updated: bool,
     pub last_activity_at: i64,
@@ -327,6 +332,13 @@ impl Store {
         self.record_activity(public_id, occurred_at)
     }
 
+    pub fn record_visible_viewer_heartbeat_now(
+        &mut self,
+        public_id: &str,
+    ) -> Result<ActivityReport, StoreError> {
+        self.record_activity(public_id, unix_seconds_now()?)
+    }
+
     fn record_activity(
         &mut self,
         public_id: &str,
@@ -436,6 +448,17 @@ pub enum StoreError {
     SessionNotFound {
         public_id: String,
     },
+    ProjectNotFound {
+        project_id: i64,
+    },
+    PostNotFound {
+        post_id: i64,
+    },
+    InvalidPageLimit {
+        limit: u32,
+        maximum: u32,
+    },
+    InvalidPageCursor,
     UploadLimitExceeded {
         limit: u64,
         attempted: u64,
@@ -481,6 +504,14 @@ impl fmt::Display for StoreError {
             Self::SessionNotFound { public_id } => {
                 write!(formatter, "session {public_id} was not found")
             }
+            Self::ProjectNotFound { project_id } => {
+                write!(formatter, "project {project_id} was not found")
+            }
+            Self::PostNotFound { post_id } => write!(formatter, "post {post_id} was not found"),
+            Self::InvalidPageLimit { limit, maximum } => {
+                write!(formatter, "page limit {limit} is outside 1..={maximum}")
+            }
+            Self::InvalidPageCursor => formatter.write_str("invalid page cursor"),
             Self::UploadLimitExceeded { limit, attempted } => write!(
                 formatter,
                 "upload byte limit exceeded: limit {limit}, attempted {attempted}"
@@ -535,6 +566,10 @@ impl Error for StoreError {
             | Self::Random(_)
             | Self::PublicIdExhausted
             | Self::SessionNotFound { .. }
+            | Self::ProjectNotFound { .. }
+            | Self::PostNotFound { .. }
+            | Self::InvalidPageLimit { .. }
+            | Self::InvalidPageCursor
             | Self::UploadLimitExceeded { .. }
             | Self::GlobalBlobBudgetExceeded { .. }
             | Self::BlankPublicationTitle

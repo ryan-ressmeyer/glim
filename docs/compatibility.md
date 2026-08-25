@@ -17,6 +17,18 @@ These policies apply when the corresponding interfaces are introduced. Phase 0 h
 - Removing or renaming a field, changing its type or meaning, or otherwise requiring client changes introduces a new major API path. Old and new major versions receive a documented overlap period before removal.
 - The health response in v1 keeps `ok` as a boolean and `version` as a string.
 
+### Phase 2A v1 contract
+
+The checked contract is `docs/openapi-v1.json`. It covers the Phase 2A health, session resolution and lookup, post lookup and scoped listing, heartbeat, and close operations. Publication transport and artifact-byte serving are not part of this contract.
+
+All v1 JSON fields use `snake_case`. Request objects reject unknown fields. Errors use one envelope with a stable `error.code`, a human-readable `error.message`, and an object-valued `error.details`. Unknown v1 routes and unsupported methods use the same JSON envelope; malformed v1 paths, queries, and JSON bodies return enveloped `400` responses. Raw SQLite messages, internal paths, and debug representations are not API fields.
+
+A visible-session heartbeat has no request body. The daemon records its wall-clock Unix time, so clients cannot set session activity to stale or future timestamps. The explicit-time storage operation remains a deterministic storage-test seam and is not exposed by HTTP.
+
+Post lists use bounded reverse-publication ordering. The daemon orders posts by `published_at DESC, id DESC`; an exclusive `published_at:post_id` cursor continues after the final post in a page. The default page size is 20 and the maximum is 100. Clients must treat cursors as server-issued values even though the v1 encoding is documented.
+
+Working directories returned with project metadata are identity values supplied during session resolution. The daemon does not read them as source paths. The compatibility `glim::app()` constructor exposes the complete route surface but returns `503 storage_unavailable` for stateful routes. Daemon root and configuration wiring remain a later implementation slice; tests and configured embeddings use `glim::app_with_store(Store)`.
+
 ## CLI JSON schemas
 
 - Canonical JSON input and structured output will carry an explicit schema version when they are introduced.

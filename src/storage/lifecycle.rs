@@ -2,7 +2,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::{Store, StoreError, blob};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LifecycleReport {
     pub sessions_deleted: u64,
     pub projects_deleted: u64,
