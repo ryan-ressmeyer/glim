@@ -2,25 +2,28 @@ use std::{
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 mod blob;
+mod lifecycle;
 
 pub use blob::{BlobHash, BlobIntegrityError, BlobRecord, InvalidBlobHash};
+pub use lifecycle::LifecycleReport;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
 const PUBLIC_ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const INITIAL_PUBLIC_ID_LENGTH: usize = 6;
 const PUBLIC_ID_ACCEPTANCE_BOUND: usize = (u8::MAX as usize + 1) / 58 * 58;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: r#"
         CREATE TABLE projects (
             id                INTEGER PRIMARY KEY,
             label             TEXT NOT NULL,
@@ -91,8 +94,23 @@ const MIGRATIONS: &[Migration] = &[Migration {
             FOREIGN KEY (blob_reference_id, post_id)
                 REFERENCES blob_references(id, post_id)
         );
-    "#,
-}];
+        "#,
+    },
+    Migration {
+        version: 2,
+        sql: r#"
+            ALTER TABLE sessions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER NOT NULL DEFAULT 0;
+            UPDATE sessions
+            SET created_at = CAST(strftime('%s', 'now') AS INTEGER),
+                last_activity_at = CAST(strftime('%s', 'now') AS INTEGER);
+
+            CREATE TABLE blob_deletion_queue (
+                blob_hash TEXT PRIMARY KEY REFERENCES blobs(hash) ON DELETE CASCADE
+            );
+        "#,
+    },
+];
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -105,6 +123,12 @@ pub struct SessionRecord {
     pub id: i64,
     pub public_id: String,
     pub project_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivityReport {
+    pub updated: bool,
+    pub last_activity_at: i64,
 }
 
 #[derive(Debug)]
@@ -132,6 +156,7 @@ impl Store {
         connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         apply_migrations(&mut connection, version, MIGRATIONS)?;
         blob::recover_blob_store(&connection, &root)?;
+        blob::drain_blob_deletion_queue(&connection, &root)?;
 
         Ok(Self { connection, root })
     }
@@ -176,6 +201,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let created_at = unix_seconds_now()?;
         transaction.execute(
             "INSERT INTO projects (label, working_directory) VALUES (?1, ?2)
              ON CONFLICT(working_directory) DO UPDATE SET label = excluded.label",
@@ -202,10 +228,16 @@ impl Store {
             let public_id = candidate(length)?;
             let inserted = transaction.execute(
                 "INSERT INTO sessions
-                 (public_id, integration_namespace, external_key, project_id)
-                 VALUES (?1, ?2, ?3, ?4)
+                 (public_id, integration_namespace, external_key, project_id, created_at, last_activity_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
                  ON CONFLICT(public_id) DO NOTHING",
-                params![public_id, integration_namespace, external_key, project_id],
+                params![
+                    public_id,
+                    integration_namespace,
+                    external_key,
+                    project_id,
+                    created_at
+                ],
             )?;
             if inserted == 1 {
                 break SessionRecord {
@@ -218,6 +250,54 @@ impl Store {
         };
         transaction.commit()?;
         Ok(session)
+    }
+
+    pub fn record_publication_activity(
+        &mut self,
+        public_id: &str,
+        occurred_at: i64,
+    ) -> Result<ActivityReport, StoreError> {
+        self.record_activity(public_id, occurred_at)
+    }
+
+    pub fn record_visible_viewer_heartbeat(
+        &mut self,
+        public_id: &str,
+        occurred_at: i64,
+    ) -> Result<ActivityReport, StoreError> {
+        self.record_activity(public_id, occurred_at)
+    }
+
+    fn record_activity(
+        &mut self,
+        public_id: &str,
+        occurred_at: i64,
+    ) -> Result<ActivityReport, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = transaction
+            .query_row(
+                "SELECT last_activity_at FROM sessions WHERE public_id = ?1",
+                [public_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::SessionNotFound {
+                public_id: public_id.to_owned(),
+            })?;
+        let last_activity_at = previous.max(occurred_at);
+        if last_activity_at != previous {
+            transaction.execute(
+                "UPDATE sessions SET last_activity_at = ?2 WHERE public_id = ?1",
+                params![public_id, last_activity_at],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(ActivityReport {
+            updated: last_activity_at != previous,
+            last_activity_at,
+        })
     }
 }
 
@@ -241,6 +321,17 @@ fn find_session(
             },
         )
         .optional()
+}
+
+fn unix_seconds_now() -> Result<i64, StoreError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
+    i64::try_from(duration.as_secs()).map_err(|_| {
+        StoreError::Io(std::io::Error::other(
+            "system time exceeds signed Unix seconds",
+        ))
+    })
 }
 
 fn generate_public_id(length: usize) -> Result<String, StoreError> {
@@ -277,6 +368,7 @@ pub enum StoreError {
     InvalidMigrationPlan { expected: u32, found: u32 },
     Random(getrandom::Error),
     PublicIdExhausted,
+    SessionNotFound { public_id: String },
 }
 
 impl fmt::Display for StoreError {
@@ -297,6 +389,9 @@ impl fmt::Display for StoreError {
                 write!(formatter, "operating-system randomness error: {error}")
             }
             Self::PublicIdExhausted => formatter.write_str("public session ID length exhausted"),
+            Self::SessionNotFound { public_id } => {
+                write!(formatter, "session {public_id} was not found")
+            }
         }
     }
 }
@@ -310,7 +405,8 @@ impl Error for StoreError {
             Self::SchemaTooNew { .. }
             | Self::InvalidMigrationPlan { .. }
             | Self::Random(_)
-            | Self::PublicIdExhausted => None,
+            | Self::PublicIdExhausted
+            | Self::SessionNotFound { .. } => None,
         }
     }
 }
@@ -483,7 +579,7 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::InvalidMigrationPlan {
-                expected: 1,
+                expected: 2,
                 found: 0
             }
         ));

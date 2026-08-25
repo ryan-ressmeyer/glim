@@ -194,6 +194,7 @@ fn fresh_store_creates_current_schema_and_enables_required_sqlite_modes() {
     assert_eq!(
         names,
         [
+            "blob_deletion_queue",
             "blob_references",
             "blobs",
             "post_files",

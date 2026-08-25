@@ -467,6 +467,10 @@ fn insert_and_verify_blob_metadata(
          ON CONFLICT(hash) DO NOTHING",
         params![hash.as_str(), sqlite_byte_size(byte_size)?],
     )?;
+    connection.execute(
+        "DELETE FROM blob_deletion_queue WHERE blob_hash = ?1",
+        [hash.as_str()],
+    )?;
     let recorded = connection.query_row(
         "SELECT byte_size FROM blobs WHERE hash = ?1",
         [hash.as_str()],
@@ -505,6 +509,49 @@ fn blob_metadata_matches(
         )
         .optional()?;
     Ok(recorded == i64::try_from(byte_size).ok())
+}
+
+pub(super) fn drain_blob_deletion_queue(
+    connection: &Connection,
+    root: &Path,
+) -> Result<u64, StoreError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let hashes = {
+            let mut statement = connection
+                .prepare("SELECT blob_hash FROM blob_deletion_queue ORDER BY blob_hash")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut deleted = 0_u64;
+        for hash in hashes {
+            let referenced = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blob_references WHERE blob_hash = ?1)",
+                [&hash],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if referenced {
+                connection.execute(
+                    "DELETE FROM blob_deletion_queue WHERE blob_hash = ?1",
+                    [&hash],
+                )?;
+                continue;
+            }
+            let hash = BlobHash::parse(&hash).map_err(|error| {
+                StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
+            })?;
+            remove_if_exists(&blob_path(root, &hash))?;
+            connection.execute("DELETE FROM blobs WHERE hash = ?1", [hash.as_str()])?;
+            deleted += 1;
+        }
+        connection.execute_batch("COMMIT")?;
+        Ok(deleted)
+    })();
+    if result.is_err() && !connection.is_autocommit() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 pub(super) fn recover_blob_store(connection: &Connection, root: &Path) -> Result<(), StoreError> {
