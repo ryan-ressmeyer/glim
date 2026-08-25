@@ -105,6 +105,50 @@ async fn malformed_feed_page_shapes_are_not_spa_fallbacks() {
 }
 
 #[tokio::test]
+async fn compiled_pdf_worker_is_embedded() {
+    let response = glim::app()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/pdf.worker.mjs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/javascript; charset=utf-8"
+    );
+    assert!(
+        !response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn compiled_script_assets_disable_content_sniffing() {
+    for uri in ["/assets/app.js", "/assets/pdf.worker.mjs"] {
+        let response = glim::app()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff",
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn compiled_frontend_script_is_embedded() {
     let response = glim::app()
         .oneshot(

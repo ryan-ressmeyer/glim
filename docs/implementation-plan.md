@@ -118,11 +118,13 @@ Phase 2D adds the canonical JSON and one-file publication interfaces, one-value 
 
 ## Phase 3: Live browser feed
 
-### First static viewer slice completed
+### Static viewer and rich-renderer slices completed
 
-The first Phase 3 slice serves routed session, project, and global feeds from the embedded frontend. It adds bounded cursor pagination, cached session provenance, scoped navigation, sanitized Markdown commentary, and safe static renderers for images, SVG, Markdown artifacts, text, JSON, CSV, and downloads. PDF, video, audio, and HTML appear as pending download cards. The feed remains intentionally fully expanded.
+The first Phase 3 slice serves routed session, project, and global feeds from the embedded frontend. It adds bounded cursor pagination, cached session provenance, scoped navigation, sanitized Markdown commentary, and safe static renderers for images, SVG, Markdown artifacts, text, JSON, CSV, and downloads. The feed remains intentionally fully expanded.
 
-This slice does not add SSE, viewport-aware insertion, heartbeat, close actions, PDF.js, media playback, or scripted HTML. Those behaviors remain in the serial renderer and live-feed slices below, so the Phase 3 exit criteria are not yet satisfied.
+The rich-renderer slice adds native video and audio controls without autoplay. An observer pauses offscreen media and releases each source outside a 1,000-pixel vertical margin, then restores the source without starting playback. The bundled PDF.js renderer requests the artifact URL with 64 KiB range chunks and disabled eval support. It creates ordered placeholders for every page, materializes pages within a 1,500-pixel vertical margin, renders at feed width, and keeps at most three canvases per artifact with deterministic least-recently-used eviction. Disconnect and renderer replacement cancel page work, release media and canvas resources, destroy PDF loading tasks, and suppress expected cancellation rejections. Vite emits the bundled worker at `/assets/pdf.worker.mjs`, and Rust embeds that asset with the application script.
+
+These slices do not add SSE, viewport-aware post insertion, heartbeat, close actions, or scripted HTML. Those behaviors remain in the live-feed and HTML renderer slices below, so the Phase 3 exit criteria are not yet satisfied.
 
 ### Scope
 

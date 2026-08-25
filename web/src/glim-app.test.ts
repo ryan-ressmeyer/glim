@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+const pdfMocks = vi.hoisted(() => ({
+  getDocument: vi.fn(),
+  workerOptions: { workerSrc: "" },
+}));
+
+vi.mock("pdfjs-dist", () => ({
+  getDocument: pdfMocks.getDocument,
+  GlobalWorkerOptions: pdfMocks.workerOptions,
+}));
+
 import "./glim-app";
 
 type Renderer =
@@ -81,13 +91,38 @@ async function rendered(element: HTMLElement, text: string) {
   await vi.waitFor(() => expect(composedText(element)).toContain(text));
 }
 
+class TestIntersectionObserver {
+  static instances: TestIntersectionObserver[] = [];
+  readonly observed = new Set<Element>();
+  readonly options: IntersectionObserverInit | undefined;
+
+  constructor(
+    private readonly callback: IntersectionObserverCallback,
+    options?: IntersectionObserverInit,
+  ) {
+    this.options = options;
+    TestIntersectionObserver.instances.push(this);
+  }
+
+  observe(target: Element) { this.observed.add(target); }
+  unobserve(target: Element) { this.observed.delete(target); }
+  disconnect() { this.observed.clear(); }
+  takeRecords(): IntersectionObserverEntry[] { return []; }
+  trigger(target: Element, isIntersecting: boolean) {
+    this.callback([{ target, isIntersecting } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
+  }
+}
+
 describe("glim-app public route and element behavior", () => {
   beforeEach(() => {
     setPath("/feed");
+    TestIntersectionObserver.instances = [];
   });
 
   afterEach(() => {
     document.body.replaceChildren();
+    pdfMocks.getDocument.mockReset();
+    pdfMocks.workerOptions.workerSrc = "";
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -404,15 +439,202 @@ describe("glim-app public route and element behavior", () => {
     expect(artifact.querySelectorAll("td, th").length).toBeLessThanOrEqual(20_000);
   });
 
+  test("renders native video and audio controls and releases offscreen resources for re-entry", async () => {
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver as unknown as typeof IntersectionObserver);
+    const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    const load = vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const mediaPost = post(55, {
+      files: [file(0, "video", "movie.mp4", "Motion"), file(1, "audio", "sound.mp3")],
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [mediaPost], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+
+    const element = mount();
+    await vi.waitFor(() => {
+      const count = Array.from(element.shadowRoot?.querySelectorAll<HTMLElement>("glim-artifact") ?? [])
+        .filter((artifact) => artifact.shadowRoot?.querySelector("video, audio")).length;
+      expect(count).toBe(2);
+    });
+    const artifacts = Array.from(element.shadowRoot!.querySelectorAll<HTMLElement>("glim-artifact"));
+    const media = artifacts.map((artifact) => artifact.shadowRoot?.querySelector<HTMLMediaElement>("video, audio")!);
+    expect(media.map((value) => value.tagName)).toEqual(["VIDEO", "AUDIO"]);
+    expect(media.every((value) => value.controls && !value.autoplay)).toBe(true);
+    expect(media.map((value) => value.getAttribute("src"))).toEqual([
+      "/api/v1/posts/55/files/0/content",
+      "/api/v1/posts/55/files/1/content",
+    ]);
+    expect(play).not.toHaveBeenCalled();
+    expect(TestIntersectionObserver.instances).toHaveLength(2);
+    expect(TestIntersectionObserver.instances.every((observer) => observer.options?.rootMargin === "1000px 0px")).toBe(true);
+
+    TestIntersectionObserver.instances.forEach((observer, index) => observer.trigger(media[index], false));
+    expect(pause).toHaveBeenCalledTimes(2);
+    expect(media.every((value) => !value.hasAttribute("src"))).toBe(true);
+    TestIntersectionObserver.instances.forEach((observer, index) => observer.trigger(media[index], true));
+    expect(media.map((value) => value.getAttribute("src"))).toEqual([
+      "/api/v1/posts/55/files/0/content",
+      "/api/v1/posts/55/files/1/content",
+    ]);
+    expect(play).not.toHaveBeenCalled();
+    expect(load).toHaveBeenCalled();
+  });
+
+  test("renders media safely when IntersectionObserver is unavailable and cleans up on disconnect", async () => {
+    vi.stubGlobal("IntersectionObserver", undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+    const mediaPost = post(56, { files: [file(0, "video", "movie.mp4")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [mediaPost], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+
+    const element = mount();
+    await vi.waitFor(() => expect(element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector("video")).toBeTruthy());
+    const video = element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector<HTMLVideoElement>("video")!;
+    expect(video.getAttribute("src")).toBe("/api/v1/posts/56/files/0/content");
+    element.remove();
+    expect(video.getAttribute("src")).toBeNull();
+  });
+
+  test("materializes PDF pages lazily in sequence and bounds live canvases", async () => {
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver as unknown as typeof IntersectionObserver);
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const cleanup = vi.fn();
+    const cancel = vi.fn();
+    const getPage = vi.fn(async (pageNumber: number) => ({
+      getViewport: ({ scale }: { scale: number }) => ({ width: 600 * scale, height: 800 * scale }),
+      render: vi.fn(() => ({ promise: Promise.resolve(), cancel })),
+      cleanup,
+      pageNumber,
+    }));
+    const cleanupDocument = vi.fn(async () => undefined);
+    const document = { numPages: 6, getPage, cleanup: cleanupDocument };
+    const destroyLoading = vi.fn(async () => undefined);
+    pdfMocks.getDocument.mockReturnValue({ promise: Promise.resolve(document), destroy: destroyLoading });
+    const pdfPost = post(57, { files: [file(0, "pdf", "paper.pdf")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [pdfPost], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+
+    const element = mount();
+    await vi.waitFor(() => expect(element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelectorAll(".pdf-page")).toHaveLength(6));
+    const artifact = element.shadowRoot?.querySelector<HTMLElement>("glim-artifact")!;
+    const pages = Array.from(artifact.shadowRoot!.querySelectorAll<HTMLElement>(".pdf-page"));
+    expect(pages.map((page) => page.dataset.page)).toEqual(["1", "2", "3", "4", "5", "6"]);
+    expect(getPage).not.toHaveBeenCalled();
+    expect(pdfMocks.getDocument).toHaveBeenCalledWith(expect.objectContaining({
+      url: "/api/v1/posts/57/files/0/content",
+      rangeChunkSize: 65_536,
+      isEvalSupported: false,
+    }));
+    expect(pdfMocks.workerOptions.workerSrc).toContain("pdf.worker");
+    const observer = TestIntersectionObserver.instances[0];
+    for (const page of pages.slice(0, 4)) {
+      Object.defineProperty(page, "clientWidth", { configurable: true, value: 600 });
+      observer.trigger(page, true);
+      await vi.waitFor(() => expect(page.querySelector("canvas")).not.toBeNull());
+    }
+    expect(artifact.shadowRoot?.querySelectorAll("canvas").length).toBeLessThanOrEqual(3);
+    expect(getPage.mock.calls.map(([number]) => number)).toEqual([1, 2, 3, 4]);
+    observer.trigger(pages[3], false);
+    expect(pages[3].querySelector("canvas")).toBeNull();
+    expect(cleanup).toHaveBeenCalled();
+
+    element.remove();
+    expect(cancel).toHaveBeenCalled();
+    expect(destroyLoading).toHaveBeenCalled();
+    expect(cleanupDocument).toHaveBeenCalled();
+  });
+
+  test("cancels an in-flight PDF render without appending after disconnect", async () => {
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver as unknown as typeof IntersectionObserver);
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    let resolveRender: (() => void) | undefined;
+    const cancel = vi.fn();
+    const page = {
+      getViewport: ({ scale }: { scale: number }) => ({ width: 600 * scale, height: 800 * scale }),
+      render: vi.fn(() => ({ promise: new Promise<void>((resolve) => { resolveRender = resolve; }), cancel })),
+      cleanup: vi.fn(),
+    };
+    const document = { numPages: 1, getPage: vi.fn(async () => page), cleanup: vi.fn(async () => undefined) };
+    const loading = { promise: Promise.resolve(document), destroy: vi.fn(async () => undefined) };
+    pdfMocks.getDocument.mockReturnValue(loading);
+    const pdfPost = post(58, { files: [file(0, "pdf", "paper.pdf")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [pdfPost], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+
+    const element = mount();
+    await vi.waitFor(() => expect(element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector(".pdf-page")).toBeTruthy());
+    const artifact = element.shadowRoot?.querySelector<HTMLElement>("glim-artifact")!;
+    const placeholder = artifact.shadowRoot?.querySelector<HTMLElement>(".pdf-page")!;
+    Object.defineProperty(placeholder, "clientWidth", { configurable: true, value: 600 });
+    TestIntersectionObserver.instances[0].trigger(placeholder, true);
+    await vi.waitFor(() => expect(resolveRender).toBeDefined());
+    artifact.remove();
+    resolveRender?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(artifact.shadowRoot?.querySelector("canvas")).toBeNull();
+    expect(cancel).toHaveBeenCalled();
+    expect(loading.destroy).toHaveBeenCalled();
+    expect(document.cleanup).toHaveBeenCalled();
+  });
+
+  test("does not materialize a PDF page that leaves the lazy margin while getPage is pending", async () => {
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver as unknown as typeof IntersectionObserver);
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    let resolvePage: ((page: unknown) => void) | undefined;
+    const cleanup = vi.fn();
+    const render = vi.fn(() => ({ promise: Promise.resolve(), cancel: vi.fn() }));
+    const page = {
+      getViewport: ({ scale }: { scale: number }) => ({ width: 600 * scale, height: 800 * scale }),
+      render,
+      cleanup,
+    };
+    const document = {
+      numPages: 1,
+      getPage: vi.fn(() => new Promise((resolve) => { resolvePage = resolve; })),
+      cleanup: vi.fn(async () => undefined),
+    };
+    pdfMocks.getDocument.mockReturnValue({ promise: Promise.resolve(document), destroy: vi.fn(async () => undefined) });
+    const pdfPost = post(59, { files: [file(0, "pdf", "paper.pdf")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [pdfPost], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+
+    const element = mount();
+    await vi.waitFor(() => expect(element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector(".pdf-page")).toBeTruthy());
+    const artifact = element.shadowRoot?.querySelector<HTMLElement>("glim-artifact")!;
+    const placeholder = artifact.shadowRoot?.querySelector<HTMLElement>(".pdf-page")!;
+    Object.defineProperty(placeholder, "clientWidth", { configurable: true, value: 600 });
+    const observer = TestIntersectionObserver.instances[0];
+    observer.trigger(placeholder, true);
+    await vi.waitFor(() => expect(resolvePage).toBeDefined());
+    observer.trigger(placeholder, false);
+    resolvePage?.(page);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(render).not.toHaveBeenCalled();
+    expect(placeholder.querySelector("canvas")).toBeNull();
+    expect(cleanup).toHaveBeenCalled();
+  });
+
   test("uses pending cards and filename-oriented fallback links without active embedding", async () => {
     const pendingPost = post(60, {
-      files: [
-        file(0, "pdf", "paper.pdf"),
-        file(1, "video", "movie.mp4"),
-        file(2, "audio", "sound.mp3"),
-        file(3, "html", "page.html"),
-        file(4, "download", "archive.bin"),
-      ],
+      files: [file(0, "html", "page.html"), file(1, "download", "archive.bin")],
     });
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [pendingPost], next_cursor: null });
@@ -422,10 +644,10 @@ describe("glim-app public route and element behavior", () => {
 
     const element = mount();
     await rendered(element, "Renderer pending");
-    expect(element.shadowRoot?.querySelectorAll("video, audio, iframe, embed, object")).toHaveLength(0);
+    expect(element.shadowRoot?.querySelectorAll("iframe, embed, object")).toHaveLength(0);
     const downloads = Array.from(element.shadowRoot!.querySelectorAll<HTMLElement>("glim-artifact"))
       .flatMap((artifact) => Array.from(artifact.shadowRoot?.querySelectorAll<HTMLAnchorElement>("[download]") ?? []));
-    expect(downloads.map((link) => link.download)).toEqual(["paper.pdf", "movie.mp4", "sound.mp3", "page.html", "archive.bin"]);
+    expect(downloads.map((link) => link.download)).toEqual(["page.html", "archive.bin"]);
   });
 
   test("shows renderer-local fetch failure fallback and aborts artifact fetches on disconnect", async () => {

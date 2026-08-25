@@ -46,9 +46,9 @@ GLIM_STORE_ROOT=/tmp/glim-store cargo run --locked
 curl http://127.0.0.1:3030/api/v1/health
 ```
 
-The frontend build writes `web/dist/index.html` and `web/dist/assets/app.js`. Rust embeds both files with `include_str!` and `include_bytes!`, so the resulting binary does not read frontend files at runtime.
+The frontend build writes `web/dist/index.html`, `web/dist/assets/app.js`, and the bundled PDF.js worker at `web/dist/assets/pdf.worker.mjs`. Rust embeds all three files, so the resulting binary does not read frontend files at runtime.
 
-The browser serves the global feed at `/feed` (and `/`), session feeds at `/sessions/{public_id}`, and project feeds at `/projects/{project_id}`. Project page IDs are limited to positive integers no greater than JavaScript's safe-integer maximum (9,007,199,254,740,991). The static viewer supports sanitized commentary and Markdown artifacts, images and SVG, text, JSON, bounded CSV tables, and downloads. PDF, media, and scripted HTML cards remain download-only until their dedicated renderer slices. Live updates, heartbeats, and close actions are not part of this viewer slice.
+The browser serves the global feed at `/feed` (and `/`), session feeds at `/sessions/{public_id}`, and project feeds at `/projects/{project_id}`. Project page IDs are limited to positive integers no greater than JavaScript's safe-integer maximum (9,007,199,254,740,991). The static viewer supports sanitized commentary and Markdown artifacts, images and SVG, text, JSON, bounded CSV tables, native video and audio controls, lazy PDF.js pages, and downloads. Media sources are released outside a 1,000-pixel vertical margin. PDF pages materialize within a 1,500-pixel margin, use 64 KiB range chunks, and retain at most three canvases per artifact. Scripted HTML remains download-only. Live updates, heartbeats, and close actions are not part of this viewer slice.
 
 ## CLI
 

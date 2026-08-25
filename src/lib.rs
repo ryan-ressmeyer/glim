@@ -38,6 +38,7 @@ use serde::Serialize;
 
 const INDEX_HTML: &str = include_str!("../web/dist/index.html");
 const APP_JS: &[u8] = include_bytes!("../web/dist/assets/app.js");
+const PDF_WORKER_JS: &[u8] = include_bytes!("../web/dist/assets/pdf.worker.mjs");
 
 #[derive(Serialize)]
 struct Health {
@@ -69,6 +70,7 @@ fn app_with_state(state: api::ApiState) -> Router {
         .route("/sessions/{public_id}", get(session_page))
         .route("/projects/{project_id}", get(project_page))
         .route("/assets/app.js", get(frontend_script))
+        .route("/assets/pdf.worker.mjs", get(pdf_worker_script))
         .nest("/api/v1", v1)
         .fallback(api::root_not_found)
         .layer(middleware::from_fn(api::validate_v1_path))
@@ -105,12 +107,26 @@ async fn project_page(Path(project_id): Path<String>) -> Response {
 }
 
 async fn frontend_script() -> impl IntoResponse {
+    script_asset(APP_JS)
+}
+
+async fn pdf_worker_script() -> impl IntoResponse {
+    script_asset(PDF_WORKER_JS)
+}
+
+fn script_asset(bytes: &'static [u8]) -> impl IntoResponse {
     (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/javascript; charset=utf-8"),
-        )],
-        APP_JS,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/javascript; charset=utf-8"),
+            ),
+            (
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ),
+        ],
+        bytes,
     )
 }
 
