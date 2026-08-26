@@ -699,6 +699,10 @@ describe("glim-app public route and element behavior", () => {
       if (url === "/api/v1/posts") return jsonResponse({ posts: [htmlPost], next_cursor: null });
       if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
       if (url === "/api/v1/posts/60/files/0/content") return new Response(html);
+      if (url === "/api/v1/posts/60/files/0/html-capability") return jsonResponse({
+        path_prefix: "/cap/safe/api/v1/posts/60/files/0/support/",
+        expires_in_seconds: 300,
+      });
       throw new Error(`unexpected fetch ${url}`);
     }));
 
@@ -707,7 +711,7 @@ describe("glim-app public route and element behavior", () => {
     const artifact = element.shadowRoot?.querySelector<HTMLElement>("glim-artifact")!;
     const iframe = artifact.shadowRoot?.querySelector<HTMLIFrameElement>("iframe[srcdoc]")!;
     const renderedDocument = new DOMParser().parseFromString(iframe.srcdoc, "text/html");
-    const support = "/api/v1/posts/60/files/0/support/";
+    const support = "/cap/safe/api/v1/posts/60/files/0/support/";
     const csp = renderedDocument.querySelector<HTMLMetaElement>('meta[http-equiv="Content-Security-Policy"]')?.content ?? "";
 
     expect(iframe.getAttribute("sandbox")).toBe("");
@@ -762,6 +766,10 @@ describe("glim-app public route and element behavior", () => {
         if (contentRequests === 1) return new Response('<script src="app.js"></script>');
         return { ok: true, text: () => new Promise<string>((resolve) => { resolveDelayedText = resolve; }) } as Response;
       }
+      if (url === "/api/v1/posts/61/files/0/html-capability") return jsonResponse({
+        path_prefix: "/cap/interactive/api/v1/posts/61/files/0/support/",
+        expires_in_seconds: 300,
+      });
       throw new Error(`unexpected fetch ${url}`);
     }));
 
@@ -783,7 +791,7 @@ describe("glim-app public route and element behavior", () => {
       .querySelector<HTMLMetaElement>('meta[http-equiv="Content-Security-Policy"]')!.content;
     expect(scriptFrame.getAttribute("sandbox")).toBe("allow-scripts");
     expect(scriptFrame.getAttribute("sandbox")).not.toContain("allow-same-origin");
-    const exactSupportScope = "http://localhost:3000/api/v1/posts/61/files/0/support/";
+    const exactSupportScope = "http://localhost:3000/cap/interactive/api/v1/posts/61/files/0/support/";
     expect(scriptCsp).toContain(`script-src 'unsafe-inline' ${exactSupportScope}`);
     expect(scriptCsp).not.toContain("'self'");
     expect(scriptCsp).toContain("connect-src 'none'");
@@ -1061,6 +1069,42 @@ describe("glim-app public route and element behavior", () => {
 
     expect(element.shadowRoot?.querySelector("article")).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("turns an expired browser session into a login state", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ error: { code: "authentication_required" } }, 401);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+    const app = mount();
+
+    await rendered(app, "Authentication expired");
+    expect(app.shadowRoot?.querySelector<HTMLAnchorElement>('a[href="/login"]')?.textContent).toBe("Sign in");
+    expect(FakeEventSource.instances[0].readyState).toBe(FakeEventSource.CLOSED);
+  });
+
+  test("submits login tokens only in a bounded JSON body and clears failures", async () => {
+    setPath("/login");
+    const fetchMock = vi.fn(async () => jsonResponse({
+      error: { code: "invalid_credentials", message: "secret daemon detail" },
+    }, 401));
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await rendered(app, "Access token");
+    const input = app.shadowRoot?.querySelector<HTMLInputElement>('input[type="password"]')!;
+    expect(input.autocomplete).toBe("current-password");
+    input.value = "private-token";
+
+    app.shadowRoot?.querySelector<HTMLFormElement>("form")?.requestSubmit();
+
+    await rendered(app, "Could not sign in");
+    expect(input.value).toBe("");
+    expect(composedText(app)).not.toContain("secret daemon detail");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/auth/session", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ token: "private-token" }),
+    }));
+    expect(window.location.href).not.toContain("private-token");
   });
 
   test("orders and deduplicates live posts while preserving existing renderer nodes", async () => {

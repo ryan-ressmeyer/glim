@@ -35,7 +35,7 @@ The daemon binds to loopback by default. It reads a versioned JSON file from the
 
 Non-loopback deployments require one of two explicit modes.
 
-- Built-in token authentication uses a generated persistent token.
+- Built-in token authentication uses a generated persistent token. Direct non-loopback binding requires configured TLS. CLI clients send a Bearer credential; browsers exchange the token for a bounded HttpOnly session cookie. Sandboxed HTML uses short-lived capabilities restricted to its declared support assets.
 - Trusted-proxy mode delegates authentication to a user-configured proxy or private network boundary.
 
 The default configuration must not expose artifacts to the local network. Media endpoints support HTTP range requests for seeking and partial transfer.

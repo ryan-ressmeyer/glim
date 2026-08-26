@@ -177,7 +177,13 @@ Top-of-page viewers receive posts immediately. Scrolled viewers retain at most 1
 
 The daemon now reads a strict, versioned JSON configuration from the XDG or home configuration directory, with an explicit `GLIM_CONFIG` override. Files are bounded to 64 KiB. Environment values override file values, and file values override secure defaults. `GLIM_STORE_ROOT` and `GLIM_BIND` are the initial environment controls.
 
-The listener accepts numeric loopback addresses with nonzero ports. Non-loopback values fail before the store opens or a socket binds. This preserves the local-only security boundary while allowing isolated ports for development and tests. Token authentication, trusted-proxy mode, service commands, status expansion, and structured logs remain in later Phase 4 slices.
+The listener accepts numeric loopback addresses with nonzero ports. Non-loopback values fail before the store opens or a socket binds. This preserves the local-only security boundary while allowing isolated ports for development and tests.
+
+### Direct token authentication slice completed
+
+Token mode generates or loads a persistent 256-bit credential from a strict mode-`0600` non-symlink file. Non-loopback token mode requires operator-provided PEM TLS material and an HTTPS public origin whose port matches the listener. The CLI supports HTTPS and sends the configured token as a Bearer credential.
+
+One router-wide middleware protects feed pages, API routes, SSE, range requests, and artifact delivery. The browser exchanges the persistent token for a bounded 12-hour HttpOnly `SameSite=Strict` session. Cookie mutations require the configured exact origin. Logout invalidates server state and expires the cookie. HTML iframes receive renewable five-minute capabilities scoped to one post and file support subtree, preserving unique-origin sandboxing without exposing the session cookie. Trusted-proxy mode, service commands, status expansion, and structured logs remain in later Phase 4 slices.
 
 ### Scope
 

@@ -2,7 +2,7 @@
 
 Glimse is a local service for visual output produced by terminal-based AI agents. The daemon listens on loopback and persists immutable publications under a per-user store root. The structured CLI publishes local files, reads daemon state, closes sessions, and returns machine-readable JSON.
 
-The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The daemon configuration schema is [`docs/config-v1.schema.json`](docs/config-v1.schema.json). The browser feed receives live updates. Authentication and service management remain pending.
+The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The daemon configuration schema is [`docs/config-v1.schema.json`](docs/config-v1.schema.json). The browser feed receives live updates. Trusted-proxy access and service management remain pending.
 
 The agreed product design is recorded in [`docs/product-design.md`](docs/product-design.md). The dependency-ordered build plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
@@ -49,18 +49,39 @@ The daemon listens on `127.0.0.1:3030` by default. It reads a bounded, versioned
 }
 ```
 
-`GLIM_STORE_ROOT` overrides `store_root`. Without either value, the daemon uses `$XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. `GLIM_BIND` overrides `bind`. Bind values must contain a numeric loopback address and a nonzero port. Non-loopback startup fails until a later Phase 4 slice adds authenticated access.
+`GLIM_STORE_ROOT` overrides `store_root`. Without either value, the daemon uses `$XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. `GLIM_BIND` overrides `bind`. Local mode accepts numeric loopback addresses with nonzero ports.
 
 ```bash
 GLIM_STORE_ROOT=/tmp/glim-store GLIM_BIND=127.0.0.1:4040 cargo run --locked
 curl http://127.0.0.1:4040/api/v1/health
 ```
 
+Token mode protects feed pages, API routes, SSE, ranges, media, and downloads. The health endpoint, login shell, and compiled frontend assets remain public. A non-loopback bind requires token mode, a configured HTTPS origin, and PEM certificate and private-key files.
+
+```json
+{
+  "schema_version": 1,
+  "store_root": "/home/user/.local/share/glim",
+  "bind": "0.0.0.0:3443",
+  "access": {
+    "mode": "token",
+    "token_file": "/home/user/.config/glim/access-token",
+    "public_origin": "https://glim.example:3443",
+    "tls_certificate": "/home/user/.config/glim/cert.pem",
+    "tls_private_key": "/home/user/.config/glim/key.pem"
+  }
+}
+```
+
+The daemon creates a missing token as 32 random bytes encoded by 64 lowercase hexadecimal characters. On Linux the token file has mode `0600`; startup rejects symlinks, malformed values, and group- or world-accessible files. Certificate provisioning remains the operator's responsibility. `GLIM_ACCESS_MODE`, `GLIM_TOKEN_FILE`, `GLIM_PUBLIC_ORIGIN`, `GLIM_TLS_CERTIFICATE`, and `GLIM_TLS_PRIVATE_KEY` override their file values.
+
+API clients use the token as a Bearer credential. The browser login form exchanges it for a bounded 12-hour HttpOnly `SameSite=Strict` session and never puts the token in a URL. Cookie-authenticated mutations require the configured exact origin. Sandboxed HTML receives a renewable five-minute capability restricted to one file's declared support subtree; iframe content never receives the persistent token or browser cookie.
+
 The frontend build writes `web/dist/index.html`, `web/dist/assets/app.js`, and the bundled PDF.js worker at `web/dist/assets/pdf.worker.mjs`. Rust embeds all three files, so the resulting binary does not read frontend files at runtime.
 
 The browser serves the global feed at `/feed` (and `/`), session feeds at `/sessions/{public_id}`, and project feeds at `/projects/{project_id}`. Project page IDs are limited to positive integers no greater than JavaScript's safe-integer maximum (9,007,199,254,740,991). The static viewer supports sanitized commentary and Markdown artifacts, images and SVG, text, JSON, bounded CSV tables, native video and audio controls, lazy PDF.js pages, sandboxed HTML, and downloads. Media sources are released outside a 1,000-pixel vertical margin. PDF pages materialize within a 1,500-pixel margin, use 64 KiB range chunks, and retain at most three canvases per artifact.
 
-HTML renders inline with scripts disabled. The renderer removes nested frames, plugins, active forms, document policies, and navigation links, then rewrites declared resources to the artifact's exact support path. Each HTML artifact provides a warning control for reloading with `allow-scripts`; no other sandbox permission is lifted. The content security policy continues to block ordinary network APIs and undeclared subresources in script mode. Browser sandboxing cannot prevent a script from navigating its own frame, which can make a network request, and the warning states this limitation before scripts run. Script mode is never selected automatically.
+HTML renders inline with scripts disabled. The renderer removes nested frames, plugins, active forms, document policies, and navigation links, then rewrites declared resources to the artifact's exact support path or scoped capability path. Each HTML artifact provides a warning control for reloading with `allow-scripts`; no other sandbox permission is lifted. The content security policy continues to block ordinary network APIs and undeclared subresources in script mode. Browser sandboxing cannot prevent a script from navigating its own frame, which can make a network request, and the warning states this limitation before scripts run. Script mode is never selected automatically.
 
 Each valid feed route opens a scoped server-sent event stream. The daemon retains 256 live events and replays at most 100 durable posts after `Last-Event-ID`; lag or a larger replay emits `reset` so the browser reloads the latest page. Post events contain the complete API `Post` object and use the positive post ID as the SSE ID. Session closure emits `session-closed`. The browser deduplicates post IDs and orders posts by `published_at DESC, id DESC`.
 
@@ -68,7 +89,7 @@ At the top of the page, live posts enter the feed immediately. Away from the top
 
 ## CLI
 
-Every short-lived CLI command writes one JSON value to standard output. Failures use the same output channel and exit nonzero. A committed publication remains successful if an explicitly requested browser launch fails; `result.browser_launch` reports the launch outcome. `GLIM_DAEMON_URL` overrides the development client endpoint; the default is `http://127.0.0.1:3030`. The Phase 2 client accepts an HTTP origin only. HTTPS transport remains deferred to Phase 4.
+Every short-lived CLI command writes one JSON value to standard output. Failures use the same output channel and exit nonzero. A committed publication remains successful if an explicitly requested browser launch fails; `result.browser_launch` reports the launch outcome. `GLIM_DAEMON_URL` accepts an HTTP or HTTPS origin and defaults to `http://127.0.0.1:3030`. In token mode the CLI reads the configured token file and adds the Bearer credential without including it in output URLs.
 
 Canonical publication reads versioned JSON from standard input.
 

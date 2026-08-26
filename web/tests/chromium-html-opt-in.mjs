@@ -79,6 +79,9 @@ const server = http.createServer((request, response) => {
   } else if (path === "/api/v1/posts/1/files/0/content") {
     response.setHeader("content-type", "text/html; charset=utf-8");
     response.end(entry);
+  } else if (path === "/api/v1/posts/1/files/0/html-capability") {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ path_prefix: "/api/v1/posts/1/files/0/support/", expires_in_seconds: 300 }));
   } else if (path === "/api/v1/posts/1/files/0/support/app.js") {
     supportRequests += 1;
     response.setHeader("content-type", "text/javascript; charset=utf-8");

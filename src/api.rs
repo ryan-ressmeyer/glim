@@ -32,7 +32,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 
 use crate::storage::{
-    ActivityReport, GitProvenance, LifecycleReport, PageRequest, PublicationFile,
+    ActivityReport, ArtifactRenderer, GitProvenance, LifecycleReport, PageRequest, PublicationFile,
     PublicationIdentity, PublicationRequest, PublicationStagingWriter, PublicationSupportAsset,
     PublishedPublication, Store, StoreError,
 };
@@ -43,11 +43,31 @@ const MAX_DECLARED_PARTS: usize = 256;
 const LIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// A reconnect may replay at most this many durable posts before receiving `reset`.
 const LIVE_REPLAY_LIMIT: usize = 100;
+const BROWSER_SESSION_LIMIT: usize = 128;
+const BROWSER_SESSION_SECONDS: u64 = 12 * 60 * 60;
+const BROWSER_SESSION_COOKIE: &str = "glim_session";
+const HTML_CAPABILITY_LIMIT: usize = 256;
+const HTML_CAPABILITY_SECONDS: u64 = 5 * 60;
 
 #[derive(Clone)]
 pub(crate) struct ApiState {
     store: Option<Arc<Mutex<Store>>>,
     events: broadcast::Sender<LiveEvent>,
+    authentication: Option<Arc<TokenAuthentication>>,
+}
+
+struct TokenAuthentication {
+    access_token: crate::daemon::AccessToken,
+    expected_origin: String,
+    secure_cookie: bool,
+    sessions: Mutex<HashMap<String, u64>>,
+    capabilities: Mutex<HashMap<String, HtmlCapability>>,
+}
+
+struct HtmlCapability {
+    post_id: i64,
+    position: u32,
+    expires_at: u64,
 }
 
 impl Default for ApiState {
@@ -56,6 +76,7 @@ impl Default for ApiState {
         Self {
             store: None,
             events,
+            authentication: None,
         }
     }
 }
@@ -64,6 +85,25 @@ impl ApiState {
     pub(crate) fn with_store(store: Store) -> Self {
         Self {
             store: Some(Arc::new(Mutex::new(store))),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_store_and_token_auth(
+        store: Store,
+        access_token: crate::daemon::AccessToken,
+        expected_origin: String,
+        secure_cookie: bool,
+    ) -> Self {
+        Self {
+            store: Some(Arc::new(Mutex::new(store))),
+            authentication: Some(Arc::new(TokenAuthentication {
+                access_token,
+                expected_origin,
+                secure_cookie,
+                sessions: Mutex::new(HashMap::new()),
+                capabilities: Mutex::new(HashMap::new()),
+            })),
             ..Self::default()
         }
     }
@@ -90,6 +130,12 @@ enum FeedScope {
 
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
+        .route(
+            "/auth/session",
+            post(create_browser_session)
+                .delete(delete_browser_session)
+                .route_layer(DefaultBodyLimit::max(1024)),
+        )
         .route("/sessions", post(resolve_session))
         .route(
             "/sessions/{public_id}",
@@ -108,6 +154,10 @@ pub(crate) fn routes() -> Router<ApiState> {
         )
         .route("/posts/{post_id}", get(get_post))
         .route(
+            "/posts/{post_id}/files/{position}/html-capability",
+            post(create_html_capability),
+        )
+        .route(
             "/posts/{post_id}/files/{position}/content",
             get(visible_artifact).head(visible_artifact),
         )
@@ -115,6 +165,361 @@ pub(crate) fn routes() -> Router<ApiState> {
             "/posts/{post_id}/files/{position}/support/{*asset_path}",
             get(support_artifact).head(support_artifact),
         )
+}
+
+pub(crate) fn capability_routes() -> Router<ApiState> {
+    Router::new().route(
+        "/cap/{capability}/api/v1/posts/{post_id}/files/{position}/support/{*asset_path}",
+        get(capability_support_artifact).head(capability_support_artifact),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserSessionRequest {
+    token: String,
+}
+
+enum AuthenticatedBy {
+    Bearer,
+    Cookie,
+}
+
+pub(crate) async fn authenticate_request(
+    State(state): State<ApiState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(authentication) = state.authentication.as_ref() else {
+        return next.run(request).await;
+    };
+    let path = request.uri().path();
+    let is_public = path == "/api/v1/health"
+        || (path == "/api/v1/auth/session" && request.method() == Method::POST)
+        || path == "/login"
+        || path == "/assets/app.js"
+        || path == "/assets/pdf.worker.mjs"
+        || path.starts_with("/cap/");
+    if is_public {
+        return next.run(request).await;
+    }
+    let authenticated_by = authenticate_headers(authentication, request.headers());
+    let Some(authenticated_by) = authenticated_by else {
+        return authentication_failure(path);
+    };
+    if matches!(authenticated_by, AuthenticatedBy::Cookie)
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        )
+        && request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            != Some(authentication.expected_origin.as_str())
+    {
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            "origin_rejected",
+            "Cookie-authenticated mutation requires the configured origin",
+            json!({}),
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+fn authenticate_headers(
+    authentication: &TokenAuthentication,
+    headers: &HeaderMap,
+) -> Option<AuthenticatedBy> {
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        let supplied = value.to_str().ok()?.strip_prefix("Bearer ")?;
+        return constant_time_equal(authentication.access_token.expose(), supplied)
+            .then_some(AuthenticatedBy::Bearer);
+    }
+    let session = cookie_value(headers, BROWSER_SESSION_COOKIE)?;
+    let now = unix_seconds().ok()?;
+    let mut sessions = authentication.sessions.lock().ok()?;
+    sessions.retain(|_, expires_at| *expires_at > now);
+    sessions
+        .get(session)
+        .is_some_and(|expires_at| *expires_at > now)
+        .then_some(AuthenticatedBy::Cookie)
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .map(str::trim)
+        .find_map(|value| value.strip_prefix(name)?.strip_prefix('='))
+}
+
+fn authentication_failure(path: &str) -> Response {
+    if !is_v1_path(path) {
+        return (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, HeaderValue::from_static("/login"))],
+        )
+            .into_response();
+    }
+    let mut response = ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "authentication_required",
+        "Authentication is required",
+        json!({}),
+    )
+    .into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"glim\""),
+    );
+    response
+}
+
+async fn create_browser_session(
+    State(state): State<ApiState>,
+    payload: Result<Json<BrowserSessionRequest>, JsonRejection>,
+) -> Response {
+    let Some(authentication) = state.authentication.as_ref() else {
+        return authentication_not_configured().into_response();
+    };
+    let Ok(Json(payload)) = payload else {
+        return ApiError::malformed_json().into_response();
+    };
+    if !constant_time_equal(authentication.access_token.expose(), &payload.token) {
+        return ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Credentials were rejected",
+            json!({}),
+        )
+        .into_response();
+    }
+    let session = match random_hex(32) {
+        Ok(session) => session,
+        Err(error) => return error.into_response(),
+    };
+    let now = match unix_seconds() {
+        Ok(now) => now,
+        Err(error) => return error.into_response(),
+    };
+    let mut sessions = match authentication.sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => return ApiError::internal().into_response(),
+    };
+    sessions.retain(|_, expires_at| *expires_at > now);
+    if sessions.len() >= BROWSER_SESSION_LIMIT
+        && let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, expires_at)| **expires_at)
+            .map(|(session, _)| session.clone())
+    {
+        sessions.remove(&oldest);
+    }
+    sessions.insert(session.clone(), now.saturating_add(BROWSER_SESSION_SECONDS));
+    drop(sessions);
+
+    let secure = if authentication.secure_cookie {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "{BROWSER_SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={BROWSER_SESSION_SECONDS}{secure}"
+    );
+    session_cookie_response(cookie)
+}
+
+async fn delete_browser_session(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let Some(authentication) = state.authentication.as_ref() else {
+        return authentication_not_configured().into_response();
+    };
+    if let Some(session) = cookie_value(&headers, BROWSER_SESSION_COOKIE)
+        && let Ok(mut sessions) = authentication.sessions.lock()
+    {
+        sessions.remove(session);
+    }
+    let secure = if authentication.secure_cookie {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie =
+        format!("{BROWSER_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}");
+    session_cookie_response(cookie)
+}
+
+fn session_cookie_response(cookie: String) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    match HeaderValue::from_str(&cookie) {
+        Ok(cookie) => {
+            response.headers_mut().insert(header::SET_COOKIE, cookie);
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(_) => ApiError::internal().into_response(),
+    }
+}
+
+fn authentication_not_configured() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "authentication_not_configured",
+        "Token authentication is not configured",
+        json!({}),
+    )
+}
+
+fn unix_seconds() -> Result<u64, ApiError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ApiError::internal())
+}
+
+fn random_hex(byte_count: usize) -> Result<String, ApiError> {
+    let mut bytes = vec![0_u8; byte_count];
+    getrandom::fill(&mut bytes).map_err(|_| ApiError::internal())?;
+    let mut encoded = String::with_capacity(byte_count * 2);
+    use std::fmt::Write as _;
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(encoded)
+}
+
+fn constant_time_equal(expected: &str, supplied: &str) -> bool {
+    if expected.len() != supplied.len() {
+        return false;
+    }
+    expected
+        .bytes()
+        .zip(supplied.bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+#[derive(Serialize)]
+struct HtmlCapabilityResponse {
+    path_prefix: String,
+    expires_in_seconds: u64,
+}
+
+async fn create_html_capability(
+    State(state): State<ApiState>,
+    Path((post_id, position)): Path<(String, String)>,
+) -> Result<Json<HtmlCapabilityResponse>, ApiError> {
+    let post_id = positive_id(&post_id)?;
+    let position = position.parse::<u32>().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_path",
+            "File position must be a nonnegative integer",
+            json!({}),
+        )
+    })?;
+    let valid_html = with_store(state.clone(), move |store| {
+        Ok(store
+            .post(post_id)?
+            .files
+            .into_iter()
+            .any(|file| file.position == position && file.renderer == ArtifactRenderer::Html))
+    })
+    .await?;
+    if !valid_html {
+        return Err(capability_not_found());
+    }
+    let Some(authentication) = state.authentication.as_ref() else {
+        return Ok(Json(HtmlCapabilityResponse {
+            path_prefix: format!("/api/v1/posts/{post_id}/files/{position}/support/"),
+            expires_in_seconds: HTML_CAPABILITY_SECONDS,
+        }));
+    };
+    let capability = random_hex(32)?;
+    let now = unix_seconds()?;
+    let mut capabilities = authentication
+        .capabilities
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    capabilities.retain(|_, value| value.expires_at > now);
+    if capabilities.len() >= HTML_CAPABILITY_LIMIT
+        && let Some(oldest) = capabilities
+            .iter()
+            .min_by_key(|(_, value)| value.expires_at)
+            .map(|(key, _)| key.clone())
+    {
+        capabilities.remove(&oldest);
+    }
+    capabilities.insert(
+        capability.clone(),
+        HtmlCapability {
+            post_id,
+            position,
+            expires_at: now.saturating_add(HTML_CAPABILITY_SECONDS),
+        },
+    );
+    Ok(Json(HtmlCapabilityResponse {
+        path_prefix: format!("/cap/{capability}/api/v1/posts/{post_id}/files/{position}/support/"),
+        expires_in_seconds: HTML_CAPABILITY_SECONDS,
+    }))
+}
+
+async fn capability_support_artifact(
+    State(state): State<ApiState>,
+    method: Method,
+    headers: HeaderMap,
+    Path((capability, post_id, position, asset_path)): Path<(String, String, String, String)>,
+) -> Result<Response, ApiError> {
+    let post_id = positive_id(&post_id)?;
+    let position = position.parse::<u32>().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_path",
+            "File position must be a nonnegative integer",
+            json!({}),
+        )
+    })?;
+    let authentication = state
+        .authentication
+        .as_ref()
+        .ok_or_else(capability_not_found)?;
+    let now = unix_seconds()?;
+    let allowed = {
+        let mut capabilities = authentication
+            .capabilities
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        capabilities.retain(|_, value| value.expires_at > now);
+        capabilities.get_mut(&capability).is_some_and(|value| {
+            let allowed =
+                value.post_id == post_id && value.position == position && value.expires_at > now;
+            if allowed {
+                value.expires_at = now.saturating_add(HTML_CAPABILITY_SECONDS);
+            }
+            allowed
+        })
+    };
+    if !allowed {
+        return Err(capability_not_found());
+    }
+    support_artifact_response(state, method, headers, post_id, position, asset_path).await
+}
+
+fn capability_not_found() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "artifact_not_found",
+        "Artifact was not found",
+        json!({}),
+    )
 }
 
 pub(crate) async fn route_not_found(OriginalUri(uri): OriginalUri) -> impl IntoResponse {
@@ -657,6 +1062,17 @@ async fn support_artifact(
             json!({}),
         )
     })?;
+    support_artifact_response(state, method, headers, post_id, position, asset_path).await
+}
+
+async fn support_artifact_response(
+    state: ApiState,
+    method: Method,
+    headers: HeaderMap,
+    post_id: i64,
+    position: u32,
+    asset_path: String,
+) -> Result<Response, ApiError> {
     if asset_path.is_empty()
         || asset_path.contains('\\')
         || asset_path.chars().any(char::is_control)

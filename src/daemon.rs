@@ -1,7 +1,7 @@
 use std::{
     ffi::OsStr,
     fs,
-    io::Read,
+    io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -24,6 +24,54 @@ pub struct StoreRoot {
 pub struct DaemonConfiguration {
     pub store: StoreRoot,
     pub bind: SocketAddr,
+    pub access: AccessConfiguration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessConfiguration {
+    Local,
+    Token(TokenAccessConfiguration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenAccessConfiguration {
+    pub token_file: PathBuf,
+    pub public_origin: String,
+    pub tls: Option<TlsFiles>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsFiles {
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccessToken(String);
+
+impl AccessToken {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(
+                "access token must contain exactly 64 lowercase hexadecimal characters".to_owned(),
+            );
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AccessToken([REDACTED])")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,9 +80,22 @@ struct FileConfiguration {
     schema_version: u32,
     store_root: Option<PathBuf>,
     bind: Option<String>,
+    access: Option<FileAccessConfiguration>,
 }
 
-pub fn resolve_daemon_configuration_values(
+#[derive(Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum FileAccessConfiguration {
+    Local,
+    Token {
+        token_file: PathBuf,
+        public_origin: String,
+        tls_certificate: Option<PathBuf>,
+        tls_private_key: Option<PathBuf>,
+    },
+}
+
+fn resolve_daemon_configuration_base_values(
     file_bytes: Option<&[u8]>,
     store_override: Option<&OsStr>,
     bind_override: Option<&OsStr>,
@@ -89,14 +150,341 @@ pub fn resolve_daemon_configuration_values(
     if bind.port() == 0 {
         return Err("daemon bind port must be greater than zero".to_owned());
     }
-    if !bind.ip().is_loopback() {
-        return Err(
-            "daemon bind must use a loopback address until authenticated access is configured"
-                .to_owned(),
-        );
+    let access = match file.and_then(|configuration| configuration.access) {
+        None | Some(FileAccessConfiguration::Local) => AccessConfiguration::Local,
+        Some(FileAccessConfiguration::Token {
+            token_file,
+            public_origin,
+            tls_certificate,
+            tls_private_key,
+        }) => {
+            require_absolute_path("access.token_file", &token_file)?;
+            validate_public_origin(&public_origin)?;
+            let tls = match (tls_certificate, tls_private_key) {
+                (None, None) => None,
+                (Some(certificate), Some(private_key)) => {
+                    require_absolute_path("access.tls_certificate", &certificate)?;
+                    require_absolute_path("access.tls_private_key", &private_key)?;
+                    Some(TlsFiles {
+                        certificate,
+                        private_key,
+                    })
+                }
+                _ => {
+                    return Err(
+                        "token access requires both tls_certificate and tls_private_key".to_owned(),
+                    );
+                }
+            };
+            AccessConfiguration::Token(TokenAccessConfiguration {
+                token_file,
+                public_origin,
+                tls,
+            })
+        }
+    };
+    Ok(DaemonConfiguration {
+        store,
+        bind,
+        access,
+    })
+}
+
+pub fn resolve_daemon_configuration_values(
+    file_bytes: Option<&[u8]>,
+    store_override: Option<&OsStr>,
+    bind_override: Option<&OsStr>,
+    xdg_data_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<DaemonConfiguration, String> {
+    let configuration = resolve_daemon_configuration_base_values(
+        file_bytes,
+        store_override,
+        bind_override,
+        xdg_data_home,
+        home,
+    )?;
+    validate_access_bind(&configuration.bind, &configuration.access)?;
+    Ok(configuration)
+}
+
+fn validate_access_bind(bind: &SocketAddr, access: &AccessConfiguration) -> Result<(), String> {
+    match access {
+        AccessConfiguration::Local if !bind.ip().is_loopback() => {
+            Err("non-loopback bind requires authenticated access".to_owned())
+        }
+        AccessConfiguration::Token(configuration)
+            if !bind.ip().is_loopback() && configuration.tls.is_none() =>
+        {
+            Err("non-loopback token access requires configured TLS".to_owned())
+        }
+        AccessConfiguration::Token(configuration) => {
+            let origin = configuration
+                .public_origin
+                .parse::<axum::http::Uri>()
+                .map_err(|_| "token public origin is invalid".to_owned())?;
+            let scheme = origin.scheme_str().unwrap_or_default();
+            if !bind.ip().is_loopback() && scheme != "https" {
+                return Err("non-loopback token access requires an HTTPS public origin".to_owned());
+            }
+            let default_port = if scheme == "https" { 443 } else { 80 };
+            if origin
+                .authority()
+                .and_then(axum::http::uri::Authority::port_u16)
+                .unwrap_or(default_port)
+                != bind.port()
+            {
+                return Err("token public origin port must match the bind port".to_owned());
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn apply_access_environment_values(
+    current: AccessConfiguration,
+    mode: Option<&OsStr>,
+    token_file: Option<&OsStr>,
+    public_origin: Option<&OsStr>,
+    tls_certificate: Option<&OsStr>,
+    tls_private_key: Option<&OsStr>,
+) -> Result<AccessConfiguration, String> {
+    let mode = mode
+        .map(|value| {
+            value
+                .to_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "GLIM_ACCESS_MODE must be nonblank UTF-8".to_owned())
+        })
+        .transpose()?;
+    let any_access_override = token_file.is_some()
+        || public_origin.is_some()
+        || tls_certificate.is_some()
+        || tls_private_key.is_some();
+    if mode == Some("local") {
+        if any_access_override {
+            return Err("local access mode does not accept token or TLS overrides".to_owned());
+        }
+        return Ok(AccessConfiguration::Local);
+    }
+    if mode.is_some_and(|value| value != "token") {
+        return Err("GLIM_ACCESS_MODE must be local or token".to_owned());
+    }
+    let (existing_token, existing_origin, existing_certificate, existing_key) = match current {
+        AccessConfiguration::Local => (None, None, None, None),
+        AccessConfiguration::Token(configuration) => (
+            Some(configuration.token_file),
+            Some(configuration.public_origin),
+            configuration
+                .tls
+                .as_ref()
+                .map(|tls| tls.certificate.clone()),
+            configuration.tls.map(|tls| tls.private_key),
+        ),
+    };
+    if mode.is_none() && !any_access_override {
+        return match existing_token {
+            Some(token_file) => Ok(AccessConfiguration::Token(TokenAccessConfiguration {
+                token_file,
+                public_origin: existing_origin.expect("token mode has a public origin"),
+                tls: match (existing_certificate, existing_key) {
+                    (Some(certificate), Some(private_key)) => Some(TlsFiles {
+                        certificate,
+                        private_key,
+                    }),
+                    _ => None,
+                },
+            })),
+            None => Ok(AccessConfiguration::Local),
+        };
+    }
+    if mode.is_none() && existing_token.is_none() {
+        return Err("token and TLS overrides require GLIM_ACCESS_MODE=token".to_owned());
+    }
+    let token_file = environment_path("GLIM_TOKEN_FILE", token_file)?
+        .or(existing_token)
+        .ok_or_else(|| "token access requires GLIM_TOKEN_FILE or access.token_file".to_owned())?;
+    require_absolute_path("access.token_file", &token_file)?;
+    let public_origin = environment_string("GLIM_PUBLIC_ORIGIN", public_origin)?
+        .or(existing_origin)
+        .ok_or_else(|| {
+            "token access requires GLIM_PUBLIC_ORIGIN or access.public_origin".to_owned()
+        })?;
+    validate_public_origin(&public_origin)?;
+    let certificate =
+        environment_path("GLIM_TLS_CERTIFICATE", tls_certificate)?.or(existing_certificate);
+    let private_key = environment_path("GLIM_TLS_PRIVATE_KEY", tls_private_key)?.or(existing_key);
+    let tls = match (certificate, private_key) {
+        (None, None) => None,
+        (Some(certificate), Some(private_key)) => {
+            require_absolute_path("access.tls_certificate", &certificate)?;
+            require_absolute_path("access.tls_private_key", &private_key)?;
+            Some(TlsFiles {
+                certificate,
+                private_key,
+            })
+        }
+        _ => return Err("token access requires both TLS path overrides".to_owned()),
+    };
+    Ok(AccessConfiguration::Token(TokenAccessConfiguration {
+        token_file,
+        public_origin,
+        tls,
+    }))
+}
+
+fn environment_string(name: &str, value: Option<&OsStr>) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            value
+                .to_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{name} must be nonblank UTF-8"))
+        })
+        .transpose()
+}
+
+fn environment_path(name: &str, value: Option<&OsStr>) -> Result<Option<PathBuf>, String> {
+    value
+        .map(|value| {
+            let path = PathBuf::from(value);
+            if path.as_os_str().to_string_lossy().trim().is_empty() {
+                Err(format!("{name} must not be blank"))
+            } else {
+                Ok(path)
+            }
+        })
+        .transpose()
+}
+
+fn validate_public_origin(value: &str) -> Result<(), String> {
+    let origin = value
+        .parse::<axum::http::Uri>()
+        .map_err(|_| "token public_origin must be an HTTP or HTTPS origin".to_owned())?;
+    let scheme = origin.scheme_str().unwrap_or_default();
+    let authority = origin
+        .authority()
+        .ok_or_else(|| "token public_origin must include an authority".to_owned())?;
+    if !matches!(scheme, "http" | "https")
+        || authority.as_str().contains('@')
+        || value != format!("{scheme}://{authority}")
+    {
+        return Err("token public_origin must contain only an HTTP or HTTPS origin".to_owned());
+    }
+    Ok(())
+}
+
+fn require_absolute_path(field: &str, path: &Path) -> Result<(), String> {
+    if path.as_os_str().to_string_lossy().trim().is_empty() || !path.is_absolute() {
+        Err(format!(
+            "daemon configuration {field} must be an absolute path"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn load_access_token(path: &Path) -> Result<AccessToken, String> {
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = fs::File::open(path);
+    let file = opened.map_err(|error| format!("could not open access token file: {error}"))?;
+    read_access_token(file)
+}
+
+pub fn load_or_create_access_token(path: &Path) -> Result<AccessToken, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => return load_access_token(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect access token file: {error}")),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "access token file has no parent directory".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create access token directory: {error}"))?;
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random)
+        .map_err(|_| "could not generate access token securely".to_owned())?;
+    let mut token = String::with_capacity(64);
+    use std::fmt::Write as _;
+    for byte in random {
+        write!(&mut token, "{byte:02x}").expect("writing to a String cannot fail");
     }
 
-    Ok(DaemonConfiguration { store, bind })
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return load_access_token(path);
+        }
+        Err(error) => return Err(format!("could not create access token file: {error}")),
+    };
+    if let Err(error) = file
+        .write_all(token.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("could not persist access token: {error}"));
+    }
+    Ok(AccessToken(token))
+}
+
+fn read_access_token(file: fs::File) -> Result<AccessToken, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect access token file: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("access token path must be a regular non-symlink file".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(
+                "access token file permissions must not grant group or other access".to_owned(),
+            );
+        }
+    }
+    let mut token = String::new();
+    file.take(65)
+        .read_to_string(&mut token)
+        .map_err(|error| format!("could not read access token file: {error}"))?;
+    AccessToken::parse(&token).map_err(|_| {
+        "access token file must contain exactly 64 lowercase hexadecimal characters".to_owned()
+    })
+}
+
+pub fn resolve_client_access_token() -> Result<Option<AccessToken>, String> {
+    match resolve_daemon_configuration()?.access {
+        AccessConfiguration::Local => Ok(None),
+        AccessConfiguration::Token(configuration) => {
+            load_access_token(&configuration.token_file).map(Some)
+        }
+    }
 }
 
 pub fn resolve_daemon_configuration() -> Result<DaemonConfiguration, String> {
@@ -105,13 +493,23 @@ pub fn resolve_daemon_configuration() -> Result<DaemonConfiguration, String> {
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )?;
-    resolve_daemon_configuration_values(
+    let mut configuration = resolve_daemon_configuration_base_values(
         file_bytes.as_deref(),
         std::env::var_os("GLIM_STORE_ROOT").as_deref(),
         std::env::var_os("GLIM_BIND").as_deref(),
         std::env::var_os("XDG_DATA_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
-    )
+    )?;
+    configuration.access = apply_access_environment_values(
+        configuration.access,
+        std::env::var_os("GLIM_ACCESS_MODE").as_deref(),
+        std::env::var_os("GLIM_TOKEN_FILE").as_deref(),
+        std::env::var_os("GLIM_PUBLIC_ORIGIN").as_deref(),
+        std::env::var_os("GLIM_TLS_CERTIFICATE").as_deref(),
+        std::env::var_os("GLIM_TLS_PRIVATE_KEY").as_deref(),
+    )?;
+    validate_access_bind(&configuration.bind, &configuration.access)?;
+    Ok(configuration)
 }
 
 fn load_configuration_file(
@@ -413,6 +811,130 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn token_mode_requires_absolute_credentials_and_tls_for_non_loopback() {
+        let configured = resolve_daemon_configuration_values(
+            Some(br#"{"schema_version":1,"bind":"0.0.0.0:3443","access":{"mode":"token","token_file":"/secrets/token","public_origin":"https://glim.example:3443","tls_certificate":"/secrets/cert.pem","tls_private_key":"/secrets/key.pem"}}"#),
+            None,
+            None,
+            Some(OsStr::new("/xdg-data")),
+            Some(OsStr::new("/home/test")),
+        )
+        .unwrap();
+        assert_eq!(configured.bind, "0.0.0.0:3443".parse().unwrap());
+        assert_eq!(
+            configured.access,
+            AccessConfiguration::Token(TokenAccessConfiguration {
+                token_file: PathBuf::from("/secrets/token"),
+                public_origin: "https://glim.example:3443".into(),
+                tls: Some(TlsFiles {
+                    certificate: PathBuf::from("/secrets/cert.pem"),
+                    private_key: PathBuf::from("/secrets/key.pem"),
+                }),
+            })
+        );
+
+        for file in [
+            br#"{"schema_version":1,"bind":"0.0.0.0:3443","access":{"mode":"local"}}"#.as_slice(),
+            br#"{"schema_version":1,"bind":"0.0.0.0:3443","access":{"mode":"token","token_file":"/token","public_origin":"https://glim.example:3443"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"token","token_file":"relative","public_origin":"http://127.0.0.1:3030"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"token","token_file":"/token","public_origin":"http://127.0.0.1:3030","tls_certificate":"/cert"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"token","token_file":"/token"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"token","token_file":"/token","public_origin":"https://glim.example/path"}}"#.as_slice(),
+        ] {
+            assert!(
+                resolve_daemon_configuration_values(
+                    Some(file),
+                    None,
+                    None,
+                    Some(OsStr::new("/xdg-data")),
+                    Some(OsStr::new("/home/test")),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn token_environment_overrides_file_access_before_bind_validation() {
+        let access = apply_access_environment_values(
+            AccessConfiguration::Local,
+            Some(OsStr::new("token")),
+            Some(OsStr::new("/environment/token")),
+            Some(OsStr::new("https://glim.example:3443")),
+            Some(OsStr::new("/environment/cert.pem")),
+            Some(OsStr::new("/environment/key.pem")),
+        )
+        .unwrap();
+        assert!(matches!(access, AccessConfiguration::Token(_)));
+        validate_access_bind(&"0.0.0.0:3443".parse().unwrap(), &access).unwrap();
+
+        for (mode, token, origin, certificate, key) in [
+            (Some(OsStr::new("unknown")), None, None, None, None),
+            (Some(OsStr::new("token")), None, None, None, None),
+            (
+                Some(OsStr::new("local")),
+                Some(OsStr::new("/token")),
+                None,
+                None,
+                None,
+            ),
+            (
+                Some(OsStr::new("token")),
+                Some(OsStr::new("relative")),
+                Some(OsStr::new("http://127.0.0.1:3030")),
+                None,
+                None,
+            ),
+            (
+                Some(OsStr::new("token")),
+                Some(OsStr::new("/token")),
+                Some(OsStr::new("http://127.0.0.1:3030")),
+                Some(OsStr::new("/cert")),
+                None,
+            ),
+        ] {
+            assert!(
+                apply_access_environment_values(
+                    AccessConfiguration::Local,
+                    mode,
+                    token,
+                    origin,
+                    certificate,
+                    key,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn access_token_is_private_persistent_and_strictly_validated() {
+        let root = tempfile::tempdir().unwrap();
+        let token_path = root.path().join("access-token");
+        let first = load_or_create_access_token(&token_path).unwrap();
+        assert_eq!(first.expose().len(), 64);
+        assert!(first.expose().bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(load_or_create_access_token(&token_path).unwrap(), first);
+
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_or_create_access_token(&token_path).is_err());
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&token_path, b"short").unwrap();
+        assert!(load_or_create_access_token(&token_path).is_err());
+
+        let target = root.path().join("target");
+        std::fs::write(&target, "a".repeat(64)).unwrap();
+        let symlink = root.path().join("symlink-token");
+        std::os::unix::fs::symlink(target, &symlink).unwrap();
+        assert!(load_or_create_access_token(&symlink).is_err());
     }
 
     #[cfg(unix)]

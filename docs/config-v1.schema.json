@@ -16,8 +16,33 @@
     "bind": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(127(?:\\.[0-9]{1,3}){3}:[1-9][0-9]*|\\[::1\\]:[1-9][0-9]*)$",
-      "description": "Numeric loopback IP socket address with a nonzero port, for example 127.0.0.1:3030 or [::1]:3030. GLIM_BIND takes precedence."
+      "description": "Numeric IP socket address with a nonzero port. GLIM_BIND takes precedence."
+    },
+    "access": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {"mode": {"const": "local"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "token_file", "public_origin"],
+          "dependentRequired": {
+            "tls_certificate": ["tls_private_key"],
+            "tls_private_key": ["tls_certificate"]
+          },
+          "properties": {
+            "mode": {"const": "token"},
+            "token_file": {"type": "string", "minLength": 1, "pattern": "^/"},
+            "public_origin": {"type": "string", "pattern": "^https?://[^/?#]+$"},
+            "tls_certificate": {"type": "string", "minLength": 1, "pattern": "^/"},
+            "tls_private_key": {"type": "string", "minLength": 1, "pattern": "^/"}
+          }
+        }
+      ]
     }
   }
 }

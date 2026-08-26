@@ -49,11 +49,49 @@ fn print_cli_error(error: glim::cli::CliError) {
 
 async fn run_daemon() -> Result<(), String> {
     let configuration = glim::daemon::resolve_daemon_configuration()?;
-    let store = glim::daemon::open_store(configuration.store)?;
-    let listener = tokio::net::TcpListener::bind(configuration.bind)
-        .await
-        .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
-    axum::serve(listener, glim::app_with_store(store))
-        .await
-        .map_err(|error| format!("server failed: {error}"))
+    match configuration.access {
+        glim::daemon::AccessConfiguration::Local => {
+            let store = glim::daemon::open_store(configuration.store)?;
+            let listener = tokio::net::TcpListener::bind(configuration.bind)
+                .await
+                .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
+            axum::serve(listener, glim::app_with_store(store))
+                .await
+                .map_err(|error| format!("server failed: {error}"))
+        }
+        glim::daemon::AccessConfiguration::Token(access) => {
+            let token = glim::daemon::load_or_create_access_token(&access.token_file)?;
+            let tls = match access.tls {
+                Some(files) => Some(
+                    axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                        files.certificate,
+                        files.private_key,
+                    )
+                    .await
+                    .map_err(|error| format!("could not load TLS certificate and key: {error}"))?,
+                ),
+                None => None,
+            };
+            let store = glim::daemon::open_store(configuration.store)?;
+            let app = glim::app_with_store_and_token_auth(
+                store,
+                token,
+                access.public_origin,
+                tls.is_some(),
+            );
+            if let Some(tls) = tls {
+                axum_server::bind_rustls(configuration.bind, tls)
+                    .serve(app.into_make_service())
+                    .await
+                    .map_err(|error| format!("TLS server failed: {error}"))
+            } else {
+                let listener = tokio::net::TcpListener::bind(configuration.bind)
+                    .await
+                    .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
+                axum::serve(listener, app)
+                    .await
+                    .map_err(|error| format!("server failed: {error}"))
+            }
+        }
+    }
 }

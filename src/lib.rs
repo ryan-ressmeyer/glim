@@ -5,6 +5,8 @@ pub mod storage;
 
 pub const API_V1_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/health"),
+    ("POST", "/api/v1/auth/session"),
+    ("DELETE", "/api/v1/auth/session"),
     ("POST", "/api/v1/sessions"),
     ("GET", "/api/v1/sessions/{public_id}"),
     ("DELETE", "/api/v1/sessions/{public_id}"),
@@ -17,6 +19,10 @@ pub const API_V1_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/posts"),
     ("POST", "/api/v1/posts"),
     ("GET", "/api/v1/posts/{post_id}"),
+    (
+        "POST",
+        "/api/v1/posts/{post_id}/files/{position}/html-capability",
+    ),
     ("GET", "/api/v1/posts/{post_id}/files/{position}/content"),
     ("HEAD", "/api/v1/posts/{post_id}/files/{position}/content"),
     (
@@ -61,23 +67,48 @@ pub fn app_with_store(store: storage::Store) -> Router {
     app_with_state(api::ApiState::with_store(store))
 }
 
+pub fn app_with_store_and_token_auth(
+    store: storage::Store,
+    access_token: daemon::AccessToken,
+    expected_origin: String,
+    secure_cookie: bool,
+) -> Router {
+    app_with_state(api::ApiState::with_store_and_token_auth(
+        store,
+        access_token,
+        expected_origin,
+        secure_cookie,
+    ))
+}
+
 fn app_with_state(state: api::ApiState) -> Router {
     let v1 = Router::new()
         .route("/health", get(health))
         .merge(api::routes())
         .fallback(api::route_not_found)
         .method_not_allowed_fallback(api::method_not_allowed);
+    let authentication_state = state.clone();
     Router::new()
         .route("/", get(root))
         .route("/feed", get(root))
+        .route("/login", get(login_page))
         .route("/sessions/{public_id}", get(session_page))
         .route("/projects/{project_id}", get(project_page))
         .route("/assets/app.js", get(frontend_script))
         .route("/assets/pdf.worker.mjs", get(pdf_worker_script))
+        .merge(api::capability_routes())
         .nest("/api/v1", v1)
         .fallback(api::root_not_found)
         .layer(middleware::from_fn(api::validate_v1_path))
+        .layer(middleware::from_fn_with_state(
+            authentication_state,
+            api::authenticate_request,
+        ))
         .with_state(state)
+}
+
+async fn login_page() -> Html<&'static str> {
+    Html(INDEX_HTML)
 }
 
 async fn root() -> Html<&'static str> {

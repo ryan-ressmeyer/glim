@@ -30,6 +30,7 @@ const MAX_DATE_SECONDS = 8_640_000_000_000;
 const MAX_BROWSER_SAFE_ID = 9_007_199_254_740_991;
 
 type Route =
+  | { kind: "login" }
   | { kind: "global" }
   | { kind: "session"; publicId: string }
   | { kind: "project"; projectId: number }
@@ -119,6 +120,7 @@ function isDateSeconds(value: unknown): value is number {
 }
 
 function routeFromLocation(pathname: string): Route {
+  if (pathname === "/login") return { kind: "login" };
   if (pathname === "/" || pathname === "/feed") return { kind: "global" };
   const sessionMatch = pathname.match(/^\/sessions\/([^/]+)$/);
   if (sessionMatch && isPublicId(sessionMatch[1])) return { kind: "session", publicId: sessionMatch[1] };
@@ -209,9 +211,8 @@ function supportScope(postId: number, file: PostFile): string {
   return `${API}/posts/${postId}/files/${file.position}/support/`;
 }
 
-function htmlResourceResolver(postId: number, file: PostFile): (value: string) => string | null {
+function htmlResourceResolver(file: PostFile, scope: string): (value: string) => string | null {
   const stored = new Set(file.support_assets.map((asset) => asset.relative_path));
-  const scope = supportScope(postId, file);
   return (raw) => {
     if (!raw || raw !== raw.trim() || raw.includes("?") || raw.includes("\\") || raw.startsWith("#")) return null;
     const hashIndex = raw.indexOf("#");
@@ -232,8 +233,8 @@ function htmlResourceResolver(postId: number, file: PostFile): (value: string) =
   };
 }
 
-function htmlCsp(postId: number, file: PostFile, scripts: boolean): string {
-  const scope = new URL(supportScope(postId, file), window.location.href).href;
+function htmlCsp(supportPrefix: string, scripts: boolean): string {
+  const scope = new URL(supportPrefix, window.location.href).href;
   const scriptSource = scripts ? `'unsafe-inline' ${scope}` : "'none'";
   return [
     "default-src 'none'",
@@ -267,9 +268,9 @@ function rewriteHtmlResource(
   return resolveSupport(value) ?? (dataKind ? safeDataResource(value, dataKind) : null);
 }
 
-function sanitizeHtmlDocument(source: string, data: ArtifactData, scripts: boolean): string {
+function sanitizeHtmlDocument(source: string, data: ArtifactData, scripts: boolean, supportPrefix: string): string {
   const documentValue = new DOMParser().parseFromString(source, "text/html");
-  const resolveSupport = htmlResourceResolver(data.postId, data.file);
+  const resolveSupport = htmlResourceResolver(data.file, supportPrefix);
 
   documentValue.querySelectorAll("base, iframe, frame, object, embed").forEach((value) => value.remove());
   documentValue.querySelectorAll("meta").forEach((value) => {
@@ -336,7 +337,7 @@ function sanitizeHtmlDocument(source: string, data: ArtifactData, scripts: boole
 
   const csp = documentValue.createElement("meta");
   csp.setAttribute("http-equiv", "Content-Security-Policy");
-  csp.setAttribute("content", htmlCsp(data.postId, data.file, scripts));
+  csp.setAttribute("content", htmlCsp(supportPrefix, scripts));
   documentValue.head.prepend(csp);
   return `<!doctype html>\n${documentValue.documentElement.outerHTML}`;
 }
@@ -525,6 +526,28 @@ class GlimArtifact extends HTMLElement {
     return generation === this.renderGeneration && this.isConnected && !signal?.aborted;
   }
 
+  private async fetchHtmlSupportPrefix(data: ArtifactData, generation: number): Promise<string | null> {
+    const controller = new AbortController();
+    this.controller = controller;
+    const endpoint = `${API}/posts/${data.postId}/files/${data.file.position}/html-capability`;
+    const response = await fetch(endpoint, { method: "POST", signal: controller.signal });
+    if (!this.isRenderActive(generation, controller.signal)) return null;
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload: unknown = await response.json();
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("malformed HTML capability");
+    const value = payload as Record<string, unknown>;
+    if (!Object.keys(value).every((key) => ["path_prefix", "expires_in_seconds"].includes(key))
+      || typeof value.path_prefix !== "string"
+      || !isPositiveSafeInteger(value.expires_in_seconds)) throw new Error("malformed HTML capability");
+    const ordinary = supportScope(data.postId, data.file);
+    const suffix = `/api/v1/posts/${data.postId}/files/${data.file.position}/support/`;
+    const capability = value.path_prefix.startsWith("/cap/") && value.path_prefix.endsWith(suffix);
+    const parsed = new URL(value.path_prefix, window.location.href);
+    if (!(value.path_prefix === ordinary || capability)
+      || parsed.origin !== window.location.origin || parsed.search || parsed.hash) throw new Error("malformed HTML capability");
+    return value.path_prefix;
+  }
+
   private async fetchText(data: ArtifactData, generation: number): Promise<string | null> {
     const controller = new AbortController();
     this.controller = controller;
@@ -586,7 +609,11 @@ class GlimArtifact extends HTMLElement {
       }
       case "html": {
         const text = await this.fetchText(data, generation);
-        if (text !== null && this.isRenderActive(generation)) this.renderHtml(root, text, data, generation);
+        if (text === null || !this.isRenderActive(generation)) return;
+        const supportPrefix = await this.fetchHtmlSupportPrefix(data, generation);
+        if (supportPrefix !== null && this.isRenderActive(generation)) {
+          this.renderHtml(root, text, data, generation, supportPrefix);
+        }
         return;
       }
       case "download":
@@ -879,7 +906,13 @@ class GlimArtifact extends HTMLElement {
     root.append(downloadLink(data));
   }
 
-  private renderHtml(root: ShadowRoot, source: string, data: ArtifactData, generation: number) {
+  private renderHtml(
+    root: ShadowRoot,
+    source: string,
+    data: ArtifactData,
+    generation: number,
+    supportPrefix: string,
+  ) {
     const warning = element("div");
     warning.className = "script-warning";
     warning.dataset.scriptWarning = "";
@@ -891,24 +924,29 @@ class GlimArtifact extends HTMLElement {
     enable.dataset.enableScripts = "";
     warning.append(enable);
 
-    const createFrame = (scripts: boolean) => {
+    const createFrame = (scripts: boolean, frameSupportPrefix: string) => {
       const frame = element("iframe");
       frame.className = "html-frame";
       frame.title = `Rendered HTML: ${data.file.filename}`;
       frame.referrerPolicy = "no-referrer";
       frame.setAttribute("sandbox", scripts ? "allow-scripts" : "");
-      frame.srcdoc = sanitizeHtmlDocument(source, data, scripts);
+      frame.srcdoc = sanitizeHtmlDocument(source, data, scripts, frameSupportPrefix);
       return frame;
     };
-    let frame = createFrame(false);
+    let frame = createFrame(false, supportPrefix);
     enable.addEventListener("click", () => {
       if (!this.isRenderActive(generation) || enable.disabled) return;
       enable.disabled = true;
-      const replacement = createFrame(true);
-      frame.srcdoc = "";
-      frame.removeAttribute("src");
-      frame.replaceWith(replacement);
-      frame = replacement;
+      void this.fetchHtmlSupportPrefix(data, generation).then((scriptSupportPrefix) => {
+        if (scriptSupportPrefix === null || !this.isRenderActive(generation)) return;
+        const replacement = createFrame(true, scriptSupportPrefix);
+        frame.srcdoc = "";
+        frame.removeAttribute("src");
+        frame.replaceWith(replacement);
+        frame = replacement;
+      }).catch(() => {
+        if (this.isRenderActive(generation)) enable.disabled = false;
+      });
     });
     root.append(warning, frame, downloadLink(data));
   }
@@ -1002,6 +1040,10 @@ class GlimApp extends HTMLElement {
     this.renderShell();
     if (this.route.kind === "invalid") {
       this.showState("Page not found");
+      return;
+    }
+    if (this.route.kind === "login") {
+      this.renderLogin(generation);
       return;
     }
     this.closed = false;
@@ -1211,6 +1253,56 @@ class GlimApp extends HTMLElement {
     this.showState("Session closed");
   }
 
+  private renderLogin(generation: number) {
+    const section = element("section");
+    section.className = "state";
+    const heading = element("h2", "Access token");
+    const explanation = element("p", "Enter the token from the configured Glimse token file.");
+    const form = element("form");
+    const label = element("label", "Access token ");
+    const input = element("input");
+    input.type = "password";
+    input.name = "token";
+    input.required = true;
+    input.autocomplete = "current-password";
+    const submit = element("button", "Sign in");
+    submit.type = "submit";
+    label.append(input);
+    form.append(label, submit);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (submit.disabled || !input.value) return;
+      const token = input.value;
+      input.value = "";
+      submit.disabled = true;
+      section.querySelector("[data-login-status]")?.remove();
+      const controller = new AbortController();
+      this.controller = controller;
+      void fetch(`${API}/auth/session`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+        signal: controller.signal,
+      }).then((response) => {
+        if (!this.isAppActive(generation, controller.signal)) return;
+        if (!response.ok) throw new Error("login rejected");
+        window.location.assign("/feed");
+      }).catch((error: unknown) => {
+        if (!this.isAppActive(generation, controller.signal)
+          || (error instanceof DOMException && error.name === "AbortError")) return;
+        submit.disabled = false;
+        const status = element("p", "Could not sign in. Check the token and try again.");
+        status.dataset.loginStatus = "";
+        status.setAttribute("role", "status");
+        section.append(status);
+        input.focus();
+      });
+    });
+    section.append(heading, explanation, form);
+    this.main?.append(section);
+    input.focus();
+  }
+
   private renderShell() {
     this.shadowRoot?.querySelector("main")?.remove();
     const main = element("main");
@@ -1229,6 +1321,7 @@ class GlimApp extends HTMLElement {
   private renderNavigation(context?: Session) {
     if (!this.navigation) return;
     this.navigation.replaceChildren();
+    if (this.route.kind === "login") return;
     if (this.route.kind === "session") {
       const sessionLink = element("a", "Session");
       sessionLink.href = `/sessions/${this.route.publicId}`;
@@ -1246,6 +1339,11 @@ class GlimApp extends HTMLElement {
     const globalLink = element("a", "Global feed");
     globalLink.href = "/feed";
     this.navigation.append(globalLink);
+    const logout = element("button", "Log out");
+    logout.type = "button";
+    logout.dataset.logout = "";
+    logout.addEventListener("click", () => { void this.logout(logout); });
+    this.navigation.append(logout);
     if (this.route.kind === "session") {
       const close = element("button", "Close session");
       close.type = "button";
@@ -1253,6 +1351,23 @@ class GlimApp extends HTMLElement {
       close.dataset.closeSession = "";
       close.addEventListener("click", () => { void this.closeSession(close); });
       this.navigation.append(close);
+    }
+  }
+
+  private async logout(button: HTMLButtonElement) {
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      const response = await fetch(`${API}/auth/session`, { method: "DELETE" });
+      if (!response.ok) throw new Error("logout failed");
+      this.stopLive();
+      this.controller?.abort();
+      window.location.assign("/login");
+    } catch {
+      button.disabled = false;
+      const status = element("span", " Could not log out. Try again.");
+      status.setAttribute("role", "status");
+      button.after(status);
     }
   }
 
@@ -1270,6 +1385,16 @@ class GlimApp extends HTMLElement {
       status.setAttribute("role", "status");
       button.after(status);
     }
+  }
+
+  private showAuthenticationExpired() {
+    this.stopLive();
+    this.showState("Authentication expired");
+    const state = this.main?.querySelector<HTMLElement>(".state");
+    if (!state) return;
+    const login = element("a", "Sign in");
+    login.href = "/login";
+    state.append(element("br"), login);
   }
 
   private showState(message: string, retry = false) {
@@ -1315,6 +1440,10 @@ class GlimApp extends HTMLElement {
       return;
     }
     if (!response.ok) {
+      if (response.status === 401) {
+        this.showAuthenticationExpired();
+        return;
+      }
       this.handleLoadError(more, `Could not load older posts (HTTP ${response.status})`, `Feed request failed (HTTP ${response.status})`);
       return;
     }

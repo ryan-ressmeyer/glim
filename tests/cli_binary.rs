@@ -6,7 +6,11 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{ffi::OsString, os::unix::ffi::OsStringExt, os::unix::fs::symlink};
+use std::{
+    ffi::OsString,
+    os::unix::fs::symlink,
+    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -19,9 +23,17 @@ fn run_glim(
     daemon_url: &str,
     browser: Option<&str>,
 ) -> std::process::Output {
+    let config_home = TempDir::new().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_glim"));
     command
         .args(args)
+        .env_remove("GLIM_CONFIG")
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("GLIM_ACCESS_MODE", "local")
+        .env_remove("GLIM_TOKEN_FILE")
+        .env_remove("GLIM_PUBLIC_ORIGIN")
+        .env_remove("GLIM_TLS_CERTIFICATE")
+        .env_remove("GLIM_TLS_PRIVATE_KEY")
         .env("GLIM_DAEMON_URL", daemon_url)
         .stdin(Stdio::piped());
     if let Some(browser) = browser {
@@ -871,6 +883,88 @@ fn publication_rejects_a_non_utf8_canonical_working_directory() {
     assert_eq!(one_json(&output)["error"]["code"], "validation_error");
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
+    let _guard = REAL_DAEMON_LOCK.lock().await;
+    let port = std::net::TcpListener::bind("127.0.0.1:3030")
+        .expect("authenticated CLI regression requires port 3030");
+    drop(port);
+    let root = TempDir::new().unwrap();
+    let config_path = root.path().join("config.json");
+    let token_path = root.path().join("token");
+    fs::write(&token_path, "a".repeat(64)).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "store_root": root.path().join("store"),
+            "bind": "127.0.0.1:3030",
+            "access": {
+                "mode": "token",
+                "token_file": token_path,
+                "public_origin": "http://127.0.0.1:3030"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_glim"))
+        .arg("daemon")
+        .env("GLIM_CONFIG", &config_path)
+        .env_remove("GLIM_ACCESS_MODE")
+        .env_remove("GLIM_TOKEN_FILE")
+        .env_remove("GLIM_PUBLIC_ORIGIN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = DaemonProcess(child);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if reqwest::get("http://127.0.0.1:3030/api/v1/health")
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "token daemon did not become ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let authenticated = Command::new(env!("CARGO_BIN_EXE_glim"))
+        .args(["list", "--global"])
+        .env("GLIM_CONFIG", &config_path)
+        .env("GLIM_DAEMON_URL", "http://127.0.0.1:3030")
+        .output()
+        .unwrap();
+    assert!(
+        authenticated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&authenticated.stdout)
+    );
+
+    let config_home = TempDir::new().unwrap();
+    let unauthenticated = Command::new(env!("CARGO_BIN_EXE_glim"))
+        .args(["list", "--global"])
+        .env_remove("GLIM_CONFIG")
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("GLIM_ACCESS_MODE", "local")
+        .env("GLIM_DAEMON_URL", "http://127.0.0.1:3030")
+        .output()
+        .unwrap();
+    assert!(!unauthenticated.status.success());
+    assert_eq!(
+        one_json(&unauthenticated)["error"]["code"],
+        "authentication_required"
+    );
+}
+
 #[test]
 fn malformed_usage_stdin_and_unavailable_daemon_are_json_errors() {
     for (args, input, code) in [
@@ -898,7 +992,7 @@ fn malformed_usage_stdin_and_unavailable_daemon_are_json_errors() {
     }
     let https = run_glim(&["status"], None, "https://127.0.0.1:3030", None);
     assert!(!https.status.success());
-    assert_eq!(one_json(&https)["error"]["code"], "configuration_error");
+    assert_eq!(one_json(&https)["error"]["code"], "daemon_unavailable");
     for invalid in [
         "http://user@example.test",
         "http://example.test/path",

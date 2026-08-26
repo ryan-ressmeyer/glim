@@ -1106,21 +1106,19 @@ async fn send_publication(publication: PreparedPublication) -> Result<Value, Cli
     }
     let base = daemon_url()?;
     let url = format!("{base}/api/v1/posts");
-    let response = reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| CliError::new("http_error", error.to_string()))?
         .post(url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|error| {
-            publication_may_have_succeeded(CliError::new(
-                "daemon_unavailable",
-                format!("could not reach daemon: {error}"),
-            ))
-        })?;
+        .multipart(form);
+    let response = authorize_request(request)?.send().await.map_err(|error| {
+        publication_may_have_succeeded(CliError::new(
+            "daemon_unavailable",
+            format!("could not reach daemon: {error}"),
+        ))
+    })?;
     let status = response.status();
     let payload = bounded_response_json(response)
         .await
@@ -1187,19 +1185,17 @@ async fn request_json(method: &str, path: &str) -> Result<Value, CliError> {
     let url = format!("{}{}", daemon_url()?, path);
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|_| CliError::new("usage_error", "invalid HTTP method"))?;
-    let response = reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|error| CliError::new("http_error", error.to_string()))?
-        .request(method, url)
-        .send()
-        .await
-        .map_err(|error| {
-            CliError::new(
-                "daemon_unavailable",
-                format!("could not reach daemon: {error}"),
-            )
-        })?;
+        .request(method, url);
+    let response = authorize_request(request)?.send().await.map_err(|error| {
+        CliError::new(
+            "daemon_unavailable",
+            format!("could not reach daemon: {error}"),
+        )
+    })?;
     let status = response.status();
     let payload = bounded_response_json(response).await?;
     if !status.is_success() {
@@ -1259,14 +1255,29 @@ fn daemon_error(status: u16, payload: Value) -> CliError {
     CliError::new(code, message).with_details(Value::Object(details))
 }
 
+fn authorize_request(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::RequestBuilder, CliError> {
+    let token = crate::daemon::resolve_client_access_token().map_err(|error| {
+        CliError::new(
+            "configuration_error",
+            format!("could not resolve daemon access token: {error}"),
+        )
+    })?;
+    Ok(match token {
+        Some(token) => request.bearer_auth(token.expose()),
+        None => request,
+    })
+}
+
 fn daemon_url() -> Result<String, CliError> {
     let value = std::env::var("GLIM_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:3030".into());
     let parsed = reqwest::Url::parse(&value)
         .map_err(|_| CliError::new("configuration_error", "GLIM_DAEMON_URL is not a valid URL"))?;
-    if parsed.scheme() != "http" {
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err(CliError::new(
             "configuration_error",
-            "GLIM_DAEMON_URL must use HTTP; HTTPS is deferred until Phase 4",
+            "GLIM_DAEMON_URL must use HTTP or HTTPS",
         ));
     }
     if parsed.host_str().is_none()
