@@ -67,6 +67,18 @@ pub fn app_with_store(store: storage::Store) -> Router {
     app_with_state(api::ApiState::with_store(store))
 }
 
+pub fn app_with_store_and_trusted_proxy(
+    store: storage::Store,
+    trusted_proxy_ips: std::collections::HashSet<std::net::IpAddr>,
+    expected_origin: String,
+) -> Router {
+    app_with_state(api::ApiState::with_store_and_trusted_proxy(
+        store,
+        trusted_proxy_ips,
+        expected_origin,
+    ))
+}
+
 pub fn app_with_store_and_token_auth(
     store: storage::Store,
     access_token: daemon::AccessToken,

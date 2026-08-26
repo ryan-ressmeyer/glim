@@ -55,6 +55,7 @@ const daemonEnvironment = { ...process.env, GLIM_CONFIG: configPath };
 for (const name of [
   "GLIM_STORE_ROOT", "GLIM_BIND", "GLIM_ACCESS_MODE", "GLIM_TOKEN_FILE",
   "GLIM_PUBLIC_ORIGIN", "GLIM_TLS_CERTIFICATE", "GLIM_TLS_PRIVATE_KEY",
+  "GLIM_TRUSTED_PROXY_IPS",
 ]) delete daemonEnvironment[name];
 const daemon = spawn(daemonBinary, ["daemon"], {
   env: daemonEnvironment,

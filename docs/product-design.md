@@ -36,9 +36,9 @@ The daemon binds to loopback by default. It reads a versioned JSON file from the
 Non-loopback deployments require one of two explicit modes.
 
 - Built-in token authentication uses a generated persistent token. Direct non-loopback binding requires configured TLS. CLI clients send a Bearer credential; browsers exchange the token for a bounded HttpOnly session cookie. Sandboxed HTML uses short-lived capabilities restricted to its declared support assets.
-- Trusted-proxy mode delegates authentication to a user-configured proxy or private network boundary.
+- Trusted-proxy mode delegates TLS and user authentication to a user-configured proxy or private network boundary. Glimse accepts requests only from configured exact numeric TCP peer addresses and does not trust forwarded identity headers. Health remains available for proxy probes. Other routes require an allowlisted peer, browser-originated mutations require the configured exact public origin, and headerless non-browser clients rely on peer authorization. Token login is unavailable in this mode.
 
-The default configuration must not expose artifacts to the local network. Media endpoints support HTTP range requests for seeking and partial transfer.
+The default configuration must not expose artifacts to the local network. A trusted-proxy listener must also be unreachable by non-proxy clients because possession of an allowlisted source address is the daemon's complete authorization check. Non-loopback trusted-proxy deployments require an HTTPS public origin while the proxy-to-daemon connection may use HTTP. Media endpoints support HTTP range requests for seeking and partial transfer.
 
 ## Sessions
 

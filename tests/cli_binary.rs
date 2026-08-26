@@ -34,6 +34,7 @@ fn run_glim(
         .env_remove("GLIM_PUBLIC_ORIGIN")
         .env_remove("GLIM_TLS_CERTIFICATE")
         .env_remove("GLIM_TLS_PRIVATE_KEY")
+        .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .env("GLIM_DAEMON_URL", daemon_url)
         .stdin(Stdio::piped());
     if let Some(browser) = browser {
@@ -916,6 +917,9 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
         .env_remove("GLIM_ACCESS_MODE")
         .env_remove("GLIM_TOKEN_FILE")
         .env_remove("GLIM_PUBLIC_ORIGIN")
+        .env_remove("GLIM_TLS_CERTIFICATE")
+        .env_remove("GLIM_TLS_PRIVATE_KEY")
+        .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -955,6 +959,11 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
         .env_remove("GLIM_CONFIG")
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("GLIM_ACCESS_MODE", "local")
+        .env_remove("GLIM_TOKEN_FILE")
+        .env_remove("GLIM_PUBLIC_ORIGIN")
+        .env_remove("GLIM_TLS_CERTIFICATE")
+        .env_remove("GLIM_TLS_PRIVATE_KEY")
+        .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .env("GLIM_DAEMON_URL", "http://127.0.0.1:3030")
         .output()
         .unwrap();

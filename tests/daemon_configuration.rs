@@ -1,4 +1,5 @@
-use serde_json::json;
+use glim::storage::{PublicationFile, PublicationRequest, Store};
+use serde_json::{Value, json};
 use std::{
     fs,
     net::TcpListener,
@@ -28,6 +29,7 @@ fn command(config_path: &Path) -> Command {
         .env_remove("GLIM_PUBLIC_ORIGIN")
         .env_remove("GLIM_TLS_CERTIFICATE")
         .env_remove("GLIM_TLS_PRIVATE_KEY")
+        .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("HOME")
@@ -155,6 +157,160 @@ async fn token_tls_configuration_serves_only_authenticated_https() {
             .is_err(),
         "TLS listener unexpectedly served plaintext HTTP"
     );
+}
+
+#[tokio::test]
+async fn trusted_proxy_real_socket_serves_api_sse_and_ranges_only_for_allowlisted_peers() {
+    let root = TempDir::new().unwrap();
+    let store_path = root.path().join("store");
+    let mut store = Store::open(&store_path).unwrap();
+    let session = store
+        .resolve_session(
+            "socket-test",
+            "trusted-proxy",
+            "Trusted proxy",
+            "/tmp/proxy",
+        )
+        .unwrap();
+    let session_public_id = session.public_id.clone();
+    let blob = store
+        .stage_publication_blob(std::io::Cursor::new(b"range response"))
+        .unwrap();
+    store
+        .publish_at(
+            PublicationRequest {
+                session_public_id: session.public_id,
+                title: "Proxy artifact".into(),
+                commentary: "Socket coverage".into(),
+                predecessor_post_id: None,
+                git: None,
+                files: vec![PublicationFile {
+                    filename: "artifact.txt".into(),
+                    caption: None,
+                    blob,
+                    support_assets: vec![],
+                }],
+            },
+            1,
+        )
+        .unwrap();
+    drop(store);
+
+    let port = free_loopback_port();
+    let config_path = root.path().join("trusted.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "store_root": store_path,
+            "bind": format!("127.0.0.1:{port}"),
+            "access": {
+                "mode": "trusted_proxy",
+                "trusted_proxy_ips": ["127.0.0.1"],
+                "public_origin": format!("http://127.0.0.1:{port}")
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut daemon = Daemon(command(&config_path).spawn().unwrap());
+    let health_url = format!("http://127.0.0.1:{port}/api/v1/health");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if reqwest::get(&health_url).await.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "trusted-proxy daemon did not listen"
+        );
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "trusted-proxy daemon exited"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!("http://127.0.0.1:{port}/api/v1/posts"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(format!("http://127.0.0.1:{port}/api/v1/posts/events"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .post(format!(
+                "http://127.0.0.1:{port}/api/v1/sessions/{session_public_id}/heartbeat"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let range = client
+        .get(format!(
+            "http://127.0.0.1:{port}/api/v1/posts/1/files/0/content"
+        ))
+        .header("range", "bytes=0-4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(range.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range.bytes().await.unwrap(), "range");
+    drop(daemon);
+
+    let denied_port = free_loopback_port();
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "store_root": store_path,
+            "bind": format!("127.0.0.1:{denied_port}"),
+            "access": {
+                "mode": "trusted_proxy",
+                "trusted_proxy_ips": ["127.0.0.2"],
+                "public_origin": format!("http://127.0.0.1:{denied_port}")
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut denied = Daemon(command(&config_path).spawn().unwrap());
+    let denied_health = format!("http://127.0.0.1:{denied_port}/api/v1/health");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if reqwest::get(&denied_health).await.is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "denial daemon did not listen");
+        assert!(
+            denied.0.try_wait().unwrap().is_none(),
+            "denial daemon exited"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let response = client
+        .get(format!("http://127.0.0.1:{denied_port}/api/v1/posts"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let payload: Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "proxy_authorization_required");
 }
 
 #[test]

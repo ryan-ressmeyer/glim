@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        DefaultBodyLimit, Multipart, OriginalUri, Path, Query, State,
+        ConnectInfo, DefaultBodyLimit, Multipart, OriginalUri, Path, Query, State,
         multipart::MultipartRejection,
         rejection::{BytesRejection, JsonRejection, QueryRejection},
     },
@@ -54,6 +54,12 @@ pub(crate) struct ApiState {
     store: Option<Arc<Mutex<Store>>>,
     events: broadcast::Sender<LiveEvent>,
     authentication: Option<Arc<TokenAuthentication>>,
+    trusted_proxy: Option<Arc<TrustedProxyAuthentication>>,
+}
+
+struct TrustedProxyAuthentication {
+    trusted_proxy_ips: HashSet<std::net::IpAddr>,
+    expected_origin: String,
 }
 
 struct TokenAuthentication {
@@ -77,6 +83,7 @@ impl Default for ApiState {
             store: None,
             events,
             authentication: None,
+            trusted_proxy: None,
         }
     }
 }
@@ -85,6 +92,21 @@ impl ApiState {
     pub(crate) fn with_store(store: Store) -> Self {
         Self {
             store: Some(Arc::new(Mutex::new(store))),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_store_and_trusted_proxy(
+        store: Store,
+        trusted_proxy_ips: HashSet<std::net::IpAddr>,
+        expected_origin: String,
+    ) -> Self {
+        Self {
+            store: Some(Arc::new(Mutex::new(store))),
+            trusted_proxy: Some(Arc::new(TrustedProxyAuthentication {
+                trusted_proxy_ips,
+                expected_origin,
+            })),
             ..Self::default()
         }
     }
@@ -190,6 +212,9 @@ pub(crate) async fn authenticate_request(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if let Some(authentication) = state.trusted_proxy.as_ref() {
+        return authenticate_trusted_proxy_request(authentication, request, next).await;
+    }
     let Some(authentication) = state.authentication.as_ref() else {
         return next.run(request).await;
     };
@@ -222,6 +247,61 @@ pub(crate) async fn authenticate_request(
             StatusCode::FORBIDDEN,
             "origin_rejected",
             "Cookie-authenticated mutation requires the configured origin",
+            json!({}),
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+async fn authenticate_trusted_proxy_request(
+    authentication: &TrustedProxyAuthentication,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if path == "/api/v1/health" {
+        return next.run(request).await;
+    }
+    let trusted = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|ConnectInfo(peer)| authentication.trusted_proxy_ips.contains(&peer.ip()));
+    if !trusted {
+        if is_v1_path(path) {
+            return ApiError::new(
+                StatusCode::FORBIDDEN,
+                "proxy_authorization_required",
+                "The immediate proxy connection is not authorized",
+                json!({}),
+            )
+            .into_response();
+        }
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if path == "/login" || path == "/api/v1/auth/session" {
+        return if is_v1_path(path) {
+            v1_not_found(path).into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    }
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let browser_request = request.headers().contains_key(header::ORIGIN)
+        || request.headers().contains_key("sec-fetch-site");
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) && browser_request
+        && origin != Some(authentication.expected_origin.as_str())
+    {
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            "origin_rejected",
+            "Mutation requires the configured origin",
             json!({}),
         )
         .into_response();

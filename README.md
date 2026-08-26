@@ -2,7 +2,7 @@
 
 Glimse is a local service for visual output produced by terminal-based AI agents. The daemon listens on loopback and persists immutable publications under a per-user store root. The structured CLI publishes local files, reads daemon state, closes sessions, and returns machine-readable JSON.
 
-The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The daemon configuration schema is [`docs/config-v1.schema.json`](docs/config-v1.schema.json). The browser feed receives live updates. Trusted-proxy access and service management remain pending.
+The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The daemon configuration schema is [`docs/config-v1.schema.json`](docs/config-v1.schema.json). The browser feed receives live updates. Service management remains pending.
 
 The agreed product design is recorded in [`docs/product-design.md`](docs/product-design.md). The dependency-ordered build plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
@@ -76,6 +76,25 @@ Token mode protects feed pages, API routes, SSE, ranges, media, and downloads. T
 The daemon creates a missing token as 32 random bytes encoded by 64 lowercase hexadecimal characters. On Linux the token file has mode `0600`; startup rejects symlinks, malformed values, and group- or world-accessible files. Certificate provisioning remains the operator's responsibility. `GLIM_ACCESS_MODE`, `GLIM_TOKEN_FILE`, `GLIM_PUBLIC_ORIGIN`, `GLIM_TLS_CERTIFICATE`, and `GLIM_TLS_PRIVATE_KEY` override their file values.
 
 API clients use the token as a Bearer credential. The browser login form exchanges it for a bounded 12-hour HttpOnly `SameSite=Strict` session and never puts the token in a URL. Cookie-authenticated mutations require the configured exact origin. Sandboxed HTML receives a renewable five-minute capability restricted to one file's declared support subtree; iframe content never receives the persistent token or browser cookie.
+
+Trusted-proxy mode delegates TLS and user authentication to a reverse proxy. Glimse authorizes only the immediate TCP peer IP and ignores `Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, and `X-Forwarded-Proto`. The allowlist contains exact numeric IP addresses, not hostnames or CIDRs. Health remains public for probes; every other route requires an allowlisted peer. Token login and session endpoints are unavailable in this mode. Browser-originated mutations require an exact `Origin` match; headerless non-browser API clients rely on the trusted peer boundary.
+
+```json
+{
+  "schema_version": 1,
+  "store_root": "/home/user/.local/share/glim",
+  "bind": "0.0.0.0:3030",
+  "access": {
+    "mode": "trusted_proxy",
+    "trusted_proxy_ips": ["100.64.0.10"],
+    "public_origin": "https://glim.example"
+  }
+}
+```
+
+`GLIM_ACCESS_MODE=trusted_proxy`, `GLIM_TRUSTED_PROXY_IPS=100.64.0.10,100.64.0.11`, and `GLIM_PUBLIC_ORIGIN=https://glim.example` provide the corresponding environment configuration. A non-loopback bind requires an HTTPS public origin, but Glimse serves plaintext HTTP to the proxy because the proxy terminates TLS.
+
+Configure a reverse proxy or Tailscale Serve deployment so only the proxy can reach the Glimse listener, then allowlist the source IP that Glimse observes for that connection. The proxy must enforce the intended user or private-network boundary and preserve browser `Origin` and `Sec-Fetch-Site` headers while forwarding all HTTP methods, SSE streams, range headers, and response streaming unchanged. Do not use forwarded identity headers as authorization. The automated tests exercise the Glimse side with real TCP sockets; they do not certify a specific nginx, Caddy, or Tailscale Serve configuration.
 
 The frontend build writes `web/dist/index.html`, `web/dist/assets/app.js`, and the bundled PDF.js worker at `web/dist/assets/pdf.worker.mjs`. Rust embeds all three files, so the resulting binary does not read frontend files at runtime.
 

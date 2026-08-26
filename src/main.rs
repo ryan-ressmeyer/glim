@@ -55,9 +55,13 @@ async fn run_daemon() -> Result<(), String> {
             let listener = tokio::net::TcpListener::bind(configuration.bind)
                 .await
                 .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
-            axum::serve(listener, glim::app_with_store(store))
-                .await
-                .map_err(|error| format!("server failed: {error}"))
+            axum::serve(
+                listener,
+                glim::app_with_store(store)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .map_err(|error| format!("server failed: {error}"))
         }
         glim::daemon::AccessConfiguration::Token(access) => {
             let token = glim::daemon::load_or_create_access_token(&access.token_file)?;
@@ -81,17 +85,37 @@ async fn run_daemon() -> Result<(), String> {
             );
             if let Some(tls) = tls {
                 axum_server::bind_rustls(configuration.bind, tls)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await
                     .map_err(|error| format!("TLS server failed: {error}"))
             } else {
                 let listener = tokio::net::TcpListener::bind(configuration.bind)
                     .await
                     .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
-                axum::serve(listener, app)
-                    .await
-                    .map_err(|error| format!("server failed: {error}"))
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .map_err(|error| format!("server failed: {error}"))
             }
+        }
+        glim::daemon::AccessConfiguration::TrustedProxy(access) => {
+            let store = glim::daemon::open_store(configuration.store)?;
+            let app = glim::app_with_store_and_trusted_proxy(
+                store,
+                access.trusted_proxy_ips,
+                access.public_origin,
+            );
+            let listener = tokio::net::TcpListener::bind(configuration.bind)
+                .await
+                .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .map_err(|error| format!("server failed: {error}"))
         }
     }
 }

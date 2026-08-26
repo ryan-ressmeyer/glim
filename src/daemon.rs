@@ -1,8 +1,9 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     fs,
     io::{Read, Write},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -31,6 +32,13 @@ pub struct DaemonConfiguration {
 pub enum AccessConfiguration {
     Local,
     Token(TokenAccessConfiguration),
+    TrustedProxy(TrustedProxyAccessConfiguration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedProxyAccessConfiguration {
+    pub trusted_proxy_ips: HashSet<IpAddr>,
+    pub public_origin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +100,10 @@ enum FileAccessConfiguration {
         public_origin: String,
         tls_certificate: Option<PathBuf>,
         tls_private_key: Option<PathBuf>,
+    },
+    TrustedProxy {
+        trusted_proxy_ips: Vec<String>,
+        public_origin: String,
     },
 }
 
@@ -182,6 +194,15 @@ fn resolve_daemon_configuration_base_values(
                 tls,
             })
         }
+        Some(FileAccessConfiguration::TrustedProxy {
+            trusted_proxy_ips,
+            public_origin,
+        }) => AccessConfiguration::TrustedProxy(TrustedProxyAccessConfiguration {
+            trusted_proxy_ips: parse_trusted_proxy_ips(
+                trusted_proxy_ips.iter().map(String::as_str),
+            )?,
+            public_origin: validate_public_origin(&public_origin).map(|()| public_origin)?,
+        }),
     };
     Ok(DaemonConfiguration {
         store,
@@ -238,6 +259,21 @@ fn validate_access_bind(bind: &SocketAddr, access: &AccessConfiguration) -> Resu
             }
             Ok(())
         }
+        AccessConfiguration::TrustedProxy(configuration) => {
+            let scheme = configuration
+                .public_origin
+                .parse::<axum::http::Uri>()
+                .map_err(|_| "trusted-proxy public origin is invalid".to_owned())?
+                .scheme_str()
+                .unwrap_or_default()
+                .to_owned();
+            if !bind.ip().is_loopback() && scheme != "https" {
+                return Err(
+                    "non-loopback trusted-proxy access requires an HTTPS public origin".to_owned(),
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -249,6 +285,7 @@ fn apply_access_environment_values(
     public_origin: Option<&OsStr>,
     tls_certificate: Option<&OsStr>,
     tls_private_key: Option<&OsStr>,
+    trusted_proxy_ips: Option<&OsStr>,
 ) -> Result<AccessConfiguration, String> {
     let mode = mode
         .map(|value| {
@@ -258,80 +295,120 @@ fn apply_access_environment_values(
                 .ok_or_else(|| "GLIM_ACCESS_MODE must be nonblank UTF-8".to_owned())
         })
         .transpose()?;
-    let any_access_override = token_file.is_some()
+    if mode.is_some_and(|value| !matches!(value, "local" | "token" | "trusted_proxy")) {
+        return Err("GLIM_ACCESS_MODE must be local, token, or trusted_proxy".to_owned());
+    }
+    let any_override = token_file.is_some()
         || public_origin.is_some()
         || tls_certificate.is_some()
-        || tls_private_key.is_some();
-    if mode == Some("local") {
-        if any_access_override {
-            return Err("local access mode does not accept token or TLS overrides".to_owned());
+        || tls_private_key.is_some()
+        || trusted_proxy_ips.is_some();
+    if mode.is_none() && !any_override {
+        return Ok(current);
+    }
+    let selected = mode.unwrap_or(match current {
+        AccessConfiguration::Local => "local",
+        AccessConfiguration::Token(_) => "token",
+        AccessConfiguration::TrustedProxy(_) => "trusted_proxy",
+    });
+    match selected {
+        "local" => {
+            if any_override {
+                return Err("local access mode does not accept access overrides".to_owned());
+            }
+            Ok(AccessConfiguration::Local)
         }
-        return Ok(AccessConfiguration::Local);
-    }
-    if mode.is_some_and(|value| value != "token") {
-        return Err("GLIM_ACCESS_MODE must be local or token".to_owned());
-    }
-    let (existing_token, existing_origin, existing_certificate, existing_key) = match current {
-        AccessConfiguration::Local => (None, None, None, None),
-        AccessConfiguration::Token(configuration) => (
-            Some(configuration.token_file),
-            Some(configuration.public_origin),
-            configuration
-                .tls
-                .as_ref()
-                .map(|tls| tls.certificate.clone()),
-            configuration.tls.map(|tls| tls.private_key),
-        ),
-    };
-    if mode.is_none() && !any_access_override {
-        return match existing_token {
-            Some(token_file) => Ok(AccessConfiguration::Token(TokenAccessConfiguration {
-                token_file,
-                public_origin: existing_origin.expect("token mode has a public origin"),
-                tls: match (existing_certificate, existing_key) {
-                    (Some(certificate), Some(private_key)) => Some(TlsFiles {
+        "token" => {
+            if trusted_proxy_ips.is_some() {
+                return Err("token access does not accept GLIM_TRUSTED_PROXY_IPS".to_owned());
+            }
+            let existing = match current {
+                AccessConfiguration::Token(configuration) => Some(configuration),
+                _ => None,
+            };
+            let token_file = environment_path("GLIM_TOKEN_FILE", token_file)?
+                .or_else(|| existing.as_ref().map(|value| value.token_file.clone()))
+                .ok_or_else(|| {
+                    "token access requires GLIM_TOKEN_FILE or access.token_file".to_owned()
+                })?;
+            require_absolute_path("access.token_file", &token_file)?;
+            let public_origin = environment_string("GLIM_PUBLIC_ORIGIN", public_origin)?
+                .or_else(|| existing.as_ref().map(|value| value.public_origin.clone()))
+                .ok_or_else(|| {
+                    "token access requires GLIM_PUBLIC_ORIGIN or access.public_origin".to_owned()
+                })?;
+            validate_public_origin(&public_origin)?;
+            let certificate =
+                environment_path("GLIM_TLS_CERTIFICATE", tls_certificate)?.or_else(|| {
+                    existing
+                        .as_ref()?
+                        .tls
+                        .as_ref()
+                        .map(|tls| tls.certificate.clone())
+                });
+            let private_key =
+                environment_path("GLIM_TLS_PRIVATE_KEY", tls_private_key)?.or_else(|| {
+                    existing
+                        .as_ref()?
+                        .tls
+                        .as_ref()
+                        .map(|tls| tls.private_key.clone())
+                });
+            let tls = match (certificate, private_key) {
+                (None, None) => None,
+                (Some(certificate), Some(private_key)) => {
+                    require_absolute_path("access.tls_certificate", &certificate)?;
+                    require_absolute_path("access.tls_private_key", &private_key)?;
+                    Some(TlsFiles {
                         certificate,
                         private_key,
-                    }),
-                    _ => None,
-                },
-            })),
-            None => Ok(AccessConfiguration::Local),
-        };
-    }
-    if mode.is_none() && existing_token.is_none() {
-        return Err("token and TLS overrides require GLIM_ACCESS_MODE=token".to_owned());
-    }
-    let token_file = environment_path("GLIM_TOKEN_FILE", token_file)?
-        .or(existing_token)
-        .ok_or_else(|| "token access requires GLIM_TOKEN_FILE or access.token_file".to_owned())?;
-    require_absolute_path("access.token_file", &token_file)?;
-    let public_origin = environment_string("GLIM_PUBLIC_ORIGIN", public_origin)?
-        .or(existing_origin)
-        .ok_or_else(|| {
-            "token access requires GLIM_PUBLIC_ORIGIN or access.public_origin".to_owned()
-        })?;
-    validate_public_origin(&public_origin)?;
-    let certificate =
-        environment_path("GLIM_TLS_CERTIFICATE", tls_certificate)?.or(existing_certificate);
-    let private_key = environment_path("GLIM_TLS_PRIVATE_KEY", tls_private_key)?.or(existing_key);
-    let tls = match (certificate, private_key) {
-        (None, None) => None,
-        (Some(certificate), Some(private_key)) => {
-            require_absolute_path("access.tls_certificate", &certificate)?;
-            require_absolute_path("access.tls_private_key", &private_key)?;
-            Some(TlsFiles {
-                certificate,
-                private_key,
-            })
+                    })
+                }
+                _ => return Err("token access requires both TLS path overrides".to_owned()),
+            };
+            Ok(AccessConfiguration::Token(TokenAccessConfiguration {
+                token_file,
+                public_origin,
+                tls,
+            }))
         }
-        _ => return Err("token access requires both TLS path overrides".to_owned()),
-    };
-    Ok(AccessConfiguration::Token(TokenAccessConfiguration {
-        token_file,
-        public_origin,
-        tls,
-    }))
+        "trusted_proxy" => {
+            if token_file.is_some() || tls_certificate.is_some() || tls_private_key.is_some() {
+                return Err("trusted-proxy access does not accept token or TLS settings".to_owned());
+            }
+            let existing = match current {
+                AccessConfiguration::TrustedProxy(configuration) => Some(configuration),
+                _ => None,
+            };
+            let trusted_proxy_ips = match environment_string(
+                "GLIM_TRUSTED_PROXY_IPS",
+                trusted_proxy_ips,
+            )? {
+                Some(value) => parse_trusted_proxy_ips(value.split(',').map(str::trim))?,
+                None => existing
+                    .as_ref()
+                    .map(|value| value.trusted_proxy_ips.clone())
+                    .ok_or_else(|| {
+                        "trusted-proxy access requires GLIM_TRUSTED_PROXY_IPS or access.trusted_proxy_ips"
+                            .to_owned()
+                    })?,
+            };
+            let public_origin = environment_string("GLIM_PUBLIC_ORIGIN", public_origin)?
+                .or_else(|| existing.as_ref().map(|value| value.public_origin.clone()))
+                .ok_or_else(|| {
+                    "trusted-proxy access requires GLIM_PUBLIC_ORIGIN or access.public_origin"
+                        .to_owned()
+                })?;
+            validate_public_origin(&public_origin)?;
+            Ok(AccessConfiguration::TrustedProxy(
+                TrustedProxyAccessConfiguration {
+                    trusted_proxy_ips,
+                    public_origin,
+                },
+            ))
+        }
+        _ => unreachable!("access mode was validated"),
+    }
 }
 
 fn environment_string(name: &str, value: Option<&OsStr>) -> Result<Option<String>, String> {
@@ -344,6 +421,24 @@ fn environment_string(name: &str, value: Option<&OsStr>) -> Result<Option<String
                 .ok_or_else(|| format!("{name} must be nonblank UTF-8"))
         })
         .transpose()
+}
+
+fn parse_trusted_proxy_ips<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<HashSet<IpAddr>, String> {
+    let mut parsed = HashSet::new();
+    for value in values {
+        if value.is_empty() {
+            return Err("trusted proxy IPs must not contain blank entries".to_owned());
+        }
+        parsed.insert(value.parse::<IpAddr>().map_err(|_| {
+            "trusted proxy IPs must be exact numeric IPv4 or IPv6 addresses".to_owned()
+        })?);
+    }
+    if parsed.is_empty() {
+        return Err("trusted proxy access requires at least one proxy IP".to_owned());
+    }
+    Ok(parsed)
 }
 
 fn environment_path(name: &str, value: Option<&OsStr>) -> Result<Option<PathBuf>, String> {
@@ -362,16 +457,16 @@ fn environment_path(name: &str, value: Option<&OsStr>) -> Result<Option<PathBuf>
 fn validate_public_origin(value: &str) -> Result<(), String> {
     let origin = value
         .parse::<axum::http::Uri>()
-        .map_err(|_| "token public_origin must be an HTTP or HTTPS origin".to_owned())?;
+        .map_err(|_| "public_origin must be an HTTP or HTTPS origin".to_owned())?;
     let scheme = origin.scheme_str().unwrap_or_default();
     let authority = origin
         .authority()
-        .ok_or_else(|| "token public_origin must include an authority".to_owned())?;
+        .ok_or_else(|| "public_origin must include an authority".to_owned())?;
     if !matches!(scheme, "http" | "https")
         || authority.as_str().contains('@')
         || value != format!("{scheme}://{authority}")
     {
-        return Err("token public_origin must contain only an HTTP or HTTPS origin".to_owned());
+        return Err("public_origin must contain only an HTTP or HTTPS origin".to_owned());
     }
     Ok(())
 }
@@ -480,7 +575,7 @@ fn read_access_token(file: fs::File) -> Result<AccessToken, String> {
 
 pub fn resolve_client_access_token() -> Result<Option<AccessToken>, String> {
     match resolve_daemon_configuration()?.access {
-        AccessConfiguration::Local => Ok(None),
+        AccessConfiguration::Local | AccessConfiguration::TrustedProxy(_) => Ok(None),
         AccessConfiguration::Token(configuration) => {
             load_access_token(&configuration.token_file).map(Some)
         }
@@ -507,6 +602,7 @@ pub fn resolve_daemon_configuration() -> Result<DaemonConfiguration, String> {
         std::env::var_os("GLIM_PUBLIC_ORIGIN").as_deref(),
         std::env::var_os("GLIM_TLS_CERTIFICATE").as_deref(),
         std::env::var_os("GLIM_TLS_PRIVATE_KEY").as_deref(),
+        std::env::var_os("GLIM_TRUSTED_PROXY_IPS").as_deref(),
     )?;
     validate_access_bind(&configuration.bind, &configuration.access)?;
     Ok(configuration)
@@ -858,6 +954,119 @@ mod tests {
     }
 
     #[test]
+    fn trusted_proxy_configuration_requires_exact_ips_and_https_for_non_loopback() {
+        let configured = resolve_daemon_configuration_values(
+            Some(br#"{"schema_version":1,"bind":"0.0.0.0:3030","access":{"mode":"trusted_proxy","trusted_proxy_ips":["127.0.0.1","::1"],"public_origin":"https://glim.example"}}"#),
+            None,
+            None,
+            Some(OsStr::new("/xdg-data")),
+            Some(OsStr::new("/home/test")),
+        )
+        .unwrap();
+        assert_eq!(
+            configured.access,
+            AccessConfiguration::TrustedProxy(TrustedProxyAccessConfiguration {
+                trusted_proxy_ips: ["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()]
+                    .into_iter()
+                    .collect(),
+                public_origin: "https://glim.example".into(),
+            })
+        );
+
+        for file in [
+            br#"{"schema_version":1,"access":{"mode":"trusted_proxy","trusted_proxy_ips":[],"public_origin":"http://127.0.0.1:3030"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"trusted_proxy","trusted_proxy_ips":["proxy.example"],"public_origin":"http://127.0.0.1:3030"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"trusted_proxy","trusted_proxy_ips":["127.0.0.0/8"],"public_origin":"http://127.0.0.1:3030"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"trusted_proxy","trusted_proxy_ips":["127.0.0.1"]}}"#.as_slice(),
+            br#"{"schema_version":1,"bind":"0.0.0.0:3030","access":{"mode":"trusted_proxy","trusted_proxy_ips":["127.0.0.1"],"public_origin":"http://glim.example:3030"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"trusted_proxy","trusted_proxy_ips":["127.0.0.1"],"public_origin":"http://127.0.0.1:3030","token_file":"/token"}}"#.as_slice(),
+        ] {
+            assert!(resolve_daemon_configuration_values(
+                Some(file),
+                None,
+                None,
+                Some(OsStr::new("/xdg-data")),
+                Some(OsStr::new("/home/test")),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_environment_overrides_file_and_rejects_unrelated_settings() {
+        let current = resolve_daemon_configuration_values(
+            Some(br#"{"schema_version":1,"access":{"mode":"trusted_proxy","trusted_proxy_ips":["127.0.0.2"],"public_origin":"http://127.0.0.1:3030"}}"#),
+            None,
+            None,
+            Some(OsStr::new("/xdg-data")),
+            Some(OsStr::new("/home/test")),
+        )
+        .unwrap()
+        .access;
+        let access = apply_access_environment_values(
+            current,
+            Some(OsStr::new("trusted_proxy")),
+            None,
+            Some(OsStr::new("https://glim.example")),
+            None,
+            None,
+            Some(OsStr::new("127.0.0.1, ::1")),
+        )
+        .unwrap();
+        assert!(matches!(
+            access,
+            AccessConfiguration::TrustedProxy(TrustedProxyAccessConfiguration { ref trusted_proxy_ips, ref public_origin })
+                if trusted_proxy_ips.len() == 2 && public_origin == "https://glim.example"
+        ));
+
+        for (mode, token, certificate, proxies) in [
+            (
+                Some(OsStr::new("trusted_proxy")),
+                Some(OsStr::new("/token")),
+                None,
+                Some(OsStr::new("127.0.0.1")),
+            ),
+            (
+                Some(OsStr::new("trusted_proxy")),
+                None,
+                Some(OsStr::new("/cert")),
+                Some(OsStr::new("127.0.0.1")),
+            ),
+            (
+                Some(OsStr::new("token")),
+                None,
+                None,
+                Some(OsStr::new("127.0.0.1")),
+            ),
+            (
+                Some(OsStr::new("trusted_proxy")),
+                None,
+                None,
+                Some(OsStr::new("")),
+            ),
+            (
+                Some(OsStr::new("trusted_proxy")),
+                None,
+                None,
+                Some(OsStr::new("127.0.0.1,localhost")),
+            ),
+        ] {
+            assert!(
+                apply_access_environment_values(
+                    AccessConfiguration::Local,
+                    mode,
+                    token,
+                    Some(OsStr::new("https://glim.example")),
+                    certificate,
+                    None,
+                    proxies,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn token_environment_overrides_file_access_before_bind_validation() {
         let access = apply_access_environment_values(
             AccessConfiguration::Local,
@@ -866,6 +1075,7 @@ mod tests {
             Some(OsStr::new("https://glim.example:3443")),
             Some(OsStr::new("/environment/cert.pem")),
             Some(OsStr::new("/environment/key.pem")),
+            None,
         )
         .unwrap();
         assert!(matches!(access, AccessConfiguration::Token(_)));
@@ -904,6 +1114,7 @@ mod tests {
                     origin,
                     certificate,
                     key,
+                    None,
                 )
                 .is_err()
             );
