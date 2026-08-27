@@ -1,6 +1,7 @@
 pub mod api;
 pub mod cli;
 pub mod daemon;
+pub mod service;
 pub mod storage;
 
 pub const API_V1_ROUTES: &[(&str, &str)] = &[

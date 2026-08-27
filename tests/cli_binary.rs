@@ -657,7 +657,7 @@ async fn created_response_requires_safe_matching_ids_and_complete_structure() {
     for (name, response) in cases {
         let app = axum::Router::new().route(
             "/api/v1/posts",
-            axum::routing::post(move || {
+            axum::routing::post(move |_body: axum::body::Bytes| {
                 let response = response.clone();
                 async move { (axum::http::StatusCode::CREATED, axum::Json(response)) }
             }),

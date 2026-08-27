@@ -418,7 +418,7 @@ pub struct CliError {
 }
 
 impl CliError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -426,7 +426,7 @@ impl CliError {
         }
     }
 
-    fn with_details(mut self, details: Value) -> Self {
+    pub(crate) fn with_details(mut self, details: Value) -> Self {
         if let Value::Object(details) = details {
             self.details = details;
         }
@@ -544,6 +544,7 @@ pub async fn run_command(arguments: Vec<String>) -> Result<Value, CliError> {
         .ok_or_else(|| CliError::new("usage_error", "missing command"))?;
     match command {
         "publish" => publish_command(&arguments[1..]).await,
+        "service" => crate::service::run(&arguments[1..]).map(success),
         "status" => {
             no_args(&arguments[1..])?;
             request_json("GET", "/api/v1/health").await

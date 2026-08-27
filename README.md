@@ -2,7 +2,7 @@
 
 Glimse is a local service for visual output produced by terminal-based AI agents. The daemon listens on loopback and persists immutable publications under a per-user store root. The structured CLI publishes local files, reads daemon state, closes sessions, and returns machine-readable JSON.
 
-The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The daemon configuration schema is [`docs/config-v1.schema.json`](docs/config-v1.schema.json). The browser feed receives live updates. Service management remains pending.
+The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The daemon configuration schema is [`docs/config-v1.schema.json`](docs/config-v1.schema.json). The browser feed receives live updates. Linux users can manage the daemon through a systemd user service.
 
 The agreed product design is recorded in [`docs/product-design.md`](docs/product-design.md). The dependency-ordered build plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
@@ -132,6 +132,18 @@ glim show POST_ID
 glim open PUBLIC_ID
 glim close PUBLIC_ID
 ```
+
+On Linux, Glimse can install and operate a systemd user service. The unit is written to `$XDG_CONFIG_HOME/systemd/user/glim.service` when `XDG_CONFIG_HOME` is an absolute path. Otherwise Glimse uses `$HOME/.config/systemd/user/glim.service`. A functioning systemd user manager is required.
+
+```bash
+glim service install    # write the managed unit and enable it; do not start it
+glim service start
+glim service status
+glim service stop
+glim service uninstall  # stop, disable, and remove the unit; do not purge data
+```
+
+The generated unit runs the exact `glim` executable used for installation with the `daemon` argument. Spaces and systemd specifiers are handled safely; installation fails closed if the executable path contains quoting or control characters that systemd cannot represent. Installation is repeatable, but it refuses to replace an existing `glim.service` that Glimse does not manage. Uninstall removes only the managed unit. Configuration files, access tokens, TLS material, store contents, and session data remain in place.
 
 Markdown image references and HTML resource attributes collect local allowlisted files beneath the entry document directory. Linked CSS is tokenized recursively to collect `@import` and `url()` dependencies with bounded depth and reference counts. Collection ignores remote, fragment, data, and blob references. Invalid encodings, absolute paths, escaping traversal, unsupported files, special files, and escaping symlinks reject publication before any HTTP request.
 

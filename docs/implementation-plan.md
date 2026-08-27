@@ -183,13 +183,17 @@ The listener accepts numeric loopback addresses with nonzero ports. Non-loopback
 
 Token mode generates or loads a persistent 256-bit credential from a strict mode-`0600` non-symlink file. Non-loopback token mode requires operator-provided PEM TLS material and an HTTPS public origin whose port matches the listener. The CLI supports HTTPS and sends the configured token as a Bearer credential.
 
-One router-wide middleware protects feed pages, API routes, SSE, range requests, and artifact delivery. The browser exchanges the persistent token for a bounded 12-hour HttpOnly `SameSite=Strict` session. Cookie mutations require the configured exact origin. Logout invalidates server state and expires the cookie. HTML iframes receive renewable five-minute capabilities scoped to one post and file support subtree, preserving unique-origin sandboxing without exposing the session cookie. Service commands, status expansion, and structured logs remain in later Phase 4 slices.
+One router-wide middleware protects feed pages, API routes, SSE, range requests, and artifact delivery. The browser exchanges the persistent token for a bounded 12-hour HttpOnly `SameSite=Strict` session. Cookie mutations require the configured exact origin. Logout invalidates server state and expires the cookie. HTML iframes receive renewable five-minute capabilities scoped to one post and file support subtree, preserving unique-origin sandboxing without exposing the session cookie. Expanded daemon status and structured logs remain in later Phase 4 slices.
 
 ### Trusted-proxy access slice completed
 
 Trusted-proxy mode accepts a nonempty allowlist of exact numeric proxy IP addresses and a canonical public origin. Router middleware authorizes the immediate TCP peer supplied by the listener and ignores all forwarded identity, host, and scheme headers. Health remains public; every other route requires an allowlisted peer. Untrusted API responses use a stable sanitized error, pages fail without a login redirect, and token session endpoints are unavailable. Browser-originated mutations require the exact configured origin, while headerless non-browser API clients rely on peer authorization.
 
 Configuration files and environment overrides preserve environment-over-file precedence and reject token or daemon-TLS settings in trusted-proxy mode. Non-loopback listeners require an HTTPS public origin but serve plaintext to the proxy. Real-socket tests cover ordinary API access, SSE, range delivery, and untrusted-peer denial. Specific reverse-proxy products and Tailscale Serve configurations remain operator-managed boundaries rather than tested Glimse integrations.
+
+### Linux systemd user-service slice completed
+
+The structured CLI now installs, starts, stops, inspects, and uninstalls a marked `glim.service` user unit. Installation writes the exact current executable and `daemon` argument atomically, reloads the user manager, and enables without starting. Lifecycle operations refuse unmarked units. Status uses bounded machine-readable `systemctl show` output and treats absent or inactive services as successful states. Uninstall stops and disables the service but preserves configuration, credentials, TLS files, stores, and sessions. Process execution has fixed time and output limits with stable sanitized errors.
 
 ### Scope
 
@@ -199,7 +203,7 @@ Configuration files and environment overrides preserve environment-over-file pre
 - Implement trusted-proxy mode with explicit allowed proxy settings.
 - Protect HTML pages, SSE, API routes, media, and downloads consistently.
 - Add CSRF and origin protections appropriate to cookie or bearer-token handling.
-- Implement `service install`, `start`, `stop`, `status`, and `uninstall` for a systemd user unit.
+- [Completed] Implement `service install`, `start`, `stop`, `status`, and `uninstall` for a systemd user unit.
 - Add daemon health, version, store-size, active-session, and cleanup status commands.
 - Add structured logs with bounded verbosity and no artifact content or tokens.
 
