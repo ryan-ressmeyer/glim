@@ -289,7 +289,9 @@ The adversarial and performance slice adds fixed-seed bounded properties for sup
 
 An opt-in Linux acceptance harness streams a configurable 64 MiB file into an isolated daemon, builds a 151-post feed, verifies 100-post pagination, measures `/proc` resident-memory high-water growth, purges the session, and removes every process and temporary path on failure. Its 48 MiB default growth ceiling is below the file size, while the separate absolute ceiling is 384 MiB. Configuration tests enforce coherent defaults without coupling operator overrides. Criterion targets measure 1 MiB hashing and staging, four concurrent publication streams, 100-post feed reads, 20-post cleanup, and a 64 KiB media range. Timed benchmarks remain opt-in.
 
-Broader crash validation beyond the existing transaction, publication-journal, and blob-rename cases, clean-machine release acceptance, renderer-wide browser security coverage, and live model-driven Pi validation remain pending.
+The clean-environment and live-model acceptance slice installs the current checkout into a temporary Cargo root, checks the release archive layout and checksum procedure locally, and runs an ephemeral token-mode daemon. Live Pi calls passed with `openai-codex/gpt-5.6-sol` in JSON and resumed RPC modes and with `openrouter/anthropic/claude-haiku-4.5` in print and resumed RPC modes. The model calls used only the native `glim_publish` tool. Headless Chromium authenticated through the login form and materialized Markdown, SVG/image, text, JSON, CSV, safe HTML, PDF, audio, and video without runtime exceptions. The same run verified live revision order, persisted-state reconstruction, distinct Pi-session identity, command-driven closure, zero active sessions, and zero retained or queued blob bytes.
+
+Broader crash validation beyond the existing transaction, publication-journal, and blob-rename cases remains pending. A real release tag and downloaded artifact and a real user-service install also remain untested because this acceptance does not create releases or alter user service state.
 
 ### Scope
 
@@ -301,11 +303,11 @@ Broader crash validation beyond the existing transaction, publication-journal, a
 - [Completed] Produce Linux release binaries and checksums in CI.
 - [Completed] Support `cargo install` for developer installation.
 - [Completed] Document upgrades, database migrations, backup expectations, and complete removal.
-- Run live model-driven native Pi publication against a configured daemon across supported Pi modes and models.
+- [Completed for the checked matrix] Run live model-driven native Pi publication against a configured daemon across Pi JSON, RPC, and print modes with the two recorded models.
 
 ### Release criteria
 
-- A clean machine can install a release binary, install the user service, publish through CLI and pi, inspect remotely, close the session, and confirm complete purge.
+- A clean machine can install a release binary, install the user service, publish through CLI and pi, inspect remotely, close the session, and confirm complete purge. Temporary source installation, local archive/checksum handling, Pi publication, browser inspection, closure, and purge are checked; a downloaded release binary and real user-service install remain pending.
 - Supported upgrade paths preserve active sessions or fail before migration without corrupting them.
 - Security tests cover every content renderer and authenticated route.
 - Release artifacts are reproducible enough to trace each binary to a tagged commit and published checksum.

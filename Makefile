@@ -1,4 +1,4 @@
-.PHONY: benchmark-compile benchmark-smoke build check check-frontend check-rust chromium-security-check frontend-build generic-skill-check hardening-harness-check pi-package-install pi-package-typecheck pi-package-test pi-package-check property-check release-contract-check resource-acceptance resource-acceptance-check rust-checks
+.PHONY: benchmark-compile benchmark-smoke build check check-frontend check-rust chromium-security-check frontend-build generic-skill-check hardening-harness-check pi-package-install pi-package-typecheck pi-package-test pi-package-check property-check release-acceptance release-acceptance-check release-contract-check resource-acceptance resource-acceptance-check rust-checks
 
 build: frontend-build
 	cargo build --locked
@@ -43,6 +43,12 @@ generic-skill-check:
 release-contract-check:
 	node tests/release-contract.mjs
 
+release-acceptance-check:
+	node --test tests/release-acceptance-contract.mjs
+
+release-acceptance: release-acceptance-check
+	node tests/release-acceptance.mjs
+
 pi-package-install:
 	npm ci
 
@@ -56,4 +62,4 @@ pi-package-check: pi-package-typecheck pi-package-test
 	npm run check:package
 	npm run test:pi-load
 
-check: check-frontend generic-skill-check pi-package-check release-contract-check chromium-security-check benchmark-compile resource-acceptance-check rust-checks
+check: check-frontend generic-skill-check pi-package-check release-contract-check release-acceptance-check chromium-security-check benchmark-compile resource-acceptance-check rust-checks
