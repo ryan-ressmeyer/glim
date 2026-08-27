@@ -37,6 +37,7 @@ fn run_glim(
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .env_remove("GLIM_MAX_UPLOAD_BYTES")
         .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
+        .env_remove("GLIM_LOG_LEVEL")
         .env("GLIM_DAEMON_URL", daemon_url)
         .stdin(Stdio::piped());
     if let Some(browser) = browser {
@@ -85,6 +86,7 @@ async fn start_daemon_process(store_root: &std::path::Path) -> DaemonProcess {
     let child = Command::new(env!("CARGO_BIN_EXE_glim"))
         .arg("daemon")
         .env_remove("GLIM_CONFIG")
+        .env_remove("GLIM_LOG_LEVEL")
         .env("XDG_CONFIG_HOME", store_root)
         .env("GLIM_STORE_ROOT", store_root)
         .env("GLIM_BIND", "127.0.0.1:3030")
@@ -945,6 +947,7 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .env_remove("GLIM_MAX_UPLOAD_BYTES")
         .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
+        .env_remove("GLIM_LOG_LEVEL")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -991,6 +994,7 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .env_remove("GLIM_MAX_UPLOAD_BYTES")
         .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
+        .env_remove("GLIM_LOG_LEVEL")
         .env("GLIM_DAEMON_URL", "http://127.0.0.1:3030")
         .output()
         .unwrap();

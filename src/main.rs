@@ -1,5 +1,8 @@
 use std::process::ExitCode;
 
+use glim::logging::{LogLevel, daemon};
+use serde_json::json;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
@@ -16,10 +19,38 @@ async fn main() -> ExitCode {
             });
             return ExitCode::FAILURE;
         }
+        let level = match LogLevel::parse(std::env::var_os("GLIM_LOG_LEVEL").as_deref()) {
+            Ok(level) => level,
+            Err(_) => {
+                glim::logging::initialize_daemon(LogLevel::Info);
+                daemon(
+                    LogLevel::Error,
+                    "daemon_error",
+                    &[
+                        ("stage", json!("logging")),
+                        ("category", json!("invalid_log_level")),
+                        (
+                            "message",
+                            json!("GLIM_LOG_LEVEL must be error, warn, or info"),
+                        ),
+                    ],
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        glim::logging::initialize_daemon(level);
         return match run_daemon().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("glim: {error}");
+                daemon(
+                    LogLevel::Error,
+                    "daemon_error",
+                    &[
+                        ("stage", json!(error.stage)),
+                        ("category", json!(error.category)),
+                        ("message", json!(error.message)),
+                    ],
+                );
                 ExitCode::FAILURE
             }
         };
@@ -47,8 +78,56 @@ fn print_cli_error(error: glim::cli::CliError) {
     );
 }
 
-async fn run_daemon() -> Result<(), String> {
-    let configuration = glim::daemon::resolve_daemon_configuration()?;
+struct DaemonFailure {
+    stage: &'static str,
+    category: &'static str,
+    message: &'static str,
+}
+
+impl DaemonFailure {
+    fn configuration() -> Self {
+        Self {
+            stage: "configuration",
+            category: "invalid_configuration",
+            message: "daemon configuration is invalid",
+        }
+    }
+
+    fn new(stage: &'static str, category: &'static str, message: &'static str) -> Self {
+        Self {
+            stage,
+            category,
+            message,
+        }
+    }
+}
+
+async fn run_daemon() -> Result<(), DaemonFailure> {
+    let configuration =
+        glim::daemon::resolve_daemon_configuration().map_err(|_| DaemonFailure::configuration())?;
+    let (access_mode, tls) = match &configuration.access {
+        glim::daemon::AccessConfiguration::Local => ("local", false),
+        glim::daemon::AccessConfiguration::Token(access) => ("token", access.tls.is_some()),
+        glim::daemon::AccessConfiguration::TrustedProxy(_) => ("trusted_proxy", false),
+    };
+    daemon(
+        LogLevel::Info,
+        "daemon_starting",
+        &[
+            ("version", json!(env!("CARGO_PKG_VERSION"))),
+            ("access_mode", json!(access_mode)),
+            ("tls", json!(tls)),
+            ("bind", json!(configuration.bind.to_string())),
+            (
+                "max_upload_bytes",
+                json!(configuration.limits.max_upload_bytes),
+            ),
+            (
+                "max_finalized_blob_bytes",
+                json!(configuration.limits.max_finalized_blob_bytes),
+            ),
+        ],
+    );
     let store_root = configuration.store.clone();
     let limits = configuration.limits;
     match configuration.access {
@@ -56,17 +135,24 @@ async fn run_daemon() -> Result<(), String> {
             let store = prepare_store(store_root, limits)?;
             let listener = tokio::net::TcpListener::bind(configuration.bind)
                 .await
-                .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
+                .map_err(|_| DaemonFailure::new("bind", "bind_failed", "daemon bind failed"))?;
             axum::serve(
                 listener,
                 glim::app_with_store(store)
                     .into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await
-            .map_err(|error| format!("server failed: {error}"))
+            .map_err(|_| DaemonFailure::new("server", "server_failed", "daemon server failed"))
         }
         glim::daemon::AccessConfiguration::Token(access) => {
-            let token = glim::daemon::load_or_create_access_token(&access.token_file)?;
+            let token =
+                glim::daemon::load_or_create_access_token(&access.token_file).map_err(|_| {
+                    DaemonFailure::new(
+                        "access",
+                        "token_material_invalid",
+                        "access token unavailable",
+                    )
+                })?;
             let tls = match access.tls {
                 Some(files) => Some(
                     axum_server::tls_rustls::RustlsConfig::from_pem_file(
@@ -74,7 +160,9 @@ async fn run_daemon() -> Result<(), String> {
                         files.private_key,
                     )
                     .await
-                    .map_err(|error| format!("could not load TLS certificate and key: {error}"))?,
+                    .map_err(|_| {
+                        DaemonFailure::new("tls", "tls_material_invalid", "TLS material is invalid")
+                    })?,
                 ),
                 None => None,
             };
@@ -89,17 +177,17 @@ async fn run_daemon() -> Result<(), String> {
                 axum_server::bind_rustls(configuration.bind, tls)
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await
-                    .map_err(|error| format!("TLS server failed: {error}"))
+                    .map_err(|_| DaemonFailure::new("server", "server_failed", "TLS server failed"))
             } else {
                 let listener = tokio::net::TcpListener::bind(configuration.bind)
                     .await
-                    .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
+                    .map_err(|_| DaemonFailure::new("bind", "bind_failed", "daemon bind failed"))?;
                 axum::serve(
                     listener,
                     app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
                 )
                 .await
-                .map_err(|error| format!("server failed: {error}"))
+                .map_err(|_| DaemonFailure::new("server", "server_failed", "daemon server failed"))
             }
         }
         glim::daemon::AccessConfiguration::TrustedProxy(access) => {
@@ -111,13 +199,13 @@ async fn run_daemon() -> Result<(), String> {
             );
             let listener = tokio::net::TcpListener::bind(configuration.bind)
                 .await
-                .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
+                .map_err(|_| DaemonFailure::new("bind", "bind_failed", "daemon bind failed"))?;
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await
-            .map_err(|error| format!("server failed: {error}"))
+            .map_err(|_| DaemonFailure::new("server", "server_failed", "daemon server failed"))
         }
     }
 }
@@ -125,9 +213,31 @@ async fn run_daemon() -> Result<(), String> {
 fn prepare_store(
     root: glim::daemon::StoreRoot,
     limits: glim::daemon::DaemonLimits,
-) -> Result<glim::storage::Store, String> {
-    let mut store = glim::daemon::open_store(root.clone(), limits)?;
-    glim::daemon::purge_expired_sessions(&mut store, std::time::SystemTime::now())?;
+) -> Result<glim::storage::Store, DaemonFailure> {
+    let mut store = glim::daemon::open_store(root.clone(), limits).map_err(|_| {
+        DaemonFailure::new(
+            "storage",
+            "store_open_failed",
+            "daemon store could not be opened",
+        )
+    })?;
+    let report = glim::daemon::purge_expired_sessions(&mut store, std::time::SystemTime::now())
+        .map_err(|_| {
+            daemon(
+                LogLevel::Error,
+                "cleanup_failed",
+                &[
+                    ("trigger", json!("startup")),
+                    ("category", json!("cleanup_operation_failed")),
+                ],
+            );
+            DaemonFailure::new(
+                "cleanup",
+                "startup_cleanup_failed",
+                "startup cleanup failed",
+            )
+        })?;
+    glim::daemon::log_cleanup_completed("startup", report);
     glim::daemon::spawn_periodic_cleanup(root, limits);
     Ok(store)
 }

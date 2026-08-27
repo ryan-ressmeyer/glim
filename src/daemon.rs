@@ -8,8 +8,12 @@ use std::{
 };
 
 use serde::Deserialize;
+use serde_json::json;
 
-use crate::storage::Store;
+use crate::{
+    logging::{LogLevel, daemon as log_daemon},
+    storage::{LifecycleReport, Store},
+};
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -866,12 +870,45 @@ pub fn open_store(root: StoreRoot, limits: DaemonLimits) -> Result<Store, String
     .map_err(|error| format!("could not open Glim store: {error}"))
 }
 
-pub fn purge_expired_sessions(store: &mut Store, now: std::time::SystemTime) -> Result<(), String> {
+pub fn purge_expired_sessions(
+    store: &mut Store,
+    now: std::time::SystemTime,
+) -> Result<LifecycleReport, String> {
     let cutoff = cleanup_cutoff(now)?;
     store
         .purge_inactive_sessions(cutoff)
-        .map(|_| ())
         .map_err(|error| format!("could not purge inactive sessions: {error}"))
+}
+
+pub fn log_cleanup_completed(trigger: &'static str, report: LifecycleReport) {
+    log_daemon(
+        LogLevel::Info,
+        "cleanup_completed",
+        &lifecycle_fields(trigger, report),
+    );
+}
+
+fn lifecycle_fields(
+    trigger: &'static str,
+    report: LifecycleReport,
+) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("trigger", json!(trigger)),
+        ("sessions_deleted", json!(report.sessions_deleted)),
+        ("projects_deleted", json!(report.projects_deleted)),
+        ("posts_deleted", json!(report.posts_deleted)),
+        ("post_files_deleted", json!(report.post_files_deleted)),
+        (
+            "support_assets_deleted",
+            json!(report.support_assets_deleted),
+        ),
+        (
+            "blob_references_deleted",
+            json!(report.blob_references_deleted),
+        ),
+        ("blobs_queued", json!(report.blobs_queued)),
+        ("blobs_deleted", json!(report.blobs_deleted)),
+    ]
 }
 
 pub fn spawn_periodic_cleanup(root: StoreRoot, limits: DaemonLimits) {
@@ -901,7 +938,25 @@ pub fn spawn_periodic_cleanup_with_interval(
             .await;
             // Cleanup failures are intentionally retried on the next tick. Due-session and
             // queued-deletion counts remain visible through authenticated daemon status.
-            let _ = result;
+            match result {
+                Ok(Ok(report)) => log_cleanup_completed("periodic", report),
+                Ok(Err(_)) => log_daemon(
+                    LogLevel::Error,
+                    "cleanup_failed",
+                    &[
+                        ("trigger", json!("periodic")),
+                        ("category", json!("cleanup_operation_failed")),
+                    ],
+                ),
+                Err(_) => log_daemon(
+                    LogLevel::Error,
+                    "cleanup_failed",
+                    &[
+                        ("trigger", json!("periodic")),
+                        ("category", json!("cleanup_worker_failed")),
+                    ],
+                ),
+            }
         }
     })
 }

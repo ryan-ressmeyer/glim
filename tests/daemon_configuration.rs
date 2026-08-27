@@ -32,6 +32,7 @@ fn command(config_path: &Path) -> Command {
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .env_remove("GLIM_MAX_UPLOAD_BYTES")
         .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
+        .env_remove("GLIM_LOG_LEVEL")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("HOME")
@@ -421,6 +422,25 @@ async fn limit_environment_overrides_are_applied_before_relationship_validation(
     process.wait().unwrap();
 }
 
+fn startup_error(output: &std::process::Output) -> Value {
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    let events = stderr
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    for event in &events {
+        assert_eq!(event["schema_version"], 1);
+        assert!(event["timestamp"].as_u64().is_some());
+        assert!(event["event"].as_str().is_some());
+    }
+    let error = events
+        .into_iter()
+        .find(|event| event["event"] == "daemon_error")
+        .unwrap_or_else(|| panic!("missing daemon_error: {stderr}"));
+    assert_eq!(error["level"], "error");
+    error
+}
+
 #[test]
 fn startup_fails_closed_for_explicit_config_errors_and_non_loopback_overrides() {
     let root = TempDir::new().unwrap();
@@ -442,11 +462,9 @@ fn startup_fails_closed_for_explicit_config_errors_and_non_loopback_overrides() 
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("loopback"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let error = startup_error(&output);
+    assert_eq!(error["stage"], "configuration");
+    assert_eq!(error["category"], "invalid_configuration");
     assert!(
         !store.exists(),
         "unsafe startup opened the configured store"
@@ -478,7 +496,9 @@ fn startup_fails_closed_for_explicit_config_errors_and_non_loopback_overrides() 
     .unwrap();
     let output = command(&config_path).output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("TLS"));
+    let error = startup_error(&output);
+    assert_eq!(error["stage"], "tls");
+    assert_eq!(error["category"], "tls_material_invalid");
     assert!(
         !tls_store.exists(),
         "invalid TLS opened the configured store"
@@ -487,15 +507,15 @@ fn startup_fails_closed_for_explicit_config_errors_and_non_loopback_overrides() 
     fs::write(&config_path, br#"{"schema_version":1,"unknown":true}"#).unwrap();
     let output = command(&config_path).output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("configuration"));
+    assert_eq!(startup_error(&output)["category"], "invalid_configuration");
 
     fs::write(&config_path, vec![b' '; 64 * 1024 + 1]).unwrap();
     let output = command(&config_path).output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("64 KiB"));
+    assert_eq!(startup_error(&output)["category"], "invalid_configuration");
 
     let missing = root.path().join("missing.json");
     let output = command(&missing).output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("explicit configuration"));
+    assert_eq!(startup_error(&output)["category"], "invalid_configuration");
 }

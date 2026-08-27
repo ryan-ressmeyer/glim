@@ -31,10 +31,13 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 
-use crate::storage::{
-    ActivityReport, ArtifactRenderer, GitProvenance, LifecycleReport, PageRequest, PublicationFile,
-    PublicationIdentity, PublicationRequest, PublicationStagingWriter, PublicationSupportAsset,
-    PublishedPublication, Store, StoreError,
+use crate::{
+    logging::{LogLevel, daemon as log_daemon},
+    storage::{
+        ActivityReport, ArtifactRenderer, GitProvenance, LifecycleReport, PageRequest,
+        PublicationFile, PublicationIdentity, PublicationRequest, PublicationStagingWriter,
+        PublicationSupportAsset, PublishedPublication, Store, StoreError,
+    },
 };
 
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
@@ -833,6 +836,28 @@ struct PublicationResponse {
 }
 
 async fn publish_post(
+    state: State<ApiState>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<(StatusCode, Json<PublicationResponse>), ApiError> {
+    let result = publish_post_inner(state, multipart).await;
+    if let Err(error) = &result {
+        log_daemon(
+            if error.status.is_server_error() {
+                LogLevel::Error
+            } else {
+                LogLevel::Warn
+            },
+            "publication_failed",
+            &[
+                ("http_status", json!(error.status.as_u16())),
+                ("api_error_code", json!(error.body.error.code)),
+            ],
+        );
+    }
+    result
+}
+
+async fn publish_post_inner(
     State(state): State<ApiState>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<(StatusCode, Json<PublicationResponse>), ApiError> {
@@ -1019,6 +1044,29 @@ async fn publish_post(
         Ok(publication)
     })
     .await?;
+    let visible_file_count = post.files.len();
+    let support_asset_count = post
+        .files
+        .iter()
+        .map(|file| file.support_assets.len())
+        .sum::<usize>();
+    let staged_bytes = post.files.iter().fold(0_u64, |total, file| {
+        file.support_assets
+            .iter()
+            .fold(total.saturating_add(file.blob.byte_size), |total, asset| {
+                total.saturating_add(asset.blob.byte_size)
+            })
+    });
+    log_daemon(
+        LogLevel::Info,
+        "publication_succeeded",
+        &[
+            ("post_id", json!(post.id)),
+            ("visible_file_count", json!(visible_file_count)),
+            ("support_asset_count", json!(support_asset_count)),
+            ("staged_bytes", json!(staged_bytes)),
+        ],
+    );
     Ok((
         StatusCode::CREATED,
         Json(PublicationResponse { session, post }),
@@ -1571,6 +1619,26 @@ async fn close_session(
         Ok(report)
     })
     .await?;
+    log_daemon(
+        LogLevel::Info,
+        "session_closed",
+        &[
+            ("sessions_deleted", json!(report.sessions_deleted)),
+            ("projects_deleted", json!(report.projects_deleted)),
+            ("posts_deleted", json!(report.posts_deleted)),
+            ("post_files_deleted", json!(report.post_files_deleted)),
+            (
+                "support_assets_deleted",
+                json!(report.support_assets_deleted),
+            ),
+            (
+                "blob_references_deleted",
+                json!(report.blob_references_deleted),
+            ),
+            ("blobs_queued", json!(report.blobs_queued)),
+            ("blobs_deleted", json!(report.blobs_deleted)),
+        ],
+    );
     Ok(Json(report))
 }
 

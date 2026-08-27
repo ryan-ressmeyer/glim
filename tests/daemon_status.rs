@@ -8,9 +8,27 @@ use glim::{
 };
 use http_body_util::BodyExt;
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+#[derive(Clone, Default)]
+struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 fn sqlite_path(root: &TempDir) -> std::path::PathBuf {
     root.path().join("metadata.sqlite3")
@@ -223,6 +241,8 @@ fn cutoff_arithmetic_is_checked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn periodic_cleanup_retries_after_open_failure() {
+    let log = SharedLogWriter::default();
+    glim::logging::initialize_daemon_with_writer(glim::logging::LogLevel::Info, log.clone());
     let parent = TempDir::new().unwrap();
     let root_path = parent.path().join("store");
     std::fs::write(&root_path, b"temporarily not a directory").unwrap();
@@ -258,4 +278,38 @@ async fn periodic_cleanup_retries_after_open_failure() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     worker.abort();
+    let bytes = log.0.lock().unwrap().clone();
+    let events = String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failed = events
+        .iter()
+        .find(|event| event["event"] == "cleanup_failed")
+        .unwrap();
+    assert_eq!(failed["trigger"], "periodic");
+    assert_eq!(failed["category"], "cleanup_operation_failed");
+    assert!(failed.as_object().unwrap().keys().all(|key| {
+        [
+            "schema_version",
+            "timestamp",
+            "level",
+            "event",
+            "trigger",
+            "category",
+        ]
+        .contains(&key.as_str())
+    }));
+    let completed = events
+        .iter()
+        .find(|event| event["event"] == "cleanup_completed")
+        .unwrap();
+    assert_eq!(completed["trigger"], "periodic");
+    assert_eq!(completed["sessions_deleted"], 1);
+    assert!(
+        !String::from_utf8(log.0.lock().unwrap().clone())
+            .unwrap()
+            .contains(root_path.to_str().unwrap())
+    );
 }
