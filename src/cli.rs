@@ -349,6 +349,7 @@ fn normalize_local_reference_from(
                 }
                 segments.push(segment.to_owned());
             }
+            Component::CurDir => {}
             Component::ParentDir if segments.pop().is_some() => {}
             _ => return Err("support path traversal escapes the entry directory".into()),
         }

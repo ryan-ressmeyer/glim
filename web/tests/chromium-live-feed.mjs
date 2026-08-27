@@ -23,7 +23,17 @@ for (const candidate of chromiumCandidates) {
 }
 if (!chromium) throw new Error("Chromium executable not found; set CHROMIUM to run this regression");
 
-const daemonOrigin = "http://127.0.0.1:3030";
+const reservePort = async () => {
+  const probe = net.createServer();
+  await new Promise((resolve, reject) => probe.listen(0, "127.0.0.1", resolve).once("error", reject));
+  const address = probe.address();
+  if (!address || typeof address === "string") throw new Error("could not allocate a daemon port");
+  await new Promise((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+  return address.port;
+};
+
+const daemonPort = await reservePort();
+const daemonOrigin = `http://127.0.0.1:${daemonPort}`;
 const daemonBinary = new URL("../../target/debug/glim", import.meta.url).pathname;
 await access(daemonBinary);
 const storeRoot = await mkdtemp(path.join(os.tmpdir(), "glim-live-store-"));
@@ -36,20 +46,13 @@ await chmod(tokenPath, 0o600);
 await writeFile(configPath, JSON.stringify({
   schema_version: 1,
   store_root: path.join(storeRoot, "store"),
-  bind: "127.0.0.1:3030",
+  bind: `127.0.0.1:${daemonPort}`,
   access: {
     mode: "token",
     token_file: tokenPath,
-    public_origin: "http://127.0.0.1:3030",
+    public_origin: daemonOrigin,
   },
 }));
-
-const portAvailable = await new Promise((resolve) => {
-  const probe = net.createServer();
-  probe.once("error", () => resolve(false));
-  probe.listen(3030, "127.0.0.1", () => probe.close(() => resolve(true)));
-});
-if (!portAvailable) throw new Error("Chromium live-feed regression requires free port 3030");
 
 const daemonEnvironment = { ...process.env, GLIM_CONFIG: configPath };
 for (const name of [
@@ -95,14 +98,14 @@ const publish = async (externalKey, title) => {
   return response.json();
 };
 
-const publishHtml = async (externalKey) => {
-  const boundary = `chromium-html-${Date.now()}`;
+const publishHtml = async (externalKey, title, supportScript) => {
+  const boundary = `chromium-html-${Date.now()}-${Math.random()}`;
   const manifest = JSON.stringify({
     integration_namespace: "chromium",
     external_key: externalKey,
     project_label: "Live project",
     working_directory: "/tmp/glim-live-project",
-    title: "Authenticated HTML",
+    title,
     commentary: "Capability-backed support script",
     files: [{
       part: "entry",
@@ -113,7 +116,7 @@ const publishHtml = async (externalKey) => {
   const body = [
     `--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n${manifest}\r\n`,
     `--${boundary}\r\nContent-Disposition: form-data; name="entry"\r\n\r\n<script src="app.js"></script>\r\n`,
-    `--${boundary}\r\nContent-Disposition: form-data; name="script"\r\n\r\nparent.postMessage('authenticated-support-ran', '*')\r\n`,
+    `--${boundary}\r\nContent-Disposition: form-data; name="script"\r\n\r\n${supportScript}\r\n`,
     `--${boundary}--\r\n`,
   ].join("");
   const response = await fetch(`${daemonOrigin}/api/v1/posts`, {
@@ -121,7 +124,7 @@ const publishHtml = async (externalKey) => {
     headers: authenticatedHeaders(`multipart/form-data; boundary=${boundary}`),
     body,
   });
-  if (response.status !== 201) throw new Error(`HTML publish failed: ${response.status} ${await response.text()}`);
+  if (response.status !== 201) throw new Error(`HTML publish ${title} failed: ${response.status} ${await response.text()}`);
   return response.json();
 };
 
@@ -141,7 +144,20 @@ try {
 
   const firstA = await publish("session-a", "A initial");
   const firstB = await publish("session-b", "B initial");
-  const authenticatedHtml = await publishHtml("session-a");
+  const victimHtml = await publishHtml(
+    "session-b",
+    "Boundary victim",
+    "parent.postMessage('cross-boundary-script-ran', '*')",
+  );
+  const authenticatedHtml = await publishHtml(
+    "session-a",
+    "Authenticated HTML",
+    `parent.postMessage('authenticated-support-ran', '*');
+const target = document.currentScript.src.replace(/\\/posts\\/\\d+\\//, '/posts/${victimHtml.post.id}/');
+parent.postMessage({ tag: 'cross-boundary-attempted', url: target }, '*');
+fetch(target, { credentials: 'omit' }).then((response) => response.text()).then((body) => parent.postMessage({ tag: 'cross-boundary-bytes', body }, '*')).catch(() => {});
+const injected = document.createElement('script'); injected.src = target; document.head.append(injected);`,
+  );
   const sessionA = firstA.session.public_id;
   const sessionB = firstB.session.public_id;
   const projectId = firstA.session.project.id;
@@ -230,7 +246,7 @@ try {
   })()`);
   await waitFor("location.pathname === '/feed'", "browser session login");
   await command("Page.navigate", { url: `${daemonOrigin}/projects/${projectId}` });
-  await waitFor(`${app}?.querySelector('#post-${firstA.post.id}') && ${app}?.querySelector('#post-${firstB.post.id}') && ${app}?.querySelector('#post-${authenticatedHtml.post.id}')`, "initial two-session project feed");
+  await waitFor(`${app}?.querySelector('#post-${firstA.post.id}') && ${app}?.querySelector('#post-${firstB.post.id}') && ${app}?.querySelector('#post-${victimHtml.post.id}') && ${app}?.querySelector('#post-${authenticatedHtml.post.id}')`, "initial two-session project feed");
   await evaluate(`(() => {
     window.__authenticatedMessages = [];
     addEventListener('message', (event) => window.__authenticatedMessages.push(event.data));
@@ -239,9 +255,32 @@ try {
   const authenticatedArtifact = `${app}.querySelector('#post-${authenticatedHtml.post.id} glim-artifact')?.shadowRoot`;
   await waitFor(`${authenticatedArtifact}?.querySelector('[data-enable-scripts]')`, "authenticated HTML artifact");
   const capabilitySource = await evaluate(`${authenticatedArtifact}.querySelector('iframe').srcdoc`);
-  if (!capabilitySource.includes("/cap/")) throw new Error("authenticated HTML did not receive a scoped capability");
+  if (!capabilitySource.includes("/cap/")) throw new Error("authenticated HTML did not receive a scoped capability script URL");
   await evaluate(`${authenticatedArtifact}.querySelector('[data-enable-scripts]').click()`);
   await waitFor("window.__authenticatedMessages.includes('authenticated-support-ran')", "capability-backed support script");
+  await waitFor(`window.__authenticatedMessages.some((value) => value?.tag === 'cross-boundary-attempted' && value.url.includes('/posts/${victimHtml.post.id}/files/0/support/app.js'))`, "browser-derived cross-subtree capability URL");
+  const attemptedUrl = await evaluate("window.__authenticatedMessages.find((value) => value?.tag === 'cross-boundary-attempted').url");
+  const optedInCapabilitySource = await evaluate(`${authenticatedArtifact}.querySelector('iframe').srcdoc`);
+  const currentCapabilityPath = optedInCapabilitySource.match(/src="(\/cap\/[^\"]+\/api\/v1\/posts\/\d+\/files\/0\/support\/app\.js)"/)?.[1];
+  if (!currentCapabilityPath) throw new Error("opted-in HTML did not retain a scoped capability script URL");
+  const currentCapabilityUrl = new URL(currentCapabilityPath, daemonOrigin);
+  const attempted = new URL(attemptedUrl);
+  if (attempted.href === currentCapabilityUrl.href) throw new Error("cross-subtree attempt retained the authorized URL");
+  if (!attempted.pathname.includes(`/posts/${victimHtml.post.id}/files/0/support/app.js`)) throw new Error(`attempt did not target victim subtree: ${attempted.href}`);
+  if (attempted.pathname.match(/^\/cap\/([^/]+)/)?.[1] !== currentCapabilityUrl.pathname.match(/^\/cap\/([^/]+)/)?.[1]) {
+    throw new Error(`cross-subtree attempt did not reuse the current artifact capability: current=${currentCapabilityUrl.href} attempted=${attempted.href}`);
+  }
+  const daemonBoundaryResponse = await fetch(attempted, { credentials: "omit", redirect: "manual" });
+  const daemonBoundaryBody = await daemonBoundaryResponse.text();
+  let daemonBoundaryError;
+  try { daemonBoundaryError = JSON.parse(daemonBoundaryBody); } catch {}
+  if (daemonBoundaryResponse.status !== 404 || daemonBoundaryError?.error?.code !== "artifact_not_found") {
+    throw new Error(`daemon did not reject foreign capability subtree: ${daemonBoundaryResponse.status} ${daemonBoundaryBody}`);
+  }
+  if (daemonBoundaryBody.includes("cross-boundary-script-ran")) throw new Error("daemon returned victim script bytes");
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const boundaryLeak = await evaluate("window.__authenticatedMessages.some((value) => value === 'cross-boundary-script-ran' || value?.tag === 'cross-boundary-bytes')");
+  if (boundaryLeak) throw new Error("foreign capability subtree returned script or bytes to the attacker frame");
 
   const liveA = await publish("session-a", "A live");
   await waitFor(`${app}?.querySelector('#post-${liveA.post.id}')`, "top-of-page live insertion");
@@ -279,7 +318,7 @@ try {
   if (postLogoutStatus !== 401) throw new Error(`logout retained API access: ${postLogoutStatus}`);
 
   if (runtimeExceptions.length > 0) throw new Error(`browser runtime exceptions: ${JSON.stringify(runtimeExceptions)}`);
-  console.log("Chromium live feed: insertion, queueing, closure, heartbeat, and confirmed close passed across two sessions");
+  console.log("Chromium live feed: capability isolation, insertion, queueing, closure, heartbeat, and confirmed close passed across two sessions");
 } catch (error) {
   throw new Error(`${error.message}\nDaemon stderr:\n${daemonErrors}\nChromium stderr:\n${browserErrors}`);
 } finally {

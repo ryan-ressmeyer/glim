@@ -31,7 +31,13 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
+criterion = "0.8.2"
 http-body-util = "0.1"
+proptest = "1.9.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[[bench]]
+name = "hardening"
+harness = false

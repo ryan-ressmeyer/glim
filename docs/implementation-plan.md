@@ -285,15 +285,19 @@ A deterministic repository contract now checks crate installation metadata, rele
 
 The source build always creates the embedded frontend from checked sources and the lockfile in an isolated Cargo output directory. It neither trusts ignored generated bundles nor writes dependencies or assets into the Cargo source tree. This supports `cargo install --path . --locked` without checking generated bundles into Git. The crate explicitly disables crates.io publication. Public operations documentation covers pinned Pi installation, explicit upgrades, current migration failure behavior, stopped-service backup consistency, destructive removal boundaries, and release checksum verification.
 
-Benchmarks, additional fuzz or property coverage, broader crash and memory validation, additional browser security work, clean-machine release acceptance, and live model-driven Pi validation remain pending.
+The adversarial and performance slice adds fixed-seed bounded properties for support-path normalization, artifact classification, byte ranges, public page paths, and versioned configuration and CLI input. Real Chromium now uses a dynamically allocated token-mode daemon to verify that an opted-in unique-origin HTML artifact cannot read or execute a support resource after substituting another post subtree into its current capability URL. A no-cookie request to the exact browser-derived URL reaches the capability route and receives the stable `404 artifact_not_found` response without victim bytes. The ordinary gate compiles Criterion benchmarks and runs the property and Chromium checks.
+
+An opt-in Linux acceptance harness streams a configurable 64 MiB file into an isolated daemon, builds a 151-post feed, verifies 100-post pagination, measures `/proc` resident-memory high-water growth, purges the session, and removes every process and temporary path on failure. Its 48 MiB default growth ceiling is below the file size, while the separate absolute ceiling is 384 MiB. Configuration tests enforce coherent defaults without coupling operator overrides. Criterion targets measure 1 MiB hashing and staging, four concurrent publication streams, 100-post feed reads, 20-post cleanup, and a 64 KiB media range. Timed benchmarks remain opt-in.
+
+Broader crash validation beyond the existing transaction, publication-journal, and blob-rename cases, clean-machine release acceptance, renderer-wide browser security coverage, and live model-driven Pi validation remain pending.
 
 ### Scope
 
-- Add fuzz or property tests for path handling, MIME detection, range parsing, short IDs, and schema decoding.
+- [Completed] Add fuzz or property tests for path handling, MIME detection, range parsing, short IDs, and schema decoding.
 - Exercise crash recovery around SQLite commits and blob renames.
-- Benchmark hashing, concurrent upload, feed queries, garbage collection, and media serving.
-- Verify bounded memory with large allowed files and long feeds.
-- Add browser security tests for sandbox escape and cross-post access.
+- [Completed] Benchmark hashing, concurrent upload, feed queries, garbage collection, and media serving.
+- [Completed] Verify bounded memory with large allowed files and long feeds.
+- [Completed for capability boundaries] Add browser security tests for sandbox escape and cross-post access.
 - [Completed] Produce Linux release binaries and checksums in CI.
 - [Completed] Support `cargo install` for developer installation.
 - [Completed] Document upgrades, database migrations, backup expectations, and complete removal.

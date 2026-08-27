@@ -1,4 +1,4 @@
-.PHONY: build check check-frontend check-rust frontend-build generic-skill-check pi-package-install pi-package-typecheck pi-package-test pi-package-check release-contract-check rust-checks
+.PHONY: benchmark-compile benchmark-smoke build check check-frontend check-rust chromium-security-check frontend-build generic-skill-check hardening-harness-check pi-package-install pi-package-typecheck pi-package-test pi-package-check property-check release-contract-check resource-acceptance resource-acceptance-check rust-checks
 
 build: frontend-build
 	cargo build --locked
@@ -9,10 +9,31 @@ frontend-build:
 check-frontend:
 	cd web && npm run check
 
+property-check:
+	cargo test --locked --test adversarial_properties
+
+chromium-security-check: build
+	cd web && node tests/chromium-html-opt-in.mjs && node tests/chromium-live-feed.mjs
+
+benchmark-compile:
+	cargo bench --locked --bench hardening --no-run
+
+benchmark-smoke:
+	cargo bench --locked --bench hardening -- --sample-size 10 --measurement-time 0.1 --warm-up-time 0.1
+
+hardening-harness-check:
+	node --test tests/hardening-harness-contract.mjs
+	node --check tests/resource-acceptance.mjs
+
+resource-acceptance-check: hardening-harness-check
+
+resource-acceptance: build resource-acceptance-check
+	node tests/resource-acceptance.mjs
+
 rust-checks:
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets --all-features -- -D warnings
-	cargo test --locked --all-targets --all-features
+	cargo test --locked --all-features
 
 check-rust: frontend-build rust-checks
 
@@ -35,4 +56,4 @@ pi-package-check: pi-package-typecheck pi-package-test
 	npm run check:package
 	npm run test:pi-load
 
-check: check-frontend generic-skill-check pi-package-check release-contract-check rust-checks
+check: check-frontend generic-skill-check pi-package-check release-contract-check chromium-security-check benchmark-compile resource-acceptance-check rust-checks

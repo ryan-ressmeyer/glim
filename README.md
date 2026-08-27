@@ -11,6 +11,7 @@ The agreed product design is recorded in [`docs/product-design.md`](docs/product
 - Rust 1.93.1, selected by `rust-toolchain.toml`
 - Node.js 22.12 through 24.x for frontend development; root Pi-package checks require Node.js 22.19 or newer. CI, release builds, and `.nvmrc` pin Node.js 22.22.0.
 - npm with the selected Node.js installation
+- curl for the opt-in streamed resource acceptance
 
 Install the Pi package and frontend dependencies from their separate root lockfiles after cloning.
 
@@ -29,9 +30,14 @@ The Make targets keep local checks aligned with CI.
 make build           # Build the frontend, then the Rust binary
 make check-rust      # Build frontend assets; run rustfmt, Clippy, and Rust tests
 make check-frontend  # Run TypeScript checks, frontend tests, and the production build
-make pi-package-check # Type-check and test the Pi package, including a real isolated Pi load/reload
-make check           # Run every Pi package, frontend, generic-skill, and Rust check
+make pi-package-check       # Type-check and test the Pi package, including a real isolated Pi load/reload
+make property-check         # Run fixed-seed bounded adversarial properties
+make chromium-security-check # Run real Chromium sandbox and capability-boundary regressions
+make benchmark-compile      # Compile the hardening benchmarks without timing them
+make check                  # Run the ordinary static, property, browser, and unit gates
 ```
+
+The timed and resource-heavy checks are opt-in. `make benchmark-smoke` runs Criterion groups for 1 MiB hashing and staging, four concurrent 64 KiB publications, a 100-post feed query, 20-post session cleanup, and a 64 KiB range from a 1 MiB artifact. Use Criterion filters and options after `--` for a narrower or longer run. `make resource-acceptance` starts an isolated token-mode daemon, streams a 64 MiB file, publishes 150 additional posts, verifies 100-post pagination, checks Linux `/proc` resident-memory high-water marks, closes the session, confirms complete data purge, and removes its temporary state. The default growth ceiling is 48 MiB, below the streamed file size, so buffering the complete file fails acceptance. The absolute default ceiling is 384 MiB. The acceptance inputs and thresholds can be changed independently with `GLIM_ACCEPT_FILE_BYTES`, `GLIM_ACCEPT_FEED_POSTS`, `GLIM_ACCEPT_TIMEOUT_MS`, `GLIM_ACCEPT_MAX_HWM_BYTES`, `GLIM_ACCEPT_MAX_HWM_GROWTH_BYTES`, and `GLIM_ACCEPT_MAX_PAGE_BYTES`.
 
 Clippy runs with warnings denied. Cargo commands use `Cargo.lock`, and frontend installation uses `web/package-lock.json`. Run the daemon after building. No arguments and the explicit `daemon` command are equivalent.
 
