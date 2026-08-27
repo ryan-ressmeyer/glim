@@ -12,9 +12,10 @@ The agreed product design is recorded in [`docs/product-design.md`](docs/product
 - Node.js 22.12 through 24.x; CI and `.nvmrc` use Node.js 22
 - npm with the selected Node.js installation
 
-Install the frontend dependencies from the lockfile after cloning.
+Install the Pi package and frontend dependencies from their separate root lockfiles after cloning.
 
 ```bash
+npm ci
 cd web
 npm ci
 cd ..
@@ -28,7 +29,8 @@ The Make targets keep local checks aligned with CI.
 make build           # Build the frontend, then the Rust binary
 make check-rust      # Build frontend assets; run rustfmt, Clippy, and Rust tests
 make check-frontend  # Run TypeScript checks, frontend tests, and the production build
-make check           # Run every frontend and Rust check
+make pi-package-check # Type-check and test the Pi package, including a real isolated Pi load/reload
+make check           # Run every Pi package, frontend, generic-skill, and Rust check
 ```
 
 Clippy runs with warnings denied. Cargo commands use `Cargo.lock`, and frontend installation uses `web/package-lock.json`. Run the daemon after building. No arguments and the explicit `daemon` command are equivalent.
@@ -172,7 +174,35 @@ Load the skill directly in Pi while developing or evaluating it:
 pi --skill integrations/generic-skill/glim
 ```
 
-For normal discovery, copy or symlink `integrations/generic-skill/glim` into an Agent Skills directory such as `~/.agents/skills/glim`, or add its parent directory to the harness's configured skill paths. Claude Code, Codex, Pi, and other shell-capable Agent Skills consumers can use the generic workflow when they expose file and shell operations. Pi's native typed integration remains planned separately; this package uses the structured CLI.
+For normal discovery, copy or symlink `integrations/generic-skill/glim` into an Agent Skills directory such as `~/.agents/skills/glim`, or add its parent directory to the harness's configured skill paths. Claude Code, Codex, Pi, and other shell-capable Agent Skills consumers can use the generic workflow when they expose file and shell operations. The repository also ships a native typed Pi extension in the root Pi package.
+
+## Native Pi package
+
+Install a reviewed release from a pinned tag or commit. No npm publication or release tag is implied by this example.
+
+```bash
+pi install git:github.com/ryan-ressmeyer/glim@<tag-or-commit>
+```
+
+Load the repository directly during development.
+
+```bash
+pi -e .
+```
+
+The package exposes the generic `glim` skill and one LLM-facing tool, `glim_publish`. The tool accepts a nonblank title, nonblank Markdown commentary, 1 to 256 ordered file specifications, an optional predecessor post ID, and an optional browser-open request. It derives the integration namespace, Pi session key, workspace label, working directory, and absolute source paths from Pi's public extension context. It passes one bounded canonical JSON document to `glim publish --json` on standard input. The TypeScript layer does not collect assets, inspect Git, authenticate, call HTTP endpoints, or validate daemon responses beyond the CLI result fields it consumes.
+
+Three commands operate on confirmed state from the current Pi branch.
+
+- `/glim-feed` reports the exact viewer URL and public ID returned by the CLI. `/glim-feed open` passes that returned URL to `glim open`.
+- `/glim-status` reports bounded aggregate health, storage, session, and cleanup fields from `glim status`.
+- `/glim-close` closes only the current confirmed public session and records the closure on the active Pi branch. Closing purges that ephemeral feed and its snapshots.
+
+The extension derives a stable `pi-` external key from `ctx.sessionManager.getSessionId()`. It reconstructs the current public ID from successful `glim_publish` results and close entries on the active branch. A fork or new Pi session has a different Pi session ID and cannot inherit the predecessor's Glimse identity. Reloading, resuming, or quitting does not close a feed automatically. The extension writes no token or state file and never returns credential material.
+
+The `glim` binary and daemon must already be installed and configured. Extensions run with the user's full permissions, and this extension starts only the `glim` executable from `PATH` with fixed argument arrays and bounded input and output. It does not use a shell or retry publication. Ambiguous publication failures remain errors and retain `publication_may_have_succeeded` for inspection before any retry.
+
+Automated tests cover TUI and non-UI command paths. An isolated Pi RPC check verifies package discovery, tool and command registration, generic-skill discovery, and `/reload`. Direct publication through a live model and daemon remains part of Phase 6 release validation.
 
 The package includes schema-valid [publication](integrations/generic-skill/glim/assets/publication.json) and [revision](integrations/generic-skill/glim/assets/revision.json) fixtures, a [CLI contract](integrations/generic-skill/glim/references/cli-contract.md), and [baseline](integrations/generic-skill/glim/evaluations/baseline.md) and [proposed-skill](integrations/generic-skill/glim/evaluations/proposed.md) evaluations. The proposed evaluation covers `openai-codex/gpt-5.6-sol` in Pi only. Cross-model and cross-harness validation remains Phase 6 work.
 

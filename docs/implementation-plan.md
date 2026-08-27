@@ -242,7 +242,7 @@ The structured logging slice completes Phase 4. Configuration, direct token and 
 
 The first Phase 5 slice packages the model-invoked Agent Skills-compatible workflow at `integrations/generic-skill/glim`. Shell-capable Claude Code, Codex, Pi, and compatible agents can discover it through an Agent Skills directory or load it by repository path. The skill uses canonical JSON stdin, stable harness/session identity, returned URLs and public IDs, immutable revisions, explicit browser launch, and confirmed session closure. It excludes routine source and terminal output and never scans directories or retries an ambiguous publication automatically.
 
-Deterministic checks validate frontmatter, links, workflow completion criteria, schema fixtures, safe stdin examples, documented commands and error codes, revision and closure identity, and `make check` integration. Baseline and proposed evaluations are stored under `integrations/generic-skill/glim/evaluations`. The proposed evaluation covers `openai-codex/gpt-5.6-sol` in Pi; cross-model validation remains deferred to Phase 6. The native Pi extension below remains incomplete, so Phase 5 as a whole is not complete.
+Deterministic checks validate frontmatter, links, workflow completion criteria, schema fixtures, safe stdin examples, documented commands and error codes, revision and closure identity, and `make check` integration. Baseline and proposed evaluations are stored under `integrations/generic-skill/glim/evaluations`. The proposed evaluation covers `openai-codex/gpt-5.6-sol` in Pi; cross-model validation remains deferred to Phase 6.
 
 Completed scope:
 
@@ -253,14 +253,15 @@ Completed scope:
 - Explain revisions, session closure, limits, and returned links.
 - Avoid automatic publication of routine source changes or terminal output.
 
-### Native pi extension (pending)
+### Native Pi extension completed
 
-- Package a thin extension from the same repository.
-- Register a typed publication tool with ordered files, captions, commentary, and revision target.
-- Supply pi session and workspace provenance from public extension APIs.
-- Register commands to show the current feed URL, report daemon status, and close the session.
-- Use the daemon API or CLI client library without duplicating storage or rendering logic.
-- Fail clearly when the `glim` daemon or compatible binary is unavailable.
+The root Pi package exposes one typed `glim_publish` tool and the existing generic skill. The tool maps bounded ordered artifact specifications to canonical CLI input, derives workspace and session identity from public Pi APIs, and runs the existing CLI without a shell. The subprocess adapter bounds input, standard output, and standard error; applies a finite ten-minute timeout; supports cancellation; and preserves stable rejection and ambiguity information without retrying.
+
+Successful tool-result details retain the Pi session ID, current Glimse public ID, post ID, exact returned URLs, browser outcome, revision target, and workspace context. Session-start and session-tree handlers reconstruct state only from the active branch. Foreign Pi session IDs are ignored, and explicit close entries suppress earlier publications on that branch. Reload, resume, quit, and shutdown never close a feed automatically.
+
+`/glim-feed`, `/glim-status`, and `/glim-close` use returned identity rather than resolving or constructing sessions. They emit notifications in TUI and RPC modes and append non-triggering custom messages in JSON and print modes. Closing records a branch entry only after a zero-exit `ok: true` response and clears memory only after that confirmation.
+
+Unit tests use injected CLI runners and fake executables. An isolated real Pi RPC test confirms package discovery, the tool, all three commands, the generic skill, and reload without startup warnings. Live model-driven publication against a configured daemon remains Phase 6 release validation.
 
 ### Test-first scenarios
 
@@ -270,11 +271,11 @@ Completed scope:
 - Integration errors do not imply that a post was published when the daemon rejected it.
 - Closing through pi purges the corresponding feed and no other session.
 
-### Exit criteria
+### Phase 5 completed
 
-- Claude Code can publish through the generic skill.
-- pi can publish through its native tool without using a shell command.
-- Both integrations can contribute to separate sessions in one daemon concurrently.
+- Claude Code and other shell-capable agents can publish through the generic skill.
+- Pi exposes a native typed publication tool that starts the `glim` CLI directly without a shell.
+- Pi session identity is stable within one session and isolated across new or forked sessions, allowing integrations to maintain separate daemon sessions concurrently.
 
 ## Phase 6: Hardening and release
 
@@ -288,7 +289,7 @@ Completed scope:
 - Produce Linux release binaries and checksums in CI.
 - Support `cargo install` for developer installation.
 - Document upgrades, database migrations, backup expectations, and complete removal.
-- Run the native pi package through pi's package-loading and reload lifecycle.
+- Run live model-driven native Pi publication against a configured daemon across supported Pi modes and models.
 
 ### Release criteria
 

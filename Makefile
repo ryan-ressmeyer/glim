@@ -1,4 +1,4 @@
-.PHONY: build check check-frontend check-rust frontend-build generic-skill-check rust-checks
+.PHONY: build check check-frontend check-rust frontend-build generic-skill-check pi-package-install pi-package-typecheck pi-package-test pi-package-check rust-checks
 
 build: frontend-build
 	cargo build --locked
@@ -19,4 +19,17 @@ check-rust: frontend-build rust-checks
 generic-skill-check:
 	node tests/generic-skill.mjs
 
-check: check-frontend generic-skill-check rust-checks
+pi-package-install:
+	npm ci
+
+pi-package-typecheck:
+	npm run typecheck
+
+pi-package-test:
+	npm test
+
+pi-package-check: pi-package-typecheck pi-package-test
+	npm run check:package
+	npm run test:pi-load
+
+check: check-frontend generic-skill-check pi-package-check rust-checks

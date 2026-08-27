@@ -1,0 +1,32 @@
+{
+  "name": "glimse-pi-package",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "engines": {
+    "node": ">=22.19 <25"
+  },
+  "pi": {
+    "extensions": ["./integrations/pi/src/index.ts"],
+    "skills": ["./integrations/generic-skill/glim"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p integrations/pi/tsconfig.json",
+    "test": "vitest run integrations/pi/test/client.test.ts integrations/pi/test/extension.test.ts",
+    "test:pi-load": "node integrations/pi/test/real-pi-load.mjs",
+    "check:package": "node --test integrations/pi/test/package.test.mjs",
+    "check:pi": "npm run typecheck && npm test && npm run check:package && npm run test:pi-load"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@types/node": "22.19.19",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}
