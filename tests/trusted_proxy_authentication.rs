@@ -53,6 +53,18 @@ async fn trusted_proxy_uses_only_the_immediate_peer_and_keeps_health_public() {
         StatusCode::OK
     );
     assert_eq!(
+        request(app.clone(), "GET", "/api/v1/status", TRUSTED, &[])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(app.clone(), "GET", "/api/v1/status", UNTRUSTED, &[])
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
         request(app.clone(), "GET", "/api/v1/posts", TRUSTED, &[])
             .await
             .status(),

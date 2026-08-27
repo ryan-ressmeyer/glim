@@ -18,6 +18,27 @@
       "minLength": 1,
       "description": "Numeric IP socket address with a nonzero port. GLIM_BIND takes precedence."
     },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_upload_bytes", "max_finalized_blob_bytes"],
+      "properties": {
+        "max_upload_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615,
+          "default": 536870912,
+          "description": "Maximum decimal bytes in one uploaded file. GLIM_MAX_UPLOAD_BYTES takes precedence."
+        },
+        "max_finalized_blob_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615,
+          "default": 21474836480,
+          "description": "Maximum physical bytes in unique finalized blobs. GLIM_MAX_FINALIZED_BLOB_BYTES takes precedence."
+        }
+      }
+    },
     "access": {
       "oneOf": [
         {

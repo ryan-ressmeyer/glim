@@ -35,6 +35,8 @@ fn run_glim(
         .env_remove("GLIM_TLS_CERTIFICATE")
         .env_remove("GLIM_TLS_PRIVATE_KEY")
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
+        .env_remove("GLIM_MAX_UPLOAD_BYTES")
+        .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
         .env("GLIM_DAEMON_URL", daemon_url)
         .stdin(Stdio::piped());
     if let Some(browser) = browser {
@@ -291,6 +293,7 @@ async fn read_and_lifecycle_commands_use_versioned_urls_and_one_json_result() {
     });
     let url = format!("http://{address}");
     for args in [
+        vec!["health"],
         vec!["status"],
         vec!["list", "--session", &public_id, "--limit", "1"],
         vec!["close", &public_id],
@@ -308,6 +311,26 @@ async fn read_and_lifecycle_commands_use_versioned_urls_and_one_json_result() {
     let error = one_json(&output);
     assert_eq!(error["ok"], false);
     assert_eq!(error["error"]["code"], "post_not_found");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_rejects_a_valid_json_response_with_the_wrong_shape() {
+    let app = axum::Router::new().route(
+        "/api/v1/status",
+        axum::routing::get(|| async {
+            axum::Json(json!({"ok":true,"version":"0.1.0","unknown":true}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let output = run_glim(&["status"], None, &format!("http://{address}"), None);
+    assert!(!output.status.success());
+    assert_eq!(
+        one_json(&output)["error"]["code"],
+        "malformed_daemon_response"
+    );
     server.abort();
 }
 
@@ -920,6 +943,8 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
         .env_remove("GLIM_TLS_CERTIFICATE")
         .env_remove("GLIM_TLS_PRIVATE_KEY")
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
+        .env_remove("GLIM_MAX_UPLOAD_BYTES")
+        .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -942,7 +967,7 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
     }
 
     let authenticated = Command::new(env!("CARGO_BIN_EXE_glim"))
-        .args(["list", "--global"])
+        .args(["status"])
         .env("GLIM_CONFIG", &config_path)
         .env("GLIM_DAEMON_URL", "http://127.0.0.1:3030")
         .output()
@@ -955,7 +980,7 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
 
     let config_home = TempDir::new().unwrap();
     let unauthenticated = Command::new(env!("CARGO_BIN_EXE_glim"))
-        .args(["list", "--global"])
+        .args(["status"])
         .env_remove("GLIM_CONFIG")
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("GLIM_ACCESS_MODE", "local")
@@ -964,6 +989,8 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
         .env_remove("GLIM_TLS_CERTIFICATE")
         .env_remove("GLIM_TLS_PRIVATE_KEY")
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
+        .env_remove("GLIM_MAX_UPLOAD_BYTES")
+        .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
         .env("GLIM_DAEMON_URL", "http://127.0.0.1:3030")
         .output()
         .unwrap();

@@ -49,9 +49,11 @@ fn print_cli_error(error: glim::cli::CliError) {
 
 async fn run_daemon() -> Result<(), String> {
     let configuration = glim::daemon::resolve_daemon_configuration()?;
+    let store_root = configuration.store.clone();
+    let limits = configuration.limits;
     match configuration.access {
         glim::daemon::AccessConfiguration::Local => {
-            let store = glim::daemon::open_store(configuration.store)?;
+            let store = prepare_store(store_root, limits)?;
             let listener = tokio::net::TcpListener::bind(configuration.bind)
                 .await
                 .map_err(|error| format!("could not bind {}: {error}", configuration.bind))?;
@@ -76,7 +78,7 @@ async fn run_daemon() -> Result<(), String> {
                 ),
                 None => None,
             };
-            let store = glim::daemon::open_store(configuration.store)?;
+            let store = prepare_store(store_root, limits)?;
             let app = glim::app_with_store_and_token_auth(
                 store,
                 token,
@@ -101,7 +103,7 @@ async fn run_daemon() -> Result<(), String> {
             }
         }
         glim::daemon::AccessConfiguration::TrustedProxy(access) => {
-            let store = glim::daemon::open_store(configuration.store)?;
+            let store = prepare_store(store_root, limits)?;
             let app = glim::app_with_store_and_trusted_proxy(
                 store,
                 access.trusted_proxy_ips,
@@ -118,4 +120,14 @@ async fn run_daemon() -> Result<(), String> {
             .map_err(|error| format!("server failed: {error}"))
         }
     }
+}
+
+fn prepare_store(
+    root: glim::daemon::StoreRoot,
+    limits: glim::daemon::DaemonLimits,
+) -> Result<glim::storage::Store, String> {
+    let mut store = glim::daemon::open_store(root.clone(), limits)?;
+    glim::daemon::purge_expired_sessions(&mut store, std::time::SystemTime::now())?;
+    glim::daemon::spawn_periodic_cleanup(root, limits);
+    Ok(store)
 }

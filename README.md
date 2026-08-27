@@ -45,11 +45,17 @@ The daemon listens on `127.0.0.1:3030` by default. It reads a bounded, versioned
 {
   "schema_version": 1,
   "store_root": "/home/user/.local/share/glim",
-  "bind": "127.0.0.1:3030"
+  "bind": "127.0.0.1:3030",
+  "limits": {
+    "max_upload_bytes": 536870912,
+    "max_finalized_blob_bytes": 21474836480
+  }
 }
 ```
 
-`GLIM_STORE_ROOT` overrides `store_root`. Without either value, the daemon uses `$XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. `GLIM_BIND` overrides `bind`. Local mode accepts numeric loopback addresses with nonzero ports.
+`GLIM_STORE_ROOT` overrides `store_root`. Without either value, the daemon uses `$XDG_DATA_HOME/glim`, then `$HOME/.local/share/glim`. `GLIM_BIND` overrides `bind`. Local mode accepts numeric loopback addresses with nonzero ports. Limits use decimal bytes: the per-file default is 512 MiB (536,870,912 bytes) and the unique finalized-blob budget is 20 GiB (21,474,836,480 bytes). `GLIM_MAX_UPLOAD_BYTES` and `GLIM_MAX_FINALIZED_BLOB_BYTES` override file values; both must be nonzero decimal integers, and the upload limit cannot exceed the global budget. Existing configuration files without `limits` adopt these defaults.
+
+Sessions inactive for seven days are purged at the inclusive boundary (`last_activity_at <= now - 604800`). Cleanup runs before the listener binds and retries hourly (3,600 seconds) on a separate store connection. Periodic failures do not stop later ticks; the protected status counts expose sessions still due and queued blob deletions, but this slice does not expose a separate last-error field.
 
 ```bash
 GLIM_STORE_ROOT=/tmp/glim-store GLIM_BIND=127.0.0.1:4040 cargo run --locked
@@ -124,7 +130,8 @@ A one-file publication can use flags. `--commentary-file` avoids shell quoting f
 glim publish --file plot.png --integration pi --external-key session-1 \
   --project analysis --working-directory "$PWD" --title "Population response" \
   --commentary-file commentary.md --caption "Mean response"
-glim status
+glim health  # minimal public health probe
+glim status  # authenticated storage and cleanup status
 glim list --session PUBLIC_ID --limit 20
 glim list --project PROJECT_ID
 glim list --global

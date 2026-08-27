@@ -6,6 +6,7 @@ pub mod storage;
 
 pub const API_V1_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/health"),
+    ("GET", "/api/v1/status"),
     ("POST", "/api/v1/auth/session"),
     ("DELETE", "/api/v1/auth/session"),
     ("POST", "/api/v1/sessions"),

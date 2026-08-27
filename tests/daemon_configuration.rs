@@ -30,6 +30,8 @@ fn command(config_path: &Path) -> Command {
         .env_remove("GLIM_TLS_CERTIFICATE")
         .env_remove("GLIM_TLS_PRIVATE_KEY")
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
+        .env_remove("GLIM_MAX_UPLOAD_BYTES")
+        .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("HOME")
@@ -311,6 +313,112 @@ async fn trusted_proxy_real_socket_serves_api_sse_and_ranges_only_for_allowliste
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     let payload: Value = response.json().await.unwrap();
     assert_eq!(payload["error"]["code"], "proxy_authorization_required");
+}
+
+#[tokio::test]
+async fn authenticated_status_reports_finite_limits_after_startup_cleanup() {
+    let root = TempDir::new().unwrap();
+    let store_path = root.path().join("store");
+    let mut store = Store::open(&store_path).unwrap();
+    let stale = store
+        .resolve_session("test", "stale", "Private", "/private/stale")
+        .unwrap();
+    let fresh = store
+        .resolve_session("test", "fresh", "Private", "/private/fresh")
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let connection = rusqlite::Connection::open(store_path.join("metadata.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET last_activity_at=?1 WHERE public_id=?2",
+            rusqlite::params![now - 604_800, &stale.public_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET last_activity_at=?1 WHERE public_id=?2",
+            rusqlite::params![now, &fresh.public_id],
+        )
+        .unwrap();
+    drop(store);
+    let port = free_loopback_port();
+    let config_path = root.path().join("status.json");
+    fs::write(&config_path, serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "store_root": store_path,
+        "bind": format!("127.0.0.1:{port}"),
+        "limits": {"max_upload_bytes": 512, "max_finalized_blob_bytes": 2048},
+        "access": {"mode":"trusted_proxy", "trusted_proxy_ips":["127.0.0.1"], "public_origin":format!("http://127.0.0.1:{port}")}
+    })).unwrap()).unwrap();
+    let mut daemon = Daemon(command(&config_path).spawn().unwrap());
+    let client = reqwest::Client::new();
+    let status_url = format!("http://127.0.0.1:{port}/api/v1/status");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status: Value = loop {
+        if let Ok(response) = client.get(&status_url).send().await
+            && response.status().is_success()
+        {
+            break response.json().await.unwrap();
+        }
+        assert!(Instant::now() < deadline, "daemon did not expose status");
+        assert!(daemon.0.try_wait().unwrap().is_none(), "daemon exited");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(status["max_upload_bytes"], 512);
+    assert_eq!(status["max_finalized_blob_bytes"], 2048);
+    assert_eq!(status["active_sessions"], 1);
+    let store = Store::open(&store_path).unwrap();
+    assert!(store.session(&stale.public_id).is_err());
+    assert!(store.session(&fresh.public_id).is_ok());
+}
+
+#[tokio::test]
+async fn limit_environment_overrides_are_applied_before_relationship_validation() {
+    let root = TempDir::new().unwrap();
+    let port = free_loopback_port();
+    let config_path = root.path().join("limit-precedence.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "store_root": root.path().join("store"),
+            "bind": format!("127.0.0.1:{port}"),
+            "limits": {"max_upload_bytes": 20, "max_finalized_blob_bytes": 10},
+            "access": {"mode":"local"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut process = command(&config_path)
+        .env("GLIM_MAX_FINALIZED_BLOB_BYTES", "30")
+        .spawn()
+        .unwrap();
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/health"))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not apply limit override"
+        );
+        assert!(
+            process.try_wait().unwrap().is_none(),
+            "daemon rejected the valid final limit configuration"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    process.kill().unwrap();
+    process.wait().unwrap();
 }
 
 #[test]

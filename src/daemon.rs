@@ -14,6 +14,25 @@ use crate::storage::Store;
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const DEFAULT_BIND: &str = "127.0.0.1:3030";
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 536_870_912;
+pub const DEFAULT_MAX_FINALIZED_BLOB_BYTES: u64 = 21_474_836_480;
+pub const RETENTION_SECONDS: u64 = 604_800;
+pub const CLEANUP_INTERVAL_SECONDS: u64 = 3_600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonLimits {
+    pub max_upload_bytes: u64,
+    pub max_finalized_blob_bytes: u64,
+}
+
+impl Default for DaemonLimits {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_finalized_blob_bytes: DEFAULT_MAX_FINALIZED_BLOB_BYTES,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreRoot {
@@ -26,6 +45,7 @@ pub struct DaemonConfiguration {
     pub store: StoreRoot,
     pub bind: SocketAddr,
     pub access: AccessConfiguration,
+    pub limits: DaemonLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +109,14 @@ struct FileConfiguration {
     store_root: Option<PathBuf>,
     bind: Option<String>,
     access: Option<FileAccessConfiguration>,
+    limits: Option<FileLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileLimits {
+    max_upload_bytes: u64,
+    max_finalized_blob_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +190,13 @@ fn resolve_daemon_configuration_base_values(
     if bind.port() == 0 {
         return Err("daemon bind port must be greater than zero".to_owned());
     }
+    let limits = file
+        .as_ref()
+        .and_then(|configuration| configuration.limits.as_ref())
+        .map_or_else(DaemonLimits::default, |limits| DaemonLimits {
+            max_upload_bytes: limits.max_upload_bytes,
+            max_finalized_blob_bytes: limits.max_finalized_blob_bytes,
+        });
     let access = match file.and_then(|configuration| configuration.access) {
         None | Some(FileAccessConfiguration::Local) => AccessConfiguration::Local,
         Some(FileAccessConfiguration::Token {
@@ -208,6 +243,7 @@ fn resolve_daemon_configuration_base_values(
         store,
         bind,
         access,
+        limits,
     })
 }
 
@@ -225,6 +261,7 @@ pub fn resolve_daemon_configuration_values(
         xdg_data_home,
         home,
     )?;
+    validate_limits(configuration.limits)?;
     validate_access_bind(&configuration.bind, &configuration.access)?;
     Ok(configuration)
 }
@@ -582,6 +619,86 @@ pub fn resolve_client_access_token() -> Result<Option<AccessToken>, String> {
     }
 }
 
+fn parse_limit_environment(name: &str, value: Option<&OsStr>) -> Result<Option<u64>, String> {
+    value
+        .map(|value| {
+            let value = value
+                .to_str()
+                .ok_or_else(|| format!("{name} must be decimal bytes"))?;
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{name} must be nonzero decimal bytes"));
+            }
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| format!("{name} exceeds the supported byte range"))?;
+            if parsed == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+            Ok(parsed)
+        })
+        .transpose()
+}
+
+fn validate_limits(limits: DaemonLimits) -> Result<(), String> {
+    if limits.max_upload_bytes == 0 || limits.max_finalized_blob_bytes == 0 {
+        return Err("daemon limits must be greater than zero".to_owned());
+    }
+    if limits.max_upload_bytes > limits.max_finalized_blob_bytes {
+        return Err("max_upload_bytes must not exceed max_finalized_blob_bytes".to_owned());
+    }
+    Ok(())
+}
+
+pub fn resolve_daemon_configuration_limit_values(
+    file_bytes: Option<&[u8]>,
+    upload_override: Option<&OsStr>,
+    finalized_override: Option<&OsStr>,
+) -> Result<DaemonLimits, String> {
+    let file = file_bytes
+        .map(|bytes| {
+            serde_json::from_slice::<FileConfiguration>(bytes)
+                .map_err(|error| format!("daemon configuration is malformed: {error}"))
+        })
+        .transpose()?;
+    if file
+        .as_ref()
+        .is_some_and(|value| value.schema_version != CONFIG_SCHEMA_VERSION)
+    {
+        return Err(format!(
+            "daemon configuration schema_version must be {CONFIG_SCHEMA_VERSION}"
+        ));
+    }
+    let from_file = file
+        .and_then(|value| value.limits)
+        .map(|limits| DaemonLimits {
+            max_upload_bytes: limits.max_upload_bytes,
+            max_finalized_blob_bytes: limits.max_finalized_blob_bytes,
+        })
+        .unwrap_or_default();
+    let limits = DaemonLimits {
+        max_upload_bytes: parse_limit_environment("GLIM_MAX_UPLOAD_BYTES", upload_override)?
+            .unwrap_or(from_file.max_upload_bytes),
+        max_finalized_blob_bytes: parse_limit_environment(
+            "GLIM_MAX_FINALIZED_BLOB_BYTES",
+            finalized_override,
+        )?
+        .unwrap_or(from_file.max_finalized_blob_bytes),
+    };
+    validate_limits(limits)?;
+    Ok(limits)
+}
+
+pub fn cleanup_cutoff(now: std::time::SystemTime) -> Result<i64, String> {
+    let seconds = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+        .as_secs();
+    let cutoff = seconds
+        .checked_sub(RETENTION_SECONDS)
+        .ok_or_else(|| "system clock predates the seven-day retention window".to_owned())?;
+    i64::try_from(cutoff).map_err(|_| "system clock exceeds signed Unix seconds".to_owned())
+}
+
 pub fn resolve_daemon_configuration() -> Result<DaemonConfiguration, String> {
     let file_bytes = load_configuration_file(
         std::env::var_os("GLIM_CONFIG").as_deref(),
@@ -595,6 +712,19 @@ pub fn resolve_daemon_configuration() -> Result<DaemonConfiguration, String> {
         std::env::var_os("XDG_DATA_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )?;
+    configuration.limits = DaemonLimits {
+        max_upload_bytes: parse_limit_environment(
+            "GLIM_MAX_UPLOAD_BYTES",
+            std::env::var_os("GLIM_MAX_UPLOAD_BYTES").as_deref(),
+        )?
+        .unwrap_or(configuration.limits.max_upload_bytes),
+        max_finalized_blob_bytes: parse_limit_environment(
+            "GLIM_MAX_FINALIZED_BLOB_BYTES",
+            std::env::var_os("GLIM_MAX_FINALIZED_BLOB_BYTES").as_deref(),
+        )?
+        .unwrap_or(configuration.limits.max_finalized_blob_bytes),
+    };
+    validate_limits(configuration.limits)?;
     configuration.access = apply_access_environment_values(
         configuration.access,
         std::env::var_os("GLIM_ACCESS_MODE").as_deref(),
@@ -714,7 +844,7 @@ pub fn resolve_store_root() -> Result<StoreRoot, String> {
     )
 }
 
-pub fn open_store(root: StoreRoot) -> Result<Store, String> {
+pub fn open_store(root: StoreRoot, limits: DaemonLimits) -> Result<Store, String> {
     let created = create_store_root_if_missing(&root.path)?;
     #[cfg(unix)]
     if created {
@@ -726,7 +856,54 @@ pub fn open_store(root: StoreRoot) -> Result<Store, String> {
             ));
         }
     }
-    Store::open(&root.path).map_err(|error| format!("could not open Glim store: {error}"))
+    Store::open_with_limits(
+        &root.path,
+        crate::storage::StoreLimits {
+            max_upload_bytes: limits.max_upload_bytes,
+            max_finalized_blob_bytes: limits.max_finalized_blob_bytes,
+        },
+    )
+    .map_err(|error| format!("could not open Glim store: {error}"))
+}
+
+pub fn purge_expired_sessions(store: &mut Store, now: std::time::SystemTime) -> Result<(), String> {
+    let cutoff = cleanup_cutoff(now)?;
+    store
+        .purge_inactive_sessions(cutoff)
+        .map(|_| ())
+        .map_err(|error| format!("could not purge inactive sessions: {error}"))
+}
+
+pub fn spawn_periodic_cleanup(root: StoreRoot, limits: DaemonLimits) {
+    drop(spawn_periodic_cleanup_with_interval(
+        root,
+        limits,
+        std::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS),
+    ));
+}
+
+#[doc(hidden)]
+pub fn spawn_periodic_cleanup_with_interval(
+    root: StoreRoot,
+    limits: DaemonLimits,
+    cleanup_interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let root = root.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut store = open_store(root, limits)?;
+                purge_expired_sessions(&mut store, std::time::SystemTime::now())
+            })
+            .await;
+            // Cleanup failures are intentionally retried on the next tick. Due-session and
+            // queued-deletion counts remain visible through authenticated daemon status.
+            let _ = result;
+        }
+    })
 }
 
 fn create_store_root_if_missing(path: &std::path::Path) -> Result<bool, String> {
@@ -1154,10 +1331,13 @@ mod tests {
         const CHILD_ROOT: &str = "GLIM_TEST_EXPLICIT_ROOT";
         if let Some(path) = std::env::var_os(CHILD_ROOT) {
             let path = PathBuf::from(path);
-            super::open_store(StoreRoot {
-                path: path.clone(),
-                explicit_override: true,
-            })
+            super::open_store(
+                StoreRoot {
+                    path: path.clone(),
+                    explicit_override: true,
+                },
+                DaemonLimits::default(),
+            )
             .unwrap();
             assert_eq!(
                 std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -1200,7 +1380,7 @@ mod tests {
             path: parent.path().join("default/glim"),
             explicit_override: false,
         };
-        super::open_store(default.clone()).unwrap();
+        super::open_store(default.clone(), DaemonLimits::default()).unwrap();
         assert_eq!(
             std::fs::metadata(&default.path)
                 .unwrap()
@@ -1213,10 +1393,13 @@ mod tests {
         let explicit_path = parent.path().join("explicit");
         std::fs::create_dir(&explicit_path).unwrap();
         std::fs::set_permissions(&explicit_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        super::open_store(StoreRoot {
-            path: explicit_path.clone(),
-            explicit_override: true,
-        })
+        super::open_store(
+            StoreRoot {
+                path: explicit_path.clone(),
+                explicit_override: true,
+            },
+            DaemonLimits::default(),
+        )
         .unwrap();
         assert_eq!(
             std::fs::metadata(explicit_path)

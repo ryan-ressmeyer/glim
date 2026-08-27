@@ -76,6 +76,8 @@ exit "${FAKE_SYSTEMCTL_EXIT:-0}"
             "GLIM_TLS_CERTIFICATE",
             "GLIM_TLS_PRIVATE_KEY",
             "GLIM_TRUSTED_PROXY_IPS",
+            "GLIM_MAX_UPLOAD_BYTES",
+            "GLIM_MAX_FINALIZED_BLOB_BYTES",
             "GLIM_DAEMON_URL",
             "GLIM_BROWSER_COMMAND",
         ] {

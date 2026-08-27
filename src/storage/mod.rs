@@ -12,6 +12,7 @@ mod classification;
 mod lifecycle;
 mod publication;
 mod read;
+mod status;
 
 pub use blob::{BlobHash, BlobIntegrityError, BlobRecord, InvalidBlobHash};
 pub use classification::ArtifactRenderer;
@@ -26,6 +27,7 @@ pub use read::{
     BlobRead, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageRequest, PostFileRead, PostPage, PostRead,
     ProjectRead, SessionRead, SupportAssetRead,
 };
+pub use status::StoreStatusSnapshot;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
@@ -495,6 +497,10 @@ pub enum StoreError {
         maximum: u32,
     },
     InvalidPageCursor,
+    InvalidStatusValue {
+        field: &'static str,
+        value: i64,
+    },
     UploadLimitExceeded {
         limit: u64,
         attempted: u64,
@@ -555,6 +561,12 @@ impl fmt::Display for StoreError {
                 write!(formatter, "page limit {limit} is outside 1..={maximum}")
             }
             Self::InvalidPageCursor => formatter.write_str("invalid page cursor"),
+            Self::InvalidStatusValue { field, value } => {
+                write!(
+                    formatter,
+                    "invalid signed status value for {field}: {value}"
+                )
+            }
             Self::UploadLimitExceeded { limit, attempted } => write!(
                 formatter,
                 "upload byte limit exceeded: limit {limit}, attempted {attempted}"
@@ -622,6 +634,7 @@ impl Error for StoreError {
             | Self::PostNotFound { .. }
             | Self::InvalidPageLimit { .. }
             | Self::InvalidPageCursor
+            | Self::InvalidStatusValue { .. }
             | Self::UploadLimitExceeded { .. }
             | Self::GlobalBlobBudgetExceeded { .. }
             | Self::BlankPublicationTitle

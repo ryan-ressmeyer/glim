@@ -131,6 +131,39 @@ impl ApiState {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatus {
+    pub ok: bool,
+    pub version: String,
+    pub finalized_unique_blob_bytes: u64,
+    pub max_upload_bytes: u64,
+    pub max_finalized_blob_bytes: u64,
+    pub active_sessions: u64,
+    pub sessions_due_for_purge: u64,
+    pub queued_blob_deletions: u64,
+    pub retention_seconds: u64,
+    pub cleanup_interval_seconds: u64,
+}
+
+async fn status(State(state): State<ApiState>) -> Result<Json<DaemonStatus>, ApiError> {
+    let cutoff =
+        crate::daemon::cleanup_cutoff(SystemTime::now()).map_err(|_| ApiError::internal())?;
+    let snapshot = with_store(state, move |store| store.status_snapshot(cutoff)).await?;
+    Ok(Json(DaemonStatus {
+        ok: true,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        finalized_unique_blob_bytes: snapshot.finalized_unique_blob_bytes,
+        max_upload_bytes: snapshot.limits.max_upload_bytes,
+        max_finalized_blob_bytes: snapshot.limits.max_finalized_blob_bytes,
+        active_sessions: snapshot.active_sessions,
+        sessions_due_for_purge: snapshot.sessions_due_for_purge,
+        queued_blob_deletions: snapshot.queued_blob_deletions,
+        retention_seconds: crate::daemon::RETENTION_SECONDS,
+        cleanup_interval_seconds: crate::daemon::CLEANUP_INTERVAL_SECONDS,
+    }))
+}
+
 #[derive(Clone)]
 enum LiveEvent {
     Post {
@@ -152,6 +185,7 @@ enum FeedScope {
 
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
+        .route("/status", get(status))
         .route(
             "/auth/session",
             post(create_browser_session)
@@ -1691,6 +1725,12 @@ impl From<StoreError> for ApiError {
                 "invalid_page_limit",
                 "Page limit is outside the supported range",
                 json!({"limit": limit, "maximum": maximum}),
+            ),
+            StoreError::InvalidStatusValue { .. } => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_integrity_error",
+                "Stored status metadata is invalid",
+                json!({}),
             ),
             StoreError::InvalidPageCursor => Self::new(
                 StatusCode::BAD_REQUEST,

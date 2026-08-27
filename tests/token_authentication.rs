@@ -55,6 +55,7 @@ async fn token_mode_protects_pages_api_sse_ranges_and_unknown_routes() {
     assert_eq!(page.headers()[header::LOCATION], "/login");
 
     for uri in [
+        "/api/v1/status",
         "/api/v1/posts",
         "/api/v1/posts/events",
         "/api/v1/posts/1/files/0/content",

@@ -547,6 +547,10 @@ pub async fn run_command(arguments: Vec<String>) -> Result<Value, CliError> {
         "service" => crate::service::run(&arguments[1..]).map(success),
         "status" => {
             no_args(&arguments[1..])?;
+            request_status().await
+        }
+        "health" => {
+            no_args(&arguments[1..])?;
             request_json("GET", "/api/v1/health").await
         }
         "show" => {
@@ -1182,7 +1186,24 @@ fn publication_may_have_succeeded(mut error: CliError) -> CliError {
     error
 }
 
+async fn request_status() -> Result<Value, CliError> {
+    let payload = request_json_payload("GET", "/api/v1/status").await?;
+    let status = serde_json::from_value::<crate::api::DaemonStatus>(payload).map_err(|_| {
+        CliError::new(
+            "malformed_daemon_response",
+            "daemon status response has an invalid shape",
+        )
+    })?;
+    Ok(success(
+        serde_json::to_value(status).expect("daemon status serializes"),
+    ))
+}
+
 async fn request_json(method: &str, path: &str) -> Result<Value, CliError> {
+    request_json_payload(method, path).await.map(success)
+}
+
+async fn request_json_payload(method: &str, path: &str) -> Result<Value, CliError> {
     let url = format!("{}{}", daemon_url()?, path);
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|_| CliError::new("usage_error", "invalid HTTP method"))?;
@@ -1202,7 +1223,7 @@ async fn request_json(method: &str, path: &str) -> Result<Value, CliError> {
     if !status.is_success() {
         return Err(daemon_error(status.as_u16(), payload));
     }
-    Ok(success(payload))
+    Ok(payload)
 }
 
 async fn bounded_response_json(mut response: reqwest::Response) -> Result<Value, CliError> {

@@ -183,7 +183,13 @@ The listener accepts numeric loopback addresses with nonzero ports. Non-loopback
 
 Token mode generates or loads a persistent 256-bit credential from a strict mode-`0600` non-symlink file. Non-loopback token mode requires operator-provided PEM TLS material and an HTTPS public origin whose port matches the listener. The CLI supports HTTPS and sends the configured token as a Bearer credential.
 
-One router-wide middleware protects feed pages, API routes, SSE, range requests, and artifact delivery. The browser exchanges the persistent token for a bounded 12-hour HttpOnly `SameSite=Strict` session. Cookie mutations require the configured exact origin. Logout invalidates server state and expires the cookie. HTML iframes receive renewable five-minute capabilities scoped to one post and file support subtree, preserving unique-origin sandboxing without exposing the session cookie. Expanded daemon status and structured logs remain in later Phase 4 slices.
+One router-wide middleware protects feed pages, API routes, SSE, range requests, and artifact delivery. The browser exchanges the persistent token for a bounded 12-hour HttpOnly `SameSite=Strict` session. Cookie mutations require the configured exact origin. Logout invalidates server state and expires the cookie. HTML iframes receive renewable five-minute capabilities scoped to one post and file support subtree, preserving unique-origin sandboxing without exposing the session cookie. Structured logs remain in a later Phase 4 slice.
+
+### Finite limits, daemon status, and cleanup slice completed
+
+Production daemon stores now use strict configurable limits with 512 MiB per-upload and 20 GiB unique-finalized-blob defaults. The public health response remains minimal; authenticated status reports only bounded aggregate storage, limit, session, queue, retention, and interval fields. `glim health` and `glim status` target those distinct contracts.
+
+The daemon purges the inclusive seven-day inactivity boundary before binding and retries cleanup hourly on a separate connection. Checked clock arithmetic fails startup safely, periodic failures leave future ticks enabled, and due/queue counts provide bounded operational visibility until structured logging is implemented.
 
 ### Trusted-proxy access slice completed
 
@@ -204,7 +210,7 @@ The structured CLI now installs, starts, stops, inspects, and uninstalls a marke
 - Protect HTML pages, SSE, API routes, media, and downloads consistently.
 - Add CSRF and origin protections appropriate to cookie or bearer-token handling.
 - [Completed] Implement `service install`, `start`, `stop`, `status`, and `uninstall` for a systemd user unit.
-- Add daemon health, version, store-size, active-session, and cleanup status commands.
+- [Completed] Add daemon health, version, store-size, active-session, and cleanup status commands.
 - Add structured logs with bounded verbosity and no artifact content or tokens.
 
 ### Test-first scenarios
