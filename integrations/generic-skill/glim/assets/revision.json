@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "integration_namespace": "pi",
+  "external_session_key": "pi-run-77",
+  "project_label": "receptive-field-analysis",
+  "working_directory": "/work/analysis",
+  "title": "Corrected receptive-field fits",
+  "commentary": "Inspect the corrected fit and compare it with post 48.",
+  "predecessor_post_id": 48,
+  "files": [
+    {
+      "source_path": "/work/analysis/revised.png",
+      "caption": "Corrected fit and residual summary"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "integration_namespace": "pi",
+  "external_session_key": "pi-run-77",
+  "project_label": "receptive-field-analysis",
+  "working_directory": "/work/analysis",
+  "title": "Receptive-field fits",
+  "commentary": "Inspect fit shape and residual structure.",
+  "files": [
+    {
+      "source_path": "/work/analysis/plot.png",
+      "caption": "Fit and residual summary"
+    }
+  ]
+}

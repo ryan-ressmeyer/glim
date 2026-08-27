@@ -1,4 +1,4 @@
-.PHONY: build check check-frontend check-rust frontend-build rust-checks
+.PHONY: build check check-frontend check-rust frontend-build generic-skill-check rust-checks
 
 build: frontend-build
 	cargo build --locked
@@ -16,4 +16,7 @@ rust-checks:
 
 check-rust: frontend-build rust-checks
 
-check: check-frontend rust-checks
+generic-skill-check:
+	node tests/generic-skill.mjs
+
+check: check-frontend generic-skill-check rust-checks

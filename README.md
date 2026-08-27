@@ -162,6 +162,20 @@ Markdown, HTML, and CSS parsers require complete UTF-8 text. The CLI therefore h
 
 The CLI records the Git root, branch, and commit when available. It does not collect remotes, diffs, environment variables, usernames, or repository contents.
 
+## Generic agent skill
+
+The repository-owned [`glim` skill](integrations/generic-skill/glim/SKILL.md) packages the CLI publication workflow for shell-capable agents that support the Agent Skills format. It is model-invoked when an agent creates an inspectable artifact or a user asks to publish, show, revise, or inspect an artifact through Glimse. The workflow publishes selected plots, images, reports, media, and inspection-oriented data. It excludes routine diffs, test output, logs, transcripts, and prose-only updates.
+
+Load the skill directly in Pi while developing or evaluating it:
+
+```bash
+pi --skill integrations/generic-skill/glim
+```
+
+For normal discovery, copy or symlink `integrations/generic-skill/glim` into an Agent Skills directory such as `~/.agents/skills/glim`, or add its parent directory to the harness's configured skill paths. Claude Code, Codex, Pi, and other shell-capable Agent Skills consumers can use the generic workflow when they expose file and shell operations. Pi's native typed integration remains planned separately; this package uses the structured CLI.
+
+The package includes schema-valid [publication](integrations/generic-skill/glim/assets/publication.json) and [revision](integrations/generic-skill/glim/assets/revision.json) fixtures, a [CLI contract](integrations/generic-skill/glim/references/cli-contract.md), and [baseline](integrations/generic-skill/glim/evaluations/baseline.md) and [proposed-skill](integrations/generic-skill/glim/evaluations/proposed.md) evaluations. The proposed evaluation covers `openai-codex/gpt-5.6-sol` in Pi only. Cross-model and cross-harness validation remains Phase 6 work.
+
 ## Compatibility
 
 [`docs/compatibility.md`](docs/compatibility.md) defines the SQLite migration policy, HTTP API versioning policy, and CLI JSON schema policy.

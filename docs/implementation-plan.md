@@ -238,7 +238,13 @@ The structured logging slice completes Phase 4. Configuration, direct token and 
 
 ## Phase 5: Agent integrations
 
-### Generic skill
+### Generic skill completed
+
+The first Phase 5 slice packages the model-invoked Agent Skills-compatible workflow at `integrations/generic-skill/glim`. Shell-capable Claude Code, Codex, Pi, and compatible agents can discover it through an Agent Skills directory or load it by repository path. The skill uses canonical JSON stdin, stable harness/session identity, returned URLs and public IDs, immutable revisions, explicit browser launch, and confirmed session closure. It excludes routine source and terminal output and never scans directories or retries an ambiguous publication automatically.
+
+Deterministic checks validate frontmatter, links, workflow completion criteria, schema fixtures, safe stdin examples, documented commands and error codes, revision and closure identity, and `make check` integration. Baseline and proposed evaluations are stored under `integrations/generic-skill/glim/evaluations`. The proposed evaluation covers `openai-codex/gpt-5.6-sol` in Pi; cross-model validation remains deferred to Phase 6. The native Pi extension below remains incomplete, so Phase 5 as a whole is not complete.
+
+Completed scope:
 
 - Teach shell-capable agents when visual output warrants publication.
 - Require an artifact and concise commentary rather than text-only feed messages.
@@ -247,7 +253,7 @@ The structured logging slice completes Phase 4. Configuration, direct token and 
 - Explain revisions, session closure, limits, and returned links.
 - Avoid automatic publication of routine source changes or terminal output.
 
-### Native pi extension
+### Native pi extension (pending)
 
 - Package a thin extension from the same repository.
 - Register a typed publication tool with ordered files, captions, commentary, and revision target.
