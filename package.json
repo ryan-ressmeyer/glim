@@ -13,7 +13,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p integrations/pi/tsconfig.json",
-    "test": "vitest run integrations/pi/test/client.test.ts integrations/pi/test/extension.test.ts",
+    "test": "vitest run --exclude 'target/**' integrations/pi/test/client.test.ts integrations/pi/test/extension.test.ts",
     "test:pi-load": "node integrations/pi/test/real-pi-load.mjs",
     "check:package": "node --test integrations/pi/test/package.test.mjs",
     "check:pi": "npm run typecheck && npm test && npm run check:package && npm run test:pi-load"

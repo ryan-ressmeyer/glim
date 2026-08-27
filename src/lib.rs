@@ -48,9 +48,9 @@ use axum::{
 };
 use serde::Serialize;
 
-const INDEX_HTML: &str = include_str!("../web/dist/index.html");
-const APP_JS: &[u8] = include_bytes!("../web/dist/assets/app.js");
-const PDF_WORKER_JS: &[u8] = include_bytes!("../web/dist/assets/pdf.worker.mjs");
+const INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/web/index.html"));
+const APP_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/assets/app.js"));
+const PDF_WORKER_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/assets/pdf.worker.mjs"));
 
 #[derive(Serialize)]
 struct Health {

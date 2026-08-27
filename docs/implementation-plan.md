@@ -279,6 +279,14 @@ Unit tests use injected CLI runners and fake executables. An isolated real Pi RP
 
 ## Phase 6: Hardening and release
 
+### Release and installation slice completed
+
+A deterministic repository contract now checks crate installation metadata, release-workflow boundaries, ordinary CI isolation, and operations documentation as part of `make check`. Version tags drive a Linux `x86_64-unknown-linux-gnu` workflow that checks the tagged commit, installs pinned toolchains and locked JavaScript dependencies, runs the complete checks, embeds the frontend in a locked release binary, and publishes a versioned archive with a matching SHA-256 checksum. Workflow actions are pinned to immutable upstream commits.
+
+The source build always creates the embedded frontend from checked sources and the lockfile in an isolated Cargo output directory. It neither trusts ignored generated bundles nor writes dependencies or assets into the Cargo source tree. This supports `cargo install --path . --locked` without checking generated bundles into Git. The crate explicitly disables crates.io publication. Public operations documentation covers pinned Pi installation, explicit upgrades, current migration failure behavior, stopped-service backup consistency, destructive removal boundaries, and release checksum verification.
+
+Benchmarks, additional fuzz or property coverage, broader crash and memory validation, additional browser security work, clean-machine release acceptance, and live model-driven Pi validation remain pending.
+
 ### Scope
 
 - Add fuzz or property tests for path handling, MIME detection, range parsing, short IDs, and schema decoding.
@@ -286,9 +294,9 @@ Unit tests use injected CLI runners and fake executables. An isolated real Pi RP
 - Benchmark hashing, concurrent upload, feed queries, garbage collection, and media serving.
 - Verify bounded memory with large allowed files and long feeds.
 - Add browser security tests for sandbox escape and cross-post access.
-- Produce Linux release binaries and checksums in CI.
-- Support `cargo install` for developer installation.
-- Document upgrades, database migrations, backup expectations, and complete removal.
+- [Completed] Produce Linux release binaries and checksums in CI.
+- [Completed] Support `cargo install` for developer installation.
+- [Completed] Document upgrades, database migrations, backup expectations, and complete removal.
 - Run live model-driven native Pi publication against a configured daemon across supported Pi modes and models.
 
 ### Release criteria

@@ -4,12 +4,12 @@ Glimse is a local service for visual output produced by terminal-based AI agents
 
 The checked HTTP contract is [`docs/openapi-v1.json`](docs/openapi-v1.json). The canonical CLI schemas are [`docs/cli-publish-v1.schema.json`](docs/cli-publish-v1.schema.json) and [`docs/cli-output-v1.schema.json`](docs/cli-output-v1.schema.json). The daemon configuration schema is [`docs/config-v1.schema.json`](docs/config-v1.schema.json). The browser feed receives live updates. Linux users can manage the daemon through a systemd user service.
 
-The agreed product design is recorded in [`docs/product-design.md`](docs/product-design.md). The dependency-ordered build plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
+The agreed product design is recorded in [`docs/product-design.md`](docs/product-design.md). The dependency-ordered build plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md). Source installation, upgrades, backups, removal, and release checksum verification are documented in [`docs/operations.md`](docs/operations.md).
 
 ## Supported development tools
 
 - Rust 1.93.1, selected by `rust-toolchain.toml`
-- Node.js 22.12 through 24.x; CI and `.nvmrc` use Node.js 22
+- Node.js 22.12 through 24.x for frontend development; root Pi-package checks require Node.js 22.19 or newer. CI, release builds, and `.nvmrc` pin Node.js 22.22.0.
 - npm with the selected Node.js installation
 
 Install the Pi package and frontend dependencies from their separate root lockfiles after cloning.
@@ -108,7 +108,7 @@ Trusted-proxy mode delegates TLS and user authentication to a reverse proxy. Gli
 
 Configure a reverse proxy or Tailscale Serve deployment so only the proxy can reach the Glimse listener, then allowlist the source IP that Glimse observes for that connection. The proxy must enforce the intended user or private-network boundary and preserve browser `Origin` and `Sec-Fetch-Site` headers while forwarding all HTTP methods, SSE streams, range headers, and response streaming unchanged. Do not use forwarded identity headers as authorization. The automated tests exercise the Glimse side with real TCP sockets; they do not certify a specific nginx, Caddy, or Tailscale Serve configuration.
 
-The frontend build writes `web/dist/index.html`, `web/dist/assets/app.js`, and the bundled PDF.js worker at `web/dist/assets/pdf.worker.mjs`. Rust embeds all three files, so the resulting binary does not read frontend files at runtime.
+The standalone frontend build writes `web/dist/index.html`, `web/dist/assets/app.js`, and the bundled PDF.js worker at `web/dist/assets/pdf.worker.mjs`. Cargo does not trust that ignored directory. Its build script copies the checked frontend source and lockfile into an isolated `OUT_DIR` workspace, runs the locked frontend build there, and embeds all three outputs. The resulting binary does not read frontend files at runtime.
 
 The browser serves the global feed at `/feed` (and `/`), session feeds at `/sessions/{public_id}`, and project feeds at `/projects/{project_id}`. Project page IDs are limited to positive integers no greater than JavaScript's safe-integer maximum (9,007,199,254,740,991). The static viewer supports sanitized commentary and Markdown artifacts, images and SVG, text, JSON, bounded CSV tables, native video and audio controls, lazy PDF.js pages, sandboxed HTML, and downloads. Media sources are released outside a 1,000-pixel vertical margin. PDF pages materialize within a 1,500-pixel margin, use 64 KiB range chunks, and retain at most three canvases per artifact.
 

@@ -28,6 +28,10 @@ test("Pi imports are peers and test-only packages are development dependencies",
   await access(resolve(root, "package-lock.json"));
 });
 
+test("Pi tests exclude generated Cargo package trees", () => {
+  assert.match(manifest.scripts.test, /--exclude ['"]?target\/\*\*['"]?/);
+});
+
 test("extension delegates HTTP, authentication, assets, and Git handling to the CLI", async () => {
   const source = await readFile(resolve(root, "integrations/pi/src/index.ts"), "utf8");
   assert.doesNotMatch(source, /from ["']node:https?["']/);

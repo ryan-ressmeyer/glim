@@ -3,6 +3,14 @@ name = "glim"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
+build = "build.rs"
+description = "Local service for visual output produced by terminal-based AI agents"
+license = "MIT"
+repository = "https://github.com/ryan-ressmeyer/glim"
+readme = "README.md"
+keywords = ["ai-agents", "artifacts", "cli", "visualization"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
