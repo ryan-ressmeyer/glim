@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::Write,
+    path::Path,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -23,6 +24,17 @@ fn run_glim(
     daemon_url: &str,
     browser: Option<&str>,
 ) -> std::process::Output {
+    run_glim_with(args, input, daemon_url, browser, None, None)
+}
+
+fn run_glim_with(
+    args: &[&str],
+    input: Option<&Value>,
+    daemon_url: &str,
+    browser: Option<&str>,
+    cwd: Option<&Path>,
+    path: Option<&Path>,
+) -> std::process::Output {
     let config_home = TempDir::new().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_glim"));
     command
@@ -42,6 +54,12 @@ fn run_glim(
         .stdin(Stdio::piped());
     if let Some(browser) = browser {
         command.env("GLIM_BROWSER_COMMAND", browser);
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    if let Some(path) = path {
+        command.env("PATH", path);
     }
     let mut child = command
         .stdout(Stdio::piped())
@@ -79,17 +97,21 @@ impl Drop for DaemonProcess {
     }
 }
 
-async fn start_daemon_process(store_root: &std::path::Path) -> DaemonProcess {
-    let port = std::net::TcpListener::bind("127.0.0.1:3030")
-        .expect("real-process CLI regression requires port 3030");
-    drop(port);
+fn unused_daemon_address() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
+async fn start_daemon_process(store_root: &std::path::Path) -> (DaemonProcess, String) {
+    let address = unused_daemon_address();
+    let daemon_url = format!("http://{address}");
     let child = Command::new(env!("CARGO_BIN_EXE_glim"))
         .arg("daemon")
         .env_remove("GLIM_CONFIG")
         .env_remove("GLIM_LOG_LEVEL")
         .env("XDG_CONFIG_HOME", store_root)
         .env("GLIM_STORE_ROOT", store_root)
-        .env("GLIM_BIND", "127.0.0.1:3030")
+        .env("GLIM_BIND", address.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -98,11 +120,11 @@ async fn start_daemon_process(store_root: &std::path::Path) -> DaemonProcess {
     let daemon = DaemonProcess(child);
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if reqwest::get("http://127.0.0.1:3030/api/v1/health")
+        if reqwest::get(format!("{daemon_url}/api/v1/health"))
             .await
             .is_ok()
         {
-            return daemon;
+            return (daemon, daemon_url);
         }
         assert!(Instant::now() < deadline, "daemon did not become ready");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -275,6 +297,37 @@ async fn canonical_and_flag_publication_share_the_streaming_contract_and_open_is
         fs::read_to_string(marker).unwrap(),
         flag_payload["result"]["viewer_url"]
     );
+
+    let relative = run_glim_with(
+        &[
+            "publish",
+            "--file",
+            "one.txt",
+            "--integration",
+            "pi",
+            "--external-key",
+            "relative-flag-session",
+            "--project",
+            "Glim",
+            "--working-directory",
+            ".",
+            "--title",
+            "Relative flags",
+            "--commentary",
+            "Flag paths remain ergonomic",
+        ],
+        None,
+        &daemon_url,
+        None,
+        Some(files.path()),
+        None,
+    );
+    assert!(
+        relative.status.success(),
+        "{}",
+        String::from_utf8_lossy(&relative.stdout)
+    );
+    assert_eq!(one_json(&relative)["ok"], true);
     server.abort();
 }
 
@@ -314,6 +367,35 @@ async fn read_and_lifecycle_commands_use_versioned_urls_and_one_json_result() {
     assert_eq!(error["ok"], false);
     assert_eq!(error["error"]["code"], "post_not_found");
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_accepts_pre_staging_daemons_without_inventing_resource_limits() {
+    let legacy = json!({
+        "ok": true, "version": "0.1.0", "finalized_unique_blob_bytes": 0,
+        "max_upload_bytes": 536870912, "max_finalized_blob_bytes": 21474836480_u64,
+        "active_sessions": 1, "sessions_due_for_purge": 0, "queued_blob_deletions": 0,
+        "retention_seconds": 604800, "cleanup_interval_seconds": 3600
+    });
+    let response = legacy.clone();
+    let app = axum::Router::new().route(
+        "/api/v1/status",
+        axum::routing::get(move || {
+            let response = response.clone();
+            async move { axum::Json(response) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let output = run_glim(&["status"], None, &format!("http://{address}"), None);
+    server.abort();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(one_json(&output)["result"], legacy);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -474,7 +556,7 @@ fn complete_created_response(public_id: &str, post_id: i64, post_session_id: &st
 async fn compiled_cli_publishes_binary_files_with_default_asset_collection() {
     let _guard = REAL_DAEMON_LOCK.lock().await;
     let store = TempDir::new().unwrap();
-    let _daemon = start_daemon_process(store.path()).await;
+    let (_daemon, daemon_url) = start_daemon_process(store.path()).await;
     let files = TempDir::new().unwrap();
     let artifacts: [(&str, &[u8], &str); 7] = [
         ("plot.png", b"\x89PNG\r\n\x1a\n\xff", "image"),
@@ -495,12 +577,7 @@ async fn compiled_cli_publishes_binary_files_with_default_asset_collection() {
         "files": artifacts.iter().map(|(filename, _, _)| json!({"source_path": files.path().join(filename)})).collect::<Vec<_>>()
     });
 
-    let output = run_glim(
-        &["publish", "--json"],
-        Some(&input),
-        "http://127.0.0.1:3030",
-        None,
-    );
+    let output = run_glim(&["publish", "--json"], Some(&input), &daemon_url, None);
     assert!(
         output.status.success(),
         "publication failed: {}",
@@ -514,7 +591,7 @@ async fn compiled_cli_publishes_binary_files_with_default_asset_collection() {
         assert_eq!(published[position]["filename"], *filename);
         assert_eq!(published[position]["renderer"], *renderer);
         let response = reqwest::get(format!(
-            "http://127.0.0.1:3030/api/v1/posts/{post_id}/files/{position}/content"
+            "{daemon_url}/api/v1/posts/{post_id}/files/{position}/content"
         ))
         .await
         .unwrap();
@@ -531,7 +608,7 @@ async fn compiled_cli_publishes_binary_files_with_default_asset_collection() {
 async fn real_process_publication_streams_recursive_css_support_bytes_from_offset_zero() {
     let _guard = REAL_DAEMON_LOCK.lock().await;
     let store = TempDir::new().unwrap();
-    let _daemon = start_daemon_process(store.path()).await;
+    let (_daemon, daemon_url) = start_daemon_process(store.path()).await;
     let files = TempDir::new().unwrap();
     fs::create_dir_all(files.path().join("styles/nested")).unwrap();
     fs::create_dir_all(files.path().join("images")).unwrap();
@@ -560,12 +637,7 @@ async fn real_process_publication_streams_recursive_css_support_bytes_from_offse
         "commentary":"Retained handles start at zero", "files":[{"source_path":files.path().join("entry.html")}]
     });
 
-    let output = run_glim(
-        &["publish", "--json"],
-        Some(&input),
-        "http://127.0.0.1:3030",
-        None,
-    );
+    let output = run_glim(&["publish", "--json"], Some(&input), &daemon_url, None);
     assert!(
         output.status.success(),
         "publication failed: {}",
@@ -584,7 +656,7 @@ async fn real_process_publication_streams_recursive_css_support_bytes_from_offse
         assets.iter().map(|(path, _)| *path).collect::<Vec<_>>()
     );
     let visible = reqwest::get(format!(
-        "http://127.0.0.1:3030/api/v1/posts/{post_id}/files/0/content"
+        "{daemon_url}/api/v1/posts/{post_id}/files/0/content"
     ))
     .await
     .unwrap();
@@ -592,13 +664,37 @@ async fn real_process_publication_streams_recursive_css_support_bytes_from_offse
     assert_eq!(visible.bytes().await.unwrap().as_ref(), entry);
     for (path, expected) in assets {
         let response = reqwest::get(format!(
-            "http://127.0.0.1:3030/api/v1/posts/{post_id}/files/0/support/{path}"
+            "{daemon_url}/api/v1/posts/{post_id}/files/0/support/{path}"
         ))
         .await
         .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
         assert_eq!(response.bytes().await.unwrap().as_ref(), expected, "{path}");
     }
+}
+
+#[test]
+fn refused_connection_is_definite_publication_failure() {
+    let address = unused_daemon_address();
+    let files = TempDir::new().unwrap();
+    let input = publication_input(&files, "refused");
+
+    let output = run_glim(
+        &["publish", "--json"],
+        Some(&input),
+        &format!("http://{address}"),
+        None,
+    );
+
+    assert!(!output.status.success());
+    let error = one_json(&output);
+    assert_eq!(error["error"]["code"], "daemon_unavailable");
+    assert!(
+        error["error"]["details"]
+            .get("publication_may_have_succeeded")
+            .is_none(),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -714,6 +810,53 @@ async fn created_response_requires_safe_matching_ids_and_complete_structure() {
         );
         server.abort();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_upload_is_ambiguous() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "client closed before upload began");
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+    });
+    let files = TempDir::new().unwrap();
+    fs::write(
+        files.path().join("result.txt"),
+        vec![b'x'; 16 * 1024 * 1024],
+    )
+    .unwrap();
+    let input = json!({
+        "schema_version":1, "integration_namespace":"pi", "external_session_key":"interrupted-upload",
+        "project_label":"Glim", "working_directory":files.path(), "title":"Interrupted",
+        "commentary":"Do not retry blindly", "files":[{"source_path":files.path().join("result.txt")}]
+    });
+
+    let output = run_glim(
+        &["publish", "--json"],
+        Some(&input),
+        &format!("http://{address}"),
+        None,
+    );
+    assert!(!output.status.success());
+    let payload = one_json(&output);
+    assert_eq!(payload["error"]["code"], "daemon_unavailable");
+    assert_eq!(
+        payload["error"]["details"]["publication_may_have_succeeded"],
+        true
+    );
+    server.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -853,7 +996,7 @@ fn open_browser_helper_is_bounded_and_accepts_a_still_running_opener() {
     let output = run_glim(
         &["open", "abc123"],
         None,
-        "http://127.0.0.1:3030",
+        "http://127.0.0.1:9",
         Some(browser.to_str().unwrap()),
     );
     assert!(started.elapsed() < Duration::from_secs(1));
@@ -874,11 +1017,99 @@ fn open_browser_helper_still_reports_an_immediate_nonzero_exit() {
     let output = run_glim(
         &["open", "abc123"],
         None,
-        "http://127.0.0.1:3030",
+        "http://127.0.0.1:9",
         Some(browser.to_str().unwrap()),
     );
     assert!(!output.status.success());
     assert_eq!(one_json(&output)["error"]["code"], "browser_launch_failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_publication_requires_absolute_paths_before_git_or_http() {
+    let files = TempDir::new().unwrap();
+    let no_executables = TempDir::new().unwrap();
+    let source = files.path().join("result.txt");
+    fs::write(&source, b"result").unwrap();
+    let cases = [
+        (json!("."), json!(source)),
+        (json!(files.path()), json!("result.txt")),
+    ];
+
+    for (working_directory, source_path) in cases {
+        let input = json!({
+            "schema_version":1, "integration_namespace":"pi", "external_session_key":"absolute-contract",
+            "project_label":"Glim", "working_directory":working_directory, "title":"Absolute paths",
+            "commentary":"Reject before side effects", "files":[{"source_path":source_path}]
+        });
+        let output = run_glim_with(
+            &["publish", "--json"],
+            Some(&input),
+            "not a URL",
+            None,
+            Some(files.path()),
+            Some(no_executables.path()),
+        );
+        assert!(!output.status.success());
+        let error = one_json(&output);
+        assert_eq!(error["error"]["code"], "validation_error", "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("absolute")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_git_is_optional_but_other_spawn_errors_are_reported() {
+    let root = TempDir::new().unwrap();
+    let store = glim::storage::Store::open(root.path()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, glim::app_with_store(store))
+            .await
+            .unwrap();
+    });
+    let files = TempDir::new().unwrap();
+    let input = publication_input(&files, "missing-git");
+    let no_executables = TempDir::new().unwrap();
+    let output = run_glim_with(
+        &["publish", "--json"],
+        Some(&input),
+        &format!("http://{address}"),
+        None,
+        None,
+        Some(no_executables.path()),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(one_json(&output)["result"]["post"]["git"], Value::Null);
+
+    let denied_path = TempDir::new().unwrap();
+    fs::write(denied_path.path().join("git"), "not executable").unwrap();
+    fs::set_permissions(
+        denied_path.path().join("git"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let denied = run_glim_with(
+        &["publish", "--json"],
+        Some(&publication_input(&files, "denied-git")),
+        &format!("http://{address}"),
+        None,
+        None,
+        Some(denied_path.path()),
+    );
+    assert!(!denied.status.success());
+    assert_eq!(one_json(&denied)["error"]["code"], "git_error");
+    server.abort();
 }
 
 #[cfg(unix)]
@@ -913,9 +1144,8 @@ fn publication_rejects_a_non_utf8_canonical_working_directory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
     let _guard = REAL_DAEMON_LOCK.lock().await;
-    let port = std::net::TcpListener::bind("127.0.0.1:3030")
-        .expect("authenticated CLI regression requires port 3030");
-    drop(port);
+    let address = unused_daemon_address();
+    let daemon_url = format!("http://{address}");
     let root = TempDir::new().unwrap();
     let config_path = root.path().join("config.json");
     let token_path = root.path().join("token");
@@ -926,11 +1156,11 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
         serde_json::to_vec(&json!({
             "schema_version": 1,
             "store_root": root.path().join("store"),
-            "bind": "127.0.0.1:3030",
+            "bind": address.to_string(),
             "access": {
                 "mode": "token",
                 "token_file": token_path,
-                "public_origin": "http://127.0.0.1:3030"
+                "public_origin": daemon_url
             }
         }))
         .unwrap(),
@@ -956,7 +1186,7 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
     let _daemon = DaemonProcess(child);
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if reqwest::get("http://127.0.0.1:3030/api/v1/health")
+        if reqwest::get(format!("{daemon_url}/api/v1/health"))
             .await
             .is_ok()
         {
@@ -972,7 +1202,7 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
     let authenticated = Command::new(env!("CARGO_BIN_EXE_glim"))
         .args(["status"])
         .env("GLIM_CONFIG", &config_path)
-        .env("GLIM_DAEMON_URL", "http://127.0.0.1:3030")
+        .env("GLIM_DAEMON_URL", &daemon_url)
         .output()
         .unwrap();
     assert!(
@@ -995,7 +1225,7 @@ async fn cli_reads_configured_token_for_authenticated_daemon_requests() {
         .env_remove("GLIM_MAX_UPLOAD_BYTES")
         .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
         .env_remove("GLIM_LOG_LEVEL")
-        .env("GLIM_DAEMON_URL", "http://127.0.0.1:3030")
+        .env("GLIM_DAEMON_URL", &daemon_url)
         .output()
         .unwrap();
     assert!(!unauthenticated.status.success());
@@ -1030,7 +1260,7 @@ fn malformed_usage_stdin_and_unavailable_daemon_are_json_errors() {
         assert!(!output.status.success());
         assert_eq!(one_json(&output)["error"]["code"], code);
     }
-    let https = run_glim(&["status"], None, "https://127.0.0.1:3030", None);
+    let https = run_glim(&["status"], None, "https://127.0.0.1:9", None);
     assert!(!https.status.success());
     assert_eq!(one_json(&https)["error"]["code"], "daemon_unavailable");
     for invalid in [

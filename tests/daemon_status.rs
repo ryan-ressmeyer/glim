@@ -3,7 +3,10 @@ use axum::{
     http::{Request, StatusCode},
 };
 use glim::{
-    daemon::{DEFAULT_MAX_FINALIZED_BLOB_BYTES, DEFAULT_MAX_UPLOAD_BYTES, DaemonLimits},
+    daemon::{
+        DEFAULT_MAX_CONCURRENT_PUBLICATIONS, DEFAULT_MAX_FINALIZED_BLOB_BYTES,
+        DEFAULT_MAX_STAGING_BYTES, DEFAULT_MAX_UPLOAD_BYTES, DaemonLimits,
+    },
     storage::{Store, StoreError, StoreLimits},
 };
 use http_body_util::BodyExt;
@@ -37,12 +40,14 @@ fn sqlite_path(root: &TempDir) -> std::path::PathBuf {
 #[test]
 fn storage_status_is_consistent_and_rejects_negative_metadata() {
     let root = TempDir::new().unwrap();
-    let mut store = Store::open_with_limits(
+    let mut store = Store::open_with_resource_limits(
         root.path(),
         StoreLimits {
             max_upload_bytes: 512,
             max_finalized_blob_bytes: 2048,
         },
+        1024,
+        2,
     )
     .unwrap();
     let a = store.resolve_session("test", "active", "P", "/p").unwrap();
@@ -73,6 +78,9 @@ fn storage_status_is_consistent_and_rejects_negative_metadata() {
         )
         .unwrap();
     let snapshot = store.status_snapshot(100).unwrap();
+    assert_eq!(snapshot.staging_bytes_in_use, 0);
+    assert_eq!(snapshot.max_staging_bytes, 1024);
+    assert_eq!(snapshot.max_concurrent_publications, 2);
     assert_eq!(snapshot.finalized_unique_blob_bytes, 17);
     assert_eq!(snapshot.active_sessions, 1);
     assert_eq!(snapshot.sessions_due_for_purge, 1);
@@ -81,7 +89,7 @@ fn storage_status_is_consistent_and_rejects_negative_metadata() {
         snapshot.limits,
         StoreLimits {
             max_upload_bytes: 512,
-            max_finalized_blob_bytes: 2048
+            max_finalized_blob_bytes: 2048,
         }
     );
     connection
@@ -96,12 +104,14 @@ fn storage_status_is_consistent_and_rejects_negative_metadata() {
 #[tokio::test]
 async fn health_is_minimal_and_status_is_expanded_without_refreshing_activity() {
     let root = TempDir::new().unwrap();
-    let mut store = Store::open_with_limits(
+    let mut store = Store::open_with_resource_limits(
         root.path(),
         StoreLimits {
             max_upload_bytes: 512,
             max_finalized_blob_bytes: 2048,
         },
+        1024,
+        2,
     )
     .unwrap();
     let session = store
@@ -150,8 +160,11 @@ async fn health_is_minimal_and_status_is_expanded_without_refreshing_activity() 
     }
     let status: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(status["ok"], true);
+    assert_eq!(status["staging_bytes_in_use"], 0);
     assert_eq!(status["max_upload_bytes"], 512);
+    assert_eq!(status["max_staging_bytes"], 1024);
     assert_eq!(status["max_finalized_blob_bytes"], 2048);
+    assert_eq!(status["max_concurrent_publications"], 2);
     assert_eq!(status["retention_seconds"], 604800);
     assert_eq!(status["cleanup_interval_seconds"], 3600);
     let reopened = Store::open(root.path()).unwrap();
@@ -167,7 +180,9 @@ async fn health_is_minimal_and_status_is_expanded_without_refreshing_activity() 
 #[test]
 fn limit_defaults_and_strict_resolution_are_finite() {
     assert_eq!(DEFAULT_MAX_UPLOAD_BYTES, 536_870_912);
+    assert_eq!(DEFAULT_MAX_STAGING_BYTES, 2_147_483_648);
     assert_eq!(DEFAULT_MAX_FINALIZED_BLOB_BYTES, 21_474_836_480);
+    assert_eq!(DEFAULT_MAX_CONCURRENT_PUBLICATIONS, 4);
     let legacy = glim::daemon::resolve_daemon_configuration_limit_values(
         Some(br#"{"schema_version":1}"#),
         None,
@@ -177,6 +192,14 @@ fn limit_defaults_and_strict_resolution_are_finite() {
     assert_eq!(legacy, DaemonLimits::default());
     let file =
         br#"{"schema_version":1,"limits":{"max_upload_bytes":10,"max_finalized_blob_bytes":20}}"#;
+    let expanded = glim::daemon::resolve_daemon_configuration_limit_values(
+        Some(br#"{"schema_version":1,"limits":{"max_upload_bytes":10,"max_staging_bytes":40,"max_finalized_blob_bytes":50,"max_concurrent_publications":3}}"#),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(expanded.max_staging_bytes, 40);
+    assert_eq!(expanded.max_concurrent_publications, 3);
     assert_eq!(
         glim::daemon::resolve_daemon_configuration_limit_values(
             Some(file),
@@ -186,10 +209,25 @@ fn limit_defaults_and_strict_resolution_are_finite() {
         .unwrap(),
         DaemonLimits {
             max_upload_bytes: 12,
-            max_finalized_blob_bytes: 30
+            max_staging_bytes: DEFAULT_MAX_STAGING_BYTES,
+            max_finalized_blob_bytes: 30,
+            max_concurrent_publications: DEFAULT_MAX_CONCURRENT_PUBLICATIONS,
         }
     );
-    for bad in [br#"{"schema_version":1,"limits":{"max_upload_bytes":0,"max_finalized_blob_bytes":20}}"#.as_slice(), br#"{"schema_version":1,"limits":{"max_upload_bytes":21,"max_finalized_blob_bytes":20}}"#.as_slice(), br#"{"schema_version":1,"limits":{"max_upload_bytes":10,"max_finalized_blob_bytes":20,"unknown":1}}"#.as_slice()] { assert!(glim::daemon::resolve_daemon_configuration_limit_values(Some(bad), None, None).is_err()); }
+    for bad in [
+        br#"{"schema_version":1,"limits":{"max_upload_bytes":0,"max_finalized_blob_bytes":20}}"#.as_slice(),
+        br#"{"schema_version":1,"limits":{"max_upload_bytes":21,"max_finalized_blob_bytes":20}}"#.as_slice(),
+        br#"{"schema_version":1,"limits":{"max_upload_bytes":10,"max_staging_bytes":0,"max_finalized_blob_bytes":20}}"#.as_slice(),
+        br#"{"schema_version":1,"limits":{"max_upload_bytes":10,"max_staging_bytes":9,"max_finalized_blob_bytes":20}}"#.as_slice(),
+        br#"{"schema_version":1,"limits":{"max_upload_bytes":10,"max_finalized_blob_bytes":20,"max_concurrent_publications":0}}"#.as_slice(),
+        br#"{"schema_version":1,"limits":{"max_upload_bytes":10,"max_finalized_blob_bytes":20,"max_concurrent_publications":5}}"#.as_slice(),
+        br#"{"schema_version":1,"limits":{"max_upload_bytes":10,"max_finalized_blob_bytes":20,"unknown":1}}"#.as_slice(),
+    ] {
+        assert!(
+            glim::daemon::resolve_daemon_configuration_limit_values(Some(bad), None, None)
+                .is_err()
+        );
+    }
     for bad in ["", "0", "-1", "+1", "1.0", "18446744073709551616"] {
         assert!(
             glim::daemon::resolve_daemon_configuration_limit_values(
@@ -212,7 +250,9 @@ fn production_open_store_applies_the_resolved_upload_boundary() {
         },
         DaemonLimits {
             max_upload_bytes: 512,
+            max_staging_bytes: 1024,
             max_finalized_blob_bytes: 2048,
+            max_concurrent_publications: 2,
         },
     )
     .unwrap();

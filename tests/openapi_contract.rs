@@ -60,6 +60,28 @@ fn checked_json_schema_artifacts_are_versioned_and_closed() {
     assert_eq!(configuration["properties"]["schema_version"]["const"], 1);
     assert_eq!(configuration["additionalProperties"], false);
     assert_eq!(configuration["required"], json!(["schema_version"]));
+    assert_eq!(
+        configuration["properties"]["limits"]["properties"]["max_staging_bytes"]["default"],
+        2_147_483_648_u64
+    );
+    assert_eq!(
+        configuration["properties"]["limits"]["properties"]["max_concurrent_publications"]["maximum"],
+        4
+    );
+    let openapi: Value = serde_json::from_str(include_str!("../docs/openapi-v1.json")).unwrap();
+    assert!(
+        openapi["components"]["schemas"]["DaemonStatus"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("max_staging_bytes"))
+    );
+    assert!(
+        openapi["components"]["schemas"]["ErrorEnvelope"]["properties"]["error"]
+            ["properties"]["code"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("publication_busy"))
+    );
 }
 
 #[test]

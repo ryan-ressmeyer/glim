@@ -538,10 +538,17 @@ fn file_deletion_failure_retains_queue_and_metadata_for_startup_retry() {
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
 
-    assert!(matches!(
-        store.close_session(&session.public_id),
-        Err(StoreError::Io(_))
-    ));
+    let report = store.close_session(&session.public_id).unwrap();
+    assert_eq!(report.sessions_deleted, 1);
+    assert_eq!(report.blobs_queued, 1);
+    assert_eq!(report.blobs_deleted, 0);
+    assert_eq!(
+        store
+            .status_snapshot(i64::MIN)
+            .unwrap()
+            .queued_blob_deletions,
+        1
+    );
     drop(store);
     let connection = database(&root);
     assert_eq!(

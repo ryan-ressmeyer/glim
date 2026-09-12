@@ -75,7 +75,7 @@ fn html_references(text: &str) -> Result<Vec<String>, String> {
         let attributes = element.value();
         if matches!(
             name,
-            "img" | "script" | "source" | "video" | "audio" | "track" | "iframe" | "input"
+            "img" | "script" | "source" | "video" | "audio" | "track" | "input"
         ) && let Some(src) = attributes.attr("src")
         {
             references.push(src.to_owned());
@@ -102,6 +102,9 @@ fn html_references(text: &str) -> Result<Vec<String>, String> {
                     .filter(|url| !url.is_empty())
                 {
                     references.push(url.to_owned());
+                    if references.len() > MAX_REFERENCES {
+                        return Err("entry document exceeds the support-reference limit".into());
+                    }
                 }
             }
         }
@@ -697,6 +700,22 @@ fn prepare_json_publication(input: JsonPublication) -> Result<PreparedPublicatio
             ),
         ));
     }
+    if !input.working_directory.is_absolute() {
+        return Err(CliError::new(
+            "validation_error",
+            "working_directory must be an absolute path in canonical JSON",
+        ));
+    }
+    if input
+        .files
+        .iter()
+        .any(|file| !file.source_path.is_absolute())
+    {
+        return Err(CliError::new(
+            "validation_error",
+            "source_path must be an absolute path in canonical JSON",
+        ));
+    }
     prepare_publication(PublicationInput {
         integration_namespace: input.integration_namespace,
         external_key: input.external_session_key,
@@ -987,14 +1006,23 @@ fn collect_git_provenance(
 }
 
 fn git_output(directory: &Path, args: &[&str]) -> Result<Option<String>, CliError> {
-    let mut child = Command::new("git")
+    let mut child = match Command::new("git")
         .args(args)
         .current_dir(directory)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|error| CliError::new("git_error", format!("could not execute Git: {error}")))?;
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::new(
+                "git_error",
+                format!("could not execute Git: {error}"),
+            ));
+        }
+    };
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match child.try_wait().map_err(|error| {
@@ -1120,10 +1148,15 @@ async fn send_publication(publication: PreparedPublication) -> Result<Value, Cli
         .post(url)
         .multipart(form);
     let response = authorize_request(request)?.send().await.map_err(|error| {
-        publication_may_have_succeeded(CliError::new(
+        let failure = CliError::new(
             "daemon_unavailable",
             format!("could not reach daemon: {error}"),
-        ))
+        );
+        if error.is_connect() {
+            failure
+        } else {
+            publication_may_have_succeeded(failure)
+        }
     })?;
     let status = response.status();
     let payload = bounded_response_json(response)

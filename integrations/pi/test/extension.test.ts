@@ -16,7 +16,8 @@ function success(publicId = "Public123", postId = 41, opened = false) {
   };
 }
 
-function harness(sessionId = "session-A", branch: unknown[] = [], hasUI = true) {
+function harness(sessionId = "session-A", branch: unknown[] = [], mode: "tui" | "rpc" | "json" | "print" = "tui") {
+  const hasUI = mode === "tui" || mode === "rpc";
   const tools: any[] = [];
   const commands = new Map<string, any>();
   const handlers = new Map<string, any[]>();
@@ -32,7 +33,7 @@ function harness(sessionId = "session-A", branch: unknown[] = [], hasUI = true) 
   };
   const ctx: any = {
     cwd: "/work/my-project",
-    mode: hasUI ? "tui" : "json",
+    mode,
     hasUI,
     sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
     ui: { notify: (text: string, level: string) => notifications.push({ text, level }) },
@@ -157,16 +158,38 @@ describe("branch state and commands", () => {
     expect(h.notifications.at(-1).text).toContain("No confirmed open");
   });
 
-  test("feed never creates a session, opens only the returned URL, and non-UI output is a non-triggering message", async () => {
+  test("feed never creates a session, opens only the returned URL, and JSON output is immediate without triggering a turn", async () => {
     const valid: any = { pi_session_id: "session-A", public_session_id: "Exact77", post_id: 2, viewer_url: "https://elsewhere/exact", post_url: "https://elsewhere/exact#post-2", browser_launch: {}, external_session_key: "pi-session-A", project_label: "p", working_directory: "/p" };
     const branch = [{ type: "message", message: { role: "toolResult", toolName: "glim_publish", isError: false, details: valid } }];
     const run = vi.fn<CliRunner>().mockResolvedValue({ schema_version: 1, ok: true, result: { viewer_url: "https://elsewhere/exact" } });
-    const h = harness("session-A", branch, false);
+    const h = harness("session-A", branch, "json");
     createGlimExtension({ run })(h.pi);
     await h.handlers.get("session_start")![0]({}, h.ctx);
     await h.commands.get("glim-feed").handler("open", h.ctx);
     expect(run).toHaveBeenCalledWith(["open", "https://elsewhere/exact"], undefined, undefined);
-    expect(h.messages.at(-1).options).toEqual({ deliverAs: "nextTurn" });
+    expect(h.messages.at(-1).options).toBeUndefined();
+    expect(h.messages.at(-1).message.content).toContain("Opened Glimse feed Exact77");
+  });
+
+  test("print commands write a bounded result while TUI and RPC keep using notifications", async () => {
+    const print = harness("session-A", [], "print");
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    createGlimExtension({ run: vi.fn() })(print.pi);
+    await print.commands.get("glim-feed").handler("", print.ctx);
+    expect(stderr).toHaveBeenCalledWith("No confirmed open Glimse publication exists on the current branch/session.");
+    expect(print.messages).toHaveLength(0);
+    stderr.mockRestore();
+
+    for (const mode of ["tui", "rpc"] as const) {
+      const interactive = harness("session-A", [], mode);
+      createGlimExtension({ run: vi.fn() })(interactive.pi);
+      await interactive.commands.get("glim-feed").handler("", interactive.ctx);
+      expect(interactive.notifications.at(-1)).toMatchObject({
+        text: "No confirmed open Glimse publication exists on the current branch/session.",
+        level: "info",
+      });
+      expect(interactive.messages).toHaveLength(0);
+    }
   });
 
   test("status displays only bounded aggregate fields", async () => {

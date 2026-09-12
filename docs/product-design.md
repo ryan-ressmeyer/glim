@@ -55,7 +55,7 @@ Each session has two identifiers.
 
 Agent-provided links open the session feed. The viewer also provides project and global feed scopes.
 
-Explicitly closing a session immediately deletes its posts, managed snapshots, metadata, and unreferenced blobs. An inactive session is purged after seven days. New publications and a heartbeat from a visible session feed reset inactivity. Background listing or polling does not.
+Explicitly closing a session immediately removes its posts and metadata from the feed and queues unreferenced blobs for deletion. If physical cleanup fails after the metadata commit, closure remains successful, cleanup stays queued for retry, and status exposes the outstanding deletion count. An inactive session is purged after seven days. New publications and a heartbeat from a visible session feed reset inactivity. Background listing or polling does not.
 
 After purge, another publication with the same external key creates a fresh session. Glimse has no pin, archive, or saved-history mechanism.
 
@@ -87,9 +87,9 @@ For Markdown and HTML entry documents, the CLI collects allowlisted relative res
 
 The daemon identifies blobs with SHA-256 encoded as 64 lowercase hexadecimal characters. Stored paths use two levels of two-character hash prefixes for bounded directory fan-out. Posts may share one stored blob, and purge removes a blob only after its final reference disappears. SQLite transactions coordinate metadata and blob-reference updates.
 
-A configurable global physical blob budget counts each unique finalized blob once. Deduplicated uploads consume no additional finalized-store budget. A separate configurable per-file upload ceiling bounds each staging write and guards against abusive uploads. Temporary staging may consume bounded transient disk space outside finalized-store accounting, and ordinary filesystem-full errors remain possible.
+A configurable global physical blob budget counts each unique finalized blob once. Deduplicated uploads consume no additional finalized-store budget. A separate configurable per-file upload ceiling bounds each staging write and guards against abusive uploads. Temporary staging is bounded separately from finalized-store accounting. In-flight publications share a configurable 2 GiB default staging budget and four active-publication slots. An overloaded daemon rejects new work rather than queueing unbounded uploads. Ordinary filesystem-full errors remain possible.
 
-The publication API will reject a whole publication before it becomes visible when any file exceeds the upload ceiling or its new unique blobs would exceed the global budget. Glimse never evicts older visible posts to make room. Production default byte values remain undecided.
+The publication API will reject a whole publication before it becomes visible when any file exceeds the upload ceiling or its new unique blobs would exceed the global budget. Glimse never evicts older visible posts to make room. Production defaults are 512 MiB per file and 20 GiB of unique finalized blobs. Manifest-only constraints are checked before consuming artifact bytes.
 
 The daemon determines media type through content sniffing and validates it against the filename and declared type. Dangerous mismatches fail publication. Safe explicit overrides may select a text language for highlighting.
 
@@ -99,19 +99,23 @@ The session feed is reverse chronological. Every visible artifact in a post rend
 
 When a user is at the top, a new post appears immediately and shifts prior posts downward. When the user has scrolled away, the browser preserves the viewport and shows a new-content indicator. Activating the indicator returns to the new posts. The browser retains at most 100 pending posts; a larger burst triggers latest-page reconciliation.
 
-Scoped server-sent event streams use post IDs as event IDs. The daemon retains 256 live events and replays at most 100 durable posts after reconnection. A client that exceeds either bound receives a reset event and reconciles from the latest page. Session closure events stop matching session views and prompt project or global views to reconcile removed posts.
+Scoped server-sent event streams use post IDs as event IDs. The daemon retains 256 live events and replays at most 100 durable posts on a first connection. Reconnects with `Last-Event-ID`, channel lag, and an oversized initial replay receive a reset event. Session closure and periodic retention cleanup also notify connected views. Reset reconciliation reloads through the oldest previously loaded post, rather than retaining potentially deleted older pages. Obsolete responses cannot restore closed sessions or overwrite newer live changes.
 
 A visible session page sends a heartbeat every 30 seconds only while its event stream is open. Hiding the page, losing the stream, closing the session, or disconnecting the component stops heartbeat work. Session pages require native destructive confirmation before closing.
 
 Inline artifact access is intentional. Visually heavy posts encourage agents to publish focused figures and demonstrations. The browser may defer offscreen work, release media decoders, bound embedded documents, or virtualize text while keeping every artifact available from the feed.
 
-The CLI always returns a deep link. It opens a local browser only when explicitly requested.
+The CLI always returns a deep link. It opens a local browser only when explicitly requested. Post fragments resolve and focus the requested post, including predecessors outside the loaded page, while enforcing the current session or project scope.
+
+The browser header shows feed navigation and connection state. Session actions and technical provenance use expandable controls. Shared artifact toolbars expose type, size, opening, downloading, and copying links. The interface follows the system light/dark preference without modifying artifact colors and respects reduced-motion settings.
+
+Automatic text-document rendering is limited to 16 MiB per artifact and deferred until near the viewport, with at most three concurrent document fetches. Larger text, Markdown, JSON, CSV, and HTML files require an explicit full-load choice. This is a browser rendering limit, not an upload limit; the original download is always available.
 
 ## Renderers
 
 ### Images and SVG
 
-Images display at their natural dimensions up to the feed width and are not upscaled. A zoom-and-pan overlay exposes full resolution.
+Images display at their natural dimensions up to the feed width and are not upscaled. A native modal dialog exposes full resolution with fit-to-window, 100%, zoom percentage, keyboard controls, and scrollable panning. Focus remains in the dialog and returns to the triggering preview on close.
 
 ### PDF
 
@@ -127,11 +131,11 @@ Sanitized Markdown renders as a complete inline document. Relative resources res
 
 ### Raw text and code
 
-Plain text, logs, and highlighted source code render in resizable scroll panes with fullscreen support. Large files may virtualize lines but remain complete within configured byte limits.
+Plain text, logs, and source code render in resizable scroll panes with fullscreen support. Source code currently uses plain text rather than syntax highlighting. Files above the automatic rendering budget require explicit full loading; the renderer does not silently truncate them.
 
 ### JSON and CSV
 
-JSON uses a structured, resizable scroll pane. CSV uses a resizable, scrollable table. Both provide fullscreen inspection.
+JSON uses an indented, resizable text pane. CSV uses a resizable, scrollable table. Both provide fullscreen inspection. CSV previews disclose the first-200-row and first-100-column limits and report parse errors, showing at most ten error details with the total count. Downloading preserves the complete original file.
 
 ### HTML
 

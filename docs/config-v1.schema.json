@@ -30,12 +30,26 @@
           "default": 536870912,
           "description": "Maximum decimal bytes in one uploaded file. GLIM_MAX_UPLOAD_BYTES takes precedence."
         },
+        "max_staging_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615,
+          "default": 2147483648,
+          "description": "Maximum shared bytes held by in-flight publication staging. GLIM_MAX_STAGING_BYTES takes precedence."
+        },
         "max_finalized_blob_bytes": {
           "type": "integer",
           "minimum": 1,
           "maximum": 18446744073709551615,
           "default": 21474836480,
           "description": "Maximum physical bytes in unique finalized blobs. GLIM_MAX_FINALIZED_BLOB_BYTES takes precedence."
+        },
+        "max_concurrent_publications": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4,
+          "default": 4,
+          "description": "Maximum active publication handlers. GLIM_MAX_CONCURRENT_PUBLICATIONS takes precedence."
         }
       }
     },

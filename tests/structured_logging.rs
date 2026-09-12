@@ -152,7 +152,9 @@ fn clean_command() -> Command {
         "GLIM_TLS_PRIVATE_KEY",
         "GLIM_TRUSTED_PROXY_IPS",
         "GLIM_MAX_UPLOAD_BYTES",
+        "GLIM_MAX_STAGING_BYTES",
         "GLIM_MAX_FINALIZED_BLOB_BYTES",
+        "GLIM_MAX_CONCURRENT_PUBLICATIONS",
         "GLIM_LOG_LEVEL",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
@@ -278,6 +280,17 @@ async fn daemon_logs_only_allowlisted_publication_close_and_bounded_request_even
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
     let published: Value = response.json().await.unwrap();
     let public_id = published["session"]["public_id"].as_str().unwrap();
+    let hash = rusqlite::Connection::open(store.join("metadata.sqlite3"))
+        .unwrap()
+        .query_row("SELECT hash FROM blobs", [], |row| row.get::<_, String>(0))
+        .unwrap();
+    let blob_path = store
+        .join("blobs")
+        .join(&hash[..2])
+        .join(&hash[2..4])
+        .join(&hash);
+    std::fs::remove_file(&blob_path).unwrap();
+    std::fs::create_dir(&blob_path).unwrap();
 
     let failed = client
         .post(format!("{base}/posts"))
@@ -328,7 +341,7 @@ async fn daemon_logs_only_allowlisted_publication_close_and_bounded_request_even
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
-    assert!(events.len() <= 7, "unexpected request logging: {stderr}");
+    assert!(events.len() <= 8, "unexpected request logging: {stderr}");
     let common = ["schema_version", "timestamp", "level", "event"];
     for event in &events {
         let allowed: &[&str] = match event["event"].as_str().unwrap() {
@@ -338,7 +351,9 @@ async fn daemon_logs_only_allowlisted_publication_close_and_bounded_request_even
                 "tls",
                 "bind",
                 "max_upload_bytes",
+                "max_staging_bytes",
                 "max_finalized_blob_bytes",
+                "max_concurrent_publications",
             ],
             "cleanup_completed" => &[
                 "trigger",
@@ -368,6 +383,7 @@ async fn daemon_logs_only_allowlisted_publication_close_and_bounded_request_even
                 "blobs_queued",
                 "blobs_deleted",
             ],
+            "blob_cleanup_deferred" => &["trigger"],
             other => panic!("unexpected event {other}: {event}"),
         };
         assert!(
@@ -386,6 +402,12 @@ async fn daemon_logs_only_allowlisted_publication_close_and_bounded_request_even
             .count(),
         1
     );
+    let cleanup_deferred = events
+        .iter()
+        .find(|event| event["event"] == "blob_cleanup_deferred")
+        .unwrap();
+    assert_eq!(cleanup_deferred["level"], "warn");
+    assert_eq!(cleanup_deferred["trigger"], "session_close");
     let publication_failures = events
         .iter()
         .filter(|event| event["event"] == "publication_failed")

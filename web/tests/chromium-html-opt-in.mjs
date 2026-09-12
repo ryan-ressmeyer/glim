@@ -49,6 +49,7 @@ const page = {
       caption: null,
       media_type: "text/html; charset=utf-8",
       renderer: "html",
+      blob: { byte_size: 256 },
       support_assets: [{ relative_path: "app.js" }],
     }],
   }],
@@ -181,7 +182,7 @@ try {
   await command("Runtime.enable");
   await command("Page.navigate", { url: `http://127.0.0.1:${address.port}/feed` });
   const artifact = "document.querySelector('glim-app')?.shadowRoot?.querySelector('glim-artifact')";
-  await waitFor(`${artifact}?.shadowRoot?.querySelector('[data-enable-scripts]') !== null`, "the HTML artifact");
+  await waitFor(`!!${artifact}?.shadowRoot?.querySelector('[data-enable-scripts]')`, "the HTML artifact");
   await new Promise((resolve) => setTimeout(resolve, 200));
   const safeMessages = await evaluate("window.__htmlMessages");
   const safeState = await evaluate(`(() => {

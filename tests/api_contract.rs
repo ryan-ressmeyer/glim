@@ -663,6 +663,67 @@ async fn multipart_manifest_and_part_contract_errors_are_typed_and_leave_no_stat
 }
 
 #[tokio::test]
+async fn every_manifest_only_constraint_is_rejected_before_artifact_body_polling() {
+    use tokio_stream::wrappers::ReceiverStream;
+
+    for (name, file, expected_code) in [
+        (
+            "unsafe-filename",
+            json!({"part":"file", "filename":"../secret.txt", "support_assets":[]}),
+            "validation_failed",
+        ),
+        (
+            "unsafe-support-path",
+            json!({"part":"file", "filename":"entry.md", "support_assets":[{"part":"asset", "relative_path":"../secret.css"}]}),
+            "validation_failed",
+        ),
+        (
+            "unsupported-media-declaration",
+            json!({"part":"file", "filename":"entry.txt", "media_type":"text/unsupported", "support_assets":[]}),
+            "artifact_classification_failed",
+        ),
+    ] {
+        let root = TempDir::new().unwrap();
+        let app = glim::app_with_store(Store::open(root.path()).unwrap());
+        let manifest = json!({
+            "integration_namespace":"pi", "external_key":"preflight", "project_label":"Glim",
+            "working_directory":"/tmp/preflight", "title":"Preflight", "commentary":"Validate",
+            "files":[file]
+        });
+        let prefix = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"manifest\"\r\n\r\n{manifest}\r\n--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\n"
+        );
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        sender.send(Ok(Bytes::from(prefix))).await.unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/posts")
+                    .header("content-type", "multipart/form-data; boundary=b")
+                    .body(Body::from_stream(ReceiverStream::new(receiver)))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} polled the artifact body before rejecting the manifest"))
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{name}"
+        );
+        let payload: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(payload["error"]["code"], expected_code, "{name}");
+        assert_clean_publication_store(&root);
+        drop(sender);
+    }
+}
+
+#[tokio::test]
 async fn http_git_provenance_validation_rejects_unsafe_inert_metadata_before_upload() {
     let invalid = [
         json!({"root":"relative","branch":"main","commit":"a".repeat(40)}),
@@ -734,6 +795,10 @@ async fn multipart_upload_and_aggregate_limits_cleanup_all_stages_and_identity()
             StatusCode::PAYLOAD_TOO_LARGE | StatusCode::INSUFFICIENT_STORAGE
         ));
         assert_eq!(payload["error"]["code"], expected_code);
+        if expected_code == "storage_limit_exceeded" {
+            assert_eq!(payload["error"]["details"]["pressure"], "finalized");
+            assert_eq!(payload["error"]["details"]["retryable"], false);
+        }
         assert_clean_publication_store(&root);
     }
 }
@@ -769,6 +834,143 @@ async fn missing_predecessor_and_sql_failure_rollback_resolved_identity_and_blob
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(payload["error"]["code"], "storage_constraint_conflict");
     assert_clean_publication_store(&root);
+}
+
+#[tokio::test]
+async fn shared_staging_budget_counts_visible_and_support_parts_before_each_write() {
+    let root = TempDir::new().unwrap();
+    let app = glim::app_with_store(
+        Store::open_with_resource_limits(
+            root.path(),
+            StoreLimits {
+                max_upload_bytes: 5,
+                max_finalized_blob_bytes: 100,
+            },
+            5,
+            4,
+        )
+        .unwrap(),
+    );
+    let manifest = json!({
+        "integration_namespace":"pi", "external_key":"staging", "project_label":"Glim",
+        "working_directory":"/tmp/staging", "title":"Staging", "commentary":"Bounded",
+        "files":[{"part":"file", "filename":"entry.md", "support_assets":[{"part":"asset", "relative_path":"asset.css"}]}]
+    });
+    let (status, payload) = post_multipart(
+        app.clone(),
+        "b",
+        multipart_body("b", &manifest, &[("file", b"abc"), ("asset", b"def")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(payload["error"]["code"], "staging_limit_exceeded");
+    assert_eq!(payload["error"]["details"]["pressure"], "staging");
+    assert_eq!(payload["error"]["details"]["limit"], 5);
+    assert_eq!(payload["error"]["details"]["current"], 3);
+    assert_eq!(payload["error"]["details"]["additional"], 3);
+    assert_clean_publication_store(&root);
+
+    let mut retry = minimal_manifest();
+    retry["files"][0]["filename"] = json!("retry.txt");
+    let (status, _) = post_multipart(
+        app,
+        "retry",
+        multipart_body("retry", &retry, &[("file", b"12345")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_publications_fail_fast_and_cancellation_releases_slot_and_staging() {
+    use tokio_stream::wrappers::ReceiverStream;
+    let root = TempDir::new().unwrap();
+    let app = glim::app_with_store(
+        Store::open_with_resource_limits(
+            root.path(),
+            StoreLimits {
+                max_upload_bytes: 16,
+                max_finalized_blob_bytes: 100,
+            },
+            16,
+            1,
+        )
+        .unwrap(),
+    );
+    let manifest = minimal_manifest();
+    let prefix = format!(
+        "--b\r\nContent-Disposition: form-data; name=\"manifest\"\r\n\r\n{manifest}\r\n--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nx"
+    );
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    sender.send(Ok(Bytes::from(prefix))).await.unwrap();
+    let first_app = app.clone();
+    let first = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/posts")
+                    .header("content-type", "multipart/form-data; boundary=b")
+                    .body(Body::from_stream(ReceiverStream::new(receiver)))
+                    .unwrap(),
+            )
+            .await
+    });
+    let staging = root.path().join("blobs/publication-staging");
+    for _ in 0..100 {
+        if std::fs::read_dir(&staging).unwrap().count() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(std::fs::read_dir(&staging).unwrap().count() > 0);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let (_, status) = request(app.clone(), "GET", "/api/v1/status", None).await;
+            if status["staging_bytes_in_use"] == 1 {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("active upload never reported its staging reservation");
+    assert_eq!(status["staging_bytes_in_use"], 1);
+
+    let (status, payload) = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        post_multipart(
+            app.clone(),
+            "busy",
+            multipart_body("busy", &minimal_manifest(), &[("file", b"ok")]),
+        ),
+    )
+    .await
+    .expect("busy publication queued instead of failing fast");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(payload["error"]["code"], "publication_busy");
+    assert_eq!(payload["error"]["details"]["pressure"], "concurrency");
+    assert_eq!(payload["error"]["details"]["retryable"], true);
+
+    first.abort();
+    let _ = first.await;
+    drop(sender);
+    for _ in 0..100 {
+        if std::fs::read_dir(&staging).unwrap().count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    let (_, status) = request(app.clone(), "GET", "/api/v1/status", None).await;
+    assert_eq!(status["staging_bytes_in_use"], 0);
+    let (status, _) = post_multipart(
+        app,
+        "after",
+        multipart_body("after", &minimal_manifest(), &[("file", b"after")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

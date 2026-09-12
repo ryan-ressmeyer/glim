@@ -31,7 +31,9 @@ fn command(config_path: &Path) -> Command {
         .env_remove("GLIM_TLS_PRIVATE_KEY")
         .env_remove("GLIM_TRUSTED_PROXY_IPS")
         .env_remove("GLIM_MAX_UPLOAD_BYTES")
+        .env_remove("GLIM_MAX_STAGING_BYTES")
         .env_remove("GLIM_MAX_FINALIZED_BLOB_BYTES")
+        .env_remove("GLIM_MAX_CONCURRENT_PUBLICATIONS")
         .env_remove("GLIM_LOG_LEVEL")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
@@ -84,6 +86,53 @@ async fn explicit_configuration_starts_on_an_alternate_loopback_port() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(store.join("metadata.sqlite3").is_file());
+}
+
+#[tokio::test]
+async fn staging_and_concurrency_environment_overrides_reach_daemon_status() {
+    let root = TempDir::new().unwrap();
+    let store = root.path().join("store");
+    let port = free_loopback_port();
+    let config_path = root.path().join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "store_root": store,
+            "bind": format!("127.0.0.1:{port}"),
+            "limits": {"max_upload_bytes": 32, "max_finalized_blob_bytes": 128}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut daemon = Daemon(
+        command(&config_path)
+            .env("GLIM_MAX_STAGING_BYTES", "64")
+            .env("GLIM_MAX_CONCURRENT_PUBLICATIONS", "1")
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Ok(response) = reqwest::get(format!("http://127.0.0.1:{port}/api/v1/status")).await
+            && response.status().is_success()
+        {
+            break response.json::<Value>().await.unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "configured daemon did not listen"
+        );
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "configured daemon exited"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(status["max_upload_bytes"], 32);
+    assert_eq!(status["max_staging_bytes"], 64);
+    assert_eq!(status["max_finalized_blob_bytes"], 128);
+    assert_eq!(status["max_concurrent_publications"], 1);
 }
 
 #[tokio::test]

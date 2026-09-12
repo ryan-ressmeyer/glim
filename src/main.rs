@@ -123,8 +123,16 @@ async fn run_daemon() -> Result<(), DaemonFailure> {
                 json!(configuration.limits.max_upload_bytes),
             ),
             (
+                "max_staging_bytes",
+                json!(configuration.limits.max_staging_bytes),
+            ),
+            (
                 "max_finalized_blob_bytes",
                 json!(configuration.limits.max_finalized_blob_bytes),
+            ),
+            (
+                "max_concurrent_publications",
+                json!(configuration.limits.max_concurrent_publications),
             ),
         ],
     );
@@ -238,6 +246,8 @@ fn prepare_store(
             )
         })?;
     glim::daemon::log_cleanup_completed("startup", report);
-    glim::daemon::spawn_periodic_cleanup(root, limits);
+    let notifier = glim::storage::LifecycleNotifier::default();
+    store.configure_lifecycle_notifier(notifier.clone());
+    glim::daemon::spawn_periodic_cleanup_with_notifier(root, limits, notifier);
     Ok(store)
 }

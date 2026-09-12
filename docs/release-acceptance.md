@@ -1,6 +1,6 @@
 # Release acceptance record
 
-This record contains no credentials, public IDs, generated URLs, transcripts, or temporary paths.
+This record contains no credentials, public IDs, generated URLs, transcripts, or temporary paths. The live-provider matrix below records the earlier release-acceptance run, before the trustworthy-inspection milestone. That matrix has not been rerun for the milestone. Current credential-free checks cover real Pi command output, Chromium inspection/security behavior, and isolated upload/resource acceptance; they do not replace live-provider release acceptance.
 
 ## Live Pi matrix
 

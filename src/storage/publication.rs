@@ -4,14 +4,15 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BlobHash, INITIAL_PUBLIC_ID_LENGTH, PostRead, SessionRead, Store, StoreError, blob,
-    generate_public_id, unix_seconds_now,
+    BlobHash, INITIAL_PUBLIC_ID_LENGTH, PostRead, SessionRead, StagingBudget, Store, StoreError,
+    blob, generate_public_id, unix_seconds_now,
 };
 
 const PUBLICATION_STAGING_DIRECTORY: &str = "publication-staging";
@@ -29,6 +30,8 @@ pub(crate) struct PublicationStagingWriter {
     hasher: Option<Sha256>,
     byte_size: u64,
     max_upload_bytes: u64,
+    staging_budget: Arc<StagingBudget>,
+    reserved_bytes: u64,
     cleaned: bool,
 }
 
@@ -42,6 +45,8 @@ pub struct StagedPublicationBlob {
     lock_file: File,
     hash: BlobHash,
     byte_size: u64,
+    staging_budget: Arc<StagingBudget>,
+    reserved_bytes: u64,
     cleaned: bool,
     retain_for_recovery: Cell<bool>,
 }
@@ -142,7 +147,11 @@ impl Store {
     pub(crate) fn publication_staging_writer(
         &self,
     ) -> Result<PublicationStagingWriter, StoreError> {
-        PublicationStagingWriter::create(&self.root, self.limits.max_upload_bytes)
+        PublicationStagingWriter::create(
+            &self.root,
+            self.limits.max_upload_bytes,
+            self.staging_budget.clone(),
+        )
     }
 
     pub fn publish(&mut self, request: PublicationRequest) -> Result<PostRecord, StoreError> {
@@ -495,6 +504,22 @@ fn retain_staged_hash_for_recovery(request: &PublicationRequest, hash: &BlobHash
     }
 }
 
+pub(crate) fn is_safe_publication_filename(filename: &str) -> bool {
+    !filename.trim().is_empty()
+        && !filename.contains('/')
+        && !filename.contains('\\')
+        && !filename.chars().any(char::is_control)
+}
+
+pub(crate) fn is_valid_support_path(relative_path: &str) -> bool {
+    !relative_path.starts_with('/')
+        && !relative_path.contains('\\')
+        && !relative_path.chars().any(char::is_control)
+        && !relative_path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
 fn validate_request(
     request: &PublicationRequest,
     root: &Path,
@@ -517,14 +542,7 @@ fn validate_request(
         let mut paths = HashSet::new();
         for asset in &file.support_assets {
             validate_staged_blob(&asset.blob, root, max_upload_bytes)?;
-            if asset.relative_path.starts_with('/')
-                || asset.relative_path.contains('\\')
-                || asset.relative_path.chars().any(char::is_control)
-                || asset
-                    .relative_path
-                    .split('/')
-                    .any(|part| part.is_empty() || part == "." || part == "..")
-            {
+            if !is_valid_support_path(&asset.relative_path) {
                 return Err(StoreError::InvalidSupportPath {
                     relative_path: asset.relative_path.clone(),
                 });
@@ -624,7 +642,11 @@ fn insert_reference(
 }
 
 impl PublicationStagingWriter {
-    fn create(root: &Path, max_upload_bytes: u64) -> Result<Self, StoreError> {
+    fn create(
+        root: &Path,
+        max_upload_bytes: u64,
+        staging_budget: Arc<StagingBudget>,
+    ) -> Result<Self, StoreError> {
         let staging_directory = root.join("blobs").join(PUBLICATION_STAGING_DIRECTORY);
         fs::create_dir_all(&staging_directory)?;
         loop {
@@ -664,6 +686,8 @@ impl PublicationStagingWriter {
                 hasher: Some(Sha256::new()),
                 byte_size: 0,
                 max_upload_bytes,
+                staging_budget,
+                reserved_bytes: 0,
                 cleaned: false,
             });
         }
@@ -680,10 +704,18 @@ impl PublicationStagingWriter {
                 attempted,
             });
         }
-        self.data_file
+        let additional = u64::try_from(bytes.len()).expect("chunk size exceeds u64");
+        self.staging_budget.reserve(additional)?;
+        if let Err(error) = self
+            .data_file
             .as_mut()
             .expect("writer is active")
-            .write_all(bytes)?;
+            .write_all(bytes)
+        {
+            self.staging_budget.release(additional);
+            return Err(error.into());
+        }
+        self.reserved_bytes += additional;
         self.hasher
             .as_mut()
             .expect("writer is active")
@@ -719,20 +751,27 @@ impl PublicationStagingWriter {
             lock_file: self.lock_file.take().expect("writer is active"),
             hash,
             byte_size: self.byte_size,
+            staging_budget: self.staging_budget.clone(),
+            reserved_bytes: self.reserved_bytes,
             cleaned: false,
             retain_for_recovery: Cell::new(false),
         };
+        self.reserved_bytes = 0;
         self.cleaned = true;
         Ok(staged)
     }
 
     fn cleanup(&mut self) {
         self.data_file.take();
-        let _ = blob::remove_if_exists(&self.data_path);
+        let data_removed = blob::remove_if_exists(&self.data_path).is_ok();
         let _ = blob::remove_if_exists(&self.journal_path.with_extension("next"));
         let _ = blob::remove_if_exists(&self.journal_path);
         let _ = blob::remove_if_exists(&self.lock_path);
         let _ = blob::sync_directory(&self.staging_directory);
+        if data_removed {
+            self.staging_budget.release(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
         self.cleaned = true;
     }
 }
@@ -758,11 +797,15 @@ impl StagedPublicationBlob {
     }
 
     fn cleanup(&mut self) {
-        let _ = blob::remove_if_exists(&self.data_path);
+        let data_removed = blob::remove_if_exists(&self.data_path).is_ok();
         let _ = blob::remove_if_exists(&self.journal_path.with_extension("next"));
         let _ = blob::remove_if_exists(&self.journal_path);
         let _ = blob::remove_if_exists(&self.lock_path);
         let _ = blob::sync_directory(&self.staging_directory);
+        if data_removed {
+            self.staging_budget.release(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
         self.cleaned = true;
     }
 }

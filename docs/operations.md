@@ -83,6 +83,18 @@ Back up each boundary that applies to the deployment.
 
 Trusted-proxy deployments must also preserve the proxy's configuration and credentials through the proxy's own backup process. Those files are outside the Glimse store.
 
+## Upload pressure and deferred cleanup
+
+The daemon distinguishes finalized storage from temporary in-flight staging. Defaults are 512 MiB per file, 2 GiB shared staging, 20 GiB of unique finalized blobs, and four active publications. `glim status` exposes current staging usage, configured limits, and queued blob deletions.
+
+- `publication_busy` means all publication slots are occupied. Wait for active uploads to finish before retrying.
+- `staging_limit_exceeded` means the next chunk would exceed shared staging capacity. Wait for other uploads, reduce the publication, or deliberately increase `limits.max_staging_bytes` / `GLIM_MAX_STAGING_BYTES`. A publication larger than the entire budget cannot succeed unchanged.
+- `storage_limit_exceeded` means new finalized bytes would exceed the store budget. Close an unneeded session or change the configured finalized budget; the daemon never silently evicts posts.
+
+`limits.max_concurrent_publications` / `GLIM_MAX_CONCURRENT_PUBLICATIONS` accepts one through four. All byte limits must be positive; the per-file ceiling cannot exceed the staging or finalized budget. Existing configurations may omit the new staging and concurrency fields.
+
+A successful close means the session's metadata deletion committed. If filesystem cleanup fails afterward, the daemon logs `blob_cleanup_deferred` and retains queued blob deletions for retry. Inspect status and filesystem permissions rather than repeatedly closing a session that is already gone. The new CLI can read older v1 status responses without inventing staging limits; upgrade the binary and restart the daemon together before relying on the new resource controls.
+
 ## Complete removal
 
 **DESTRUCTIVE:** These steps permanently delete publications, configuration, credentials, and local integration state. Confirm the active configuration and store paths before removing anything. Keep a tested backup if the data may be needed again.

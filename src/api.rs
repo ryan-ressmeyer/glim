@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
-    sync::{broadcast, mpsc},
+    sync::{Semaphore, broadcast, mpsc},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
@@ -34,9 +34,9 @@ use tokio_util::io::ReaderStream;
 use crate::{
     logging::{LogLevel, daemon as log_daemon},
     storage::{
-        ActivityReport, ArtifactRenderer, GitProvenance, LifecycleReport, PageRequest,
-        PublicationFile, PublicationIdentity, PublicationRequest, PublicationStagingWriter,
-        PublicationSupportAsset, PublishedPublication, Store, StoreError,
+        ActivityReport, ArtifactRenderer, GitProvenance, LifecycleNotifier, LifecycleReport,
+        PageRequest, PublicationFile, PublicationIdentity, PublicationRequest,
+        PublicationStagingWriter, PublicationSupportAsset, PublishedPublication, Store, StoreError,
     },
 };
 
@@ -44,7 +44,7 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_DECLARED_PARTS: usize = 256;
 /// Live publication fan-out is intentionally lossy; lagging clients receive `reset`.
 const LIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
-/// A reconnect may replay at most this many durable posts before receiving `reset`.
+/// A first connection may replay at most this many durable posts before receiving `reset`.
 const LIVE_REPLAY_LIMIT: usize = 100;
 const BROWSER_SESSION_LIMIT: usize = 128;
 const BROWSER_SESSION_SECONDS: u64 = 12 * 60 * 60;
@@ -56,6 +56,9 @@ const HTML_CAPABILITY_SECONDS: u64 = 5 * 60;
 pub(crate) struct ApiState {
     store: Option<Arc<Mutex<Store>>>,
     events: broadcast::Sender<LiveEvent>,
+    lifecycle_events: LifecycleNotifier,
+    publication_slots: Arc<Semaphore>,
+    max_concurrent_publications: u32,
     authentication: Option<Arc<TokenAuthentication>>,
     trusted_proxy: Option<Arc<TrustedProxyAuthentication>>,
 }
@@ -85,6 +88,9 @@ impl Default for ApiState {
         Self {
             store: None,
             events,
+            lifecycle_events: LifecycleNotifier::default(),
+            publication_slots: Arc::new(Semaphore::new(4)),
+            max_concurrent_publications: 4,
             authentication: None,
             trusted_proxy: None,
         }
@@ -93,8 +99,13 @@ impl Default for ApiState {
 
 impl ApiState {
     pub(crate) fn with_store(store: Store) -> Self {
+        let lifecycle_events = store.lifecycle_notifier();
+        let max_concurrent_publications = store.max_concurrent_publications();
         Self {
             store: Some(Arc::new(Mutex::new(store))),
+            lifecycle_events,
+            publication_slots: Arc::new(Semaphore::new(max_concurrent_publications as usize)),
+            max_concurrent_publications,
             ..Self::default()
         }
     }
@@ -104,8 +115,13 @@ impl ApiState {
         trusted_proxy_ips: HashSet<std::net::IpAddr>,
         expected_origin: String,
     ) -> Self {
+        let lifecycle_events = store.lifecycle_notifier();
+        let max_concurrent_publications = store.max_concurrent_publications();
         Self {
             store: Some(Arc::new(Mutex::new(store))),
+            lifecycle_events,
+            publication_slots: Arc::new(Semaphore::new(max_concurrent_publications as usize)),
+            max_concurrent_publications,
             trusted_proxy: Some(Arc::new(TrustedProxyAuthentication {
                 trusted_proxy_ips,
                 expected_origin,
@@ -120,8 +136,13 @@ impl ApiState {
         expected_origin: String,
         secure_cookie: bool,
     ) -> Self {
+        let lifecycle_events = store.lifecycle_notifier();
+        let max_concurrent_publications = store.max_concurrent_publications();
         Self {
             store: Some(Arc::new(Mutex::new(store))),
+            lifecycle_events,
+            publication_slots: Arc::new(Semaphore::new(max_concurrent_publications as usize)),
+            max_concurrent_publications,
             authentication: Some(Arc::new(TokenAuthentication {
                 access_token,
                 expected_origin,
@@ -139,9 +160,16 @@ impl ApiState {
 pub struct DaemonStatus {
     pub ok: bool,
     pub version: String,
+    // Older v1 daemons omit these additions. Do not invent limits when the CLI reads them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_bytes_in_use: Option<u64>,
     pub finalized_unique_blob_bytes: u64,
     pub max_upload_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_staging_bytes: Option<u64>,
     pub max_finalized_blob_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_publications: Option<u32>,
     pub active_sessions: u64,
     pub sessions_due_for_purge: u64,
     pub queued_blob_deletions: u64,
@@ -156,9 +184,12 @@ async fn status(State(state): State<ApiState>) -> Result<Json<DaemonStatus>, Api
     Ok(Json(DaemonStatus {
         ok: true,
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        staging_bytes_in_use: Some(snapshot.staging_bytes_in_use),
         finalized_unique_blob_bytes: snapshot.finalized_unique_blob_bytes,
         max_upload_bytes: snapshot.limits.max_upload_bytes,
+        max_staging_bytes: Some(snapshot.max_staging_bytes),
         max_finalized_blob_bytes: snapshot.limits.max_finalized_blob_bytes,
+        max_concurrent_publications: Some(snapshot.max_concurrent_publications),
         active_sessions: snapshot.active_sessions,
         sessions_due_for_purge: snapshot.sessions_due_for_purge,
         queued_blob_deletions: snapshot.queued_blob_deletions,
@@ -176,6 +207,9 @@ enum LiveEvent {
     SessionClosed {
         project_id: i64,
         session_public_id: String,
+    },
+    Reset {
+        reason: &'static str,
     },
 }
 
@@ -838,6 +872,22 @@ async fn publish_post(
     state: State<ApiState>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<(StatusCode, Json<PublicationResponse>), ApiError> {
+    let _publication_slot = state
+        .publication_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "publication_busy",
+                "All publication slots are in use",
+                json!({
+                    "pressure": "concurrency",
+                    "limit": state.max_concurrent_publications,
+                    "retryable": true,
+                }),
+            )
+        })?;
     let result = publish_post_inner(state, multipart).await;
     if let Err(error) = &result {
         log_daemon(
@@ -1122,6 +1172,16 @@ fn validate_manifest(manifest: &PublicationManifest) -> Result<HashSet<String>, 
     }
     let mut parts = HashSet::with_capacity(count);
     for file in &manifest.files {
+        if !crate::storage::is_safe_publication_filename(&file.filename) {
+            return Err(ApiError::multipart(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_failed",
+                "Artifact filename is invalid",
+            ));
+        }
+        if let Some(media_type) = file.media_type.as_deref() {
+            crate::storage::validate_declared_media_type(media_type)?;
+        }
         if file.part.is_empty() {
             return Err(ApiError::multipart(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1150,6 +1210,13 @@ fn validate_manifest(manifest: &PublicationManifest) -> Result<HashSet<String>, 
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "duplicate_part",
                     "Declared part names must be unique",
+                ));
+            }
+            if !crate::storage::is_valid_support_path(&asset.relative_path) {
+                return Err(ApiError::multipart(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "validation_failed",
+                    "Support path is invalid",
                 ));
             }
             if !paths.insert(asset.relative_path.as_str()) {
@@ -1484,20 +1551,29 @@ async fn live_events(
     };
     // Subscribe first: a commit racing durable replay can duplicate, but cannot disappear.
     let mut receiver = state.events.subscribe();
-    let replay_scope = scope.clone();
-    let replay = with_store(state.clone(), move |store| match replay_scope {
-        FeedScope::Global => store.global_posts_after(after_id, LIVE_REPLAY_LIMIT + 1),
-        FeedScope::Project(project_id) => {
-            store.project_posts_after(project_id, after_id, LIVE_REPLAY_LIMIT + 1)
-        }
-        FeedScope::Session(public_id) => {
-            store.session_posts_after(&public_id, after_id, LIVE_REPLAY_LIMIT + 1)
-        }
-    })
-    .await?;
+    let mut lifecycle_receiver = state.lifecycle_events.subscribe();
+    let replay = if after_id == 0 {
+        let replay_scope = scope.clone();
+        with_store(state.clone(), move |store| match replay_scope {
+            FeedScope::Global => store.global_posts_after(after_id, LIVE_REPLAY_LIMIT + 1),
+            FeedScope::Project(project_id) => {
+                store.project_posts_after(project_id, after_id, LIVE_REPLAY_LIMIT + 1)
+            }
+            FeedScope::Session(public_id) => {
+                store.session_posts_after(&public_id, after_id, LIVE_REPLAY_LIMIT + 1)
+            }
+        })
+        .await?
+    } else {
+        Vec::new()
+    };
     let (sender, stream) = mpsc::channel::<Result<Event, Infallible>>(32);
     tokio::spawn(async move {
-        if replay.len() > LIVE_REPLAY_LIMIT {
+        if after_id > 0 {
+            if sender.send(Ok(reset_event("reconnect"))).await.is_err() {
+                return;
+            }
+        } else if replay.len() > LIVE_REPLAY_LIMIT {
             if sender.send(Ok(reset_event("replay_limit"))).await.is_err() {
                 return;
             }
@@ -1509,27 +1585,39 @@ async fn live_events(
             }
         }
         loop {
-            match receiver.recv().await {
-                Ok(event) if event_matches(&scope, &event) => {
-                    let encoded = match event {
-                        LiveEvent::Post { post, .. } => post_event(&post),
-                        LiveEvent::SessionClosed { project_id, session_public_id } => Event::default()
-                            .event("session-closed")
-                            .json_data(json!({"project_id": project_id, "session_public_id": session_public_id}))
-                            .expect("trusted closure event serializes"),
-                    };
-                    if sender.send(Ok(encoded)).await.is_err() {
-                        return;
+            tokio::select! {
+                _ = sender.closed() => return,
+                deletion = lifecycle_receiver.recv() => match deletion {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if sender.send(Ok(reset_event("storage_changed"))).await.is_err() {
+                            return;
+                        }
                     }
-                }
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    receiver = receiver.resubscribe();
-                    if sender.send(Ok(reset_event("channel_lag"))).await.is_err() {
-                        return;
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                received = receiver.recv() => match received {
+                    Ok(event) if event_matches(&scope, &event) => {
+                        let encoded = match event {
+                            LiveEvent::Post { post, .. } => post_event(&post),
+                            LiveEvent::SessionClosed { project_id, session_public_id } => Event::default()
+                                .event("session-closed")
+                                .json_data(json!({"project_id": project_id, "session_public_id": session_public_id}))
+                                .expect("trusted closure event serializes"),
+                            LiveEvent::Reset { reason } => reset_event(reason),
+                        };
+                        if sender.send(Ok(encoded)).await.is_err() {
+                            return;
+                        }
                     }
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        receiver = receiver.resubscribe();
+                        if sender.send(Ok(reset_event("channel_lag"))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
             }
         }
     });
@@ -1545,6 +1633,7 @@ async fn live_events(
 fn event_matches(scope: &FeedScope, event: &LiveEvent) -> bool {
     match (scope, event) {
         (FeedScope::Global, _) => true,
+        (_, LiveEvent::Reset { .. }) => true,
         (
             FeedScope::Project(expected),
             LiveEvent::Post { project_id, .. } | LiveEvent::SessionClosed { project_id, .. },
@@ -1607,12 +1696,15 @@ async fn close_session(
     let report = with_store(state, move |store| {
         let context = store.session(&close_id).ok();
         let report = store.close_session(&close_id)?;
-        if report.sessions_deleted > 0
-            && let Some(session) = context
-        {
-            let _ = events.send(LiveEvent::SessionClosed {
-                project_id: session.project.id,
-                session_public_id: close_id,
+        if report.sessions_deleted > 0 {
+            if let Some(session) = context {
+                let _ = events.send(LiveEvent::SessionClosed {
+                    project_id: session.project.id,
+                    session_public_id: close_id,
+                });
+            }
+            let _ = events.send(LiveEvent::Reset {
+                reason: "session_deleted",
             });
         }
         Ok(report)
@@ -1811,6 +1903,22 @@ impl From<StoreError> for ApiError {
                 "Upload exceeds the configured limit",
                 json!({"limit": limit, "attempted": attempted}),
             ),
+            StoreError::StagingLimitExceeded {
+                limit,
+                current,
+                additional,
+            } => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "staging_limit_exceeded",
+                "Shared in-flight staging capacity would be exceeded",
+                json!({
+                    "pressure": "staging",
+                    "limit": limit,
+                    "current": current,
+                    "additional": additional,
+                    "retryable": true,
+                }),
+            ),
             StoreError::GlobalBlobBudgetExceeded {
                 limit,
                 current,
@@ -1819,7 +1927,13 @@ impl From<StoreError> for ApiError {
                 StatusCode::INSUFFICIENT_STORAGE,
                 "storage_limit_exceeded",
                 "Storage budget would be exceeded",
-                json!({"limit": limit, "current": current, "additional": additional}),
+                json!({
+                    "pressure": "finalized",
+                    "limit": limit,
+                    "current": current,
+                    "additional": additional,
+                    "retryable": false,
+                }),
             ),
             StoreError::ArtifactNotFound => Self::new(
                 StatusCode::NOT_FOUND,

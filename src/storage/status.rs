@@ -4,6 +4,9 @@ use super::{Store, StoreError, StoreLimits};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreStatusSnapshot {
+    pub staging_bytes_in_use: u64,
+    pub max_staging_bytes: u64,
+    pub max_concurrent_publications: u32,
     pub finalized_unique_blob_bytes: u64,
     pub active_sessions: u64,
     pub sessions_due_for_purge: u64,
@@ -36,6 +39,9 @@ impl Store {
             })?;
         transaction.commit()?;
         Ok(StoreStatusSnapshot {
+            staging_bytes_in_use: self.staging_bytes_in_use(),
+            max_staging_bytes: self.max_staging_bytes(),
+            max_concurrent_publications: self.max_concurrent_publications(),
             finalized_unique_blob_bytes: nonnegative("finalized_unique_blob_bytes", finalized)?,
             active_sessions: nonnegative("active_sessions", active)?,
             sessions_due_for_purge: nonnegative("sessions_due_for_purge", due)?,

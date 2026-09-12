@@ -73,7 +73,7 @@ const run = async () => {
     limits: { max_upload_bytes: fileBytes + mib, max_finalized_blob_bytes: fileBytes + 8 * mib },
   }));
   const environment = { ...process.env, GLIM_CONFIG: configPath };
-  for (const name of ["GLIM_STORE_ROOT", "GLIM_BIND", "GLIM_ACCESS_MODE", "GLIM_TOKEN_FILE", "GLIM_PUBLIC_ORIGIN", "GLIM_TLS_CERTIFICATE", "GLIM_TLS_PRIVATE_KEY", "GLIM_TRUSTED_PROXY_IPS", "GLIM_MAX_UPLOAD_BYTES", "GLIM_MAX_FINALIZED_BLOB_BYTES"]) delete environment[name];
+  for (const name of ["GLIM_STORE_ROOT", "GLIM_BIND", "GLIM_ACCESS_MODE", "GLIM_TOKEN_FILE", "GLIM_PUBLIC_ORIGIN", "GLIM_TLS_CERTIFICATE", "GLIM_TLS_PRIVATE_KEY", "GLIM_TRUSTED_PROXY_IPS", "GLIM_MAX_UPLOAD_BYTES", "GLIM_MAX_FINALIZED_BLOB_BYTES", "GLIM_MAX_STAGING_BYTES", "GLIM_MAX_CONCURRENT_PUBLICATIONS"]) delete environment[name];
   daemon = spawn(daemonBinary, ["daemon"], { env: environment, stdio: ["ignore", "ignore", "pipe"] });
   daemon.stderr.on("data", (chunk) => { daemonStderr += chunk; });
   for (let attempt = 0; attempt < 200; attempt += 1) {

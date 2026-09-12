@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,11 +17,14 @@ mod status;
 
 pub use blob::{BlobHash, BlobIntegrityError, BlobRecord, InvalidBlobHash};
 pub use classification::ArtifactRenderer;
+pub(crate) use classification::validate_declared_media_type;
 pub use lifecycle::LifecycleReport;
-pub(crate) use publication::PublicationStagingWriter;
 pub use publication::{
     GitProvenance, PostRecord, PublicationFile, PublicationIdentity, PublicationRequest,
     PublicationSupportAsset, PublishedPublication, StagedPublicationBlob,
+};
+pub(crate) use publication::{
+    PublicationStagingWriter, is_safe_publication_filename, is_valid_support_path,
 };
 pub(crate) use read::AssociatedArtifact;
 pub use read::{
@@ -199,6 +203,30 @@ pub struct ActivityReport {
     pub last_activity_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct LifecycleNotifier {
+    events: tokio::sync::broadcast::Sender<()>,
+}
+
+impl Default for LifecycleNotifier {
+    fn default() -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        Self { events }
+    }
+}
+
+impl LifecycleNotifier {
+    pub fn notify_cleanup(&self, report: LifecycleReport) {
+        if report.sessions_deleted > 0 {
+            let _ = self.events.send(());
+        }
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.events.subscribe()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreLimits {
     pub max_upload_bytes: u64,
@@ -221,10 +249,62 @@ impl Default for StoreLimits {
 }
 
 #[derive(Debug)]
+pub(crate) struct StagingBudget {
+    limit: u64,
+    used: Mutex<u64>,
+}
+
+impl StagingBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: Mutex::new(0),
+        }
+    }
+
+    fn reserve(&self, additional: u64) -> Result<(), StoreError> {
+        let mut used = self
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if used
+            .checked_add(additional)
+            .is_none_or(|total| total > self.limit)
+        {
+            return Err(StoreError::StagingLimitExceeded {
+                limit: self.limit,
+                current: *used,
+                additional,
+            });
+        }
+        *used += additional;
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut used = self
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *used = used.saturating_sub(bytes);
+    }
+
+    fn used(&self) -> u64 {
+        *self
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[derive(Debug)]
 pub struct Store {
     connection: Connection,
     root: PathBuf,
     limits: StoreLimits,
+    staging_budget: Arc<StagingBudget>,
+    max_concurrent_publications: u32,
+    lifecycle_notifier: LifecycleNotifier,
 }
 
 impl Store {
@@ -235,6 +315,15 @@ impl Store {
     pub fn open_with_limits(
         root: impl AsRef<Path>,
         limits: StoreLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_resource_limits(root, limits, u64::MAX, 4)
+    }
+
+    pub fn open_with_resource_limits(
+        root: impl AsRef<Path>,
+        limits: StoreLimits,
+        max_staging_bytes: u64,
+        max_concurrent_publications: u32,
     ) -> Result<Self, StoreError> {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root)?;
@@ -260,7 +349,30 @@ impl Store {
             connection,
             root,
             limits,
+            staging_budget: Arc::new(StagingBudget::new(max_staging_bytes)),
+            max_concurrent_publications,
+            lifecycle_notifier: LifecycleNotifier::default(),
         })
+    }
+
+    pub(crate) fn staging_bytes_in_use(&self) -> u64 {
+        self.staging_budget.used()
+    }
+
+    pub(crate) fn max_staging_bytes(&self) -> u64 {
+        self.staging_budget.limit
+    }
+
+    pub(crate) fn max_concurrent_publications(&self) -> u32 {
+        self.max_concurrent_publications
+    }
+
+    pub fn configure_lifecycle_notifier(&mut self, notifier: LifecycleNotifier) {
+        self.lifecycle_notifier = notifier;
+    }
+
+    pub(crate) fn lifecycle_notifier(&self) -> LifecycleNotifier {
+        self.lifecycle_notifier.clone()
     }
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {
@@ -505,6 +617,11 @@ pub enum StoreError {
         limit: u64,
         attempted: u64,
     },
+    StagingLimitExceeded {
+        limit: u64,
+        current: u64,
+        additional: u64,
+    },
     GlobalBlobBudgetExceeded {
         limit: u64,
         current: u64,
@@ -571,6 +688,14 @@ impl fmt::Display for StoreError {
                 formatter,
                 "upload byte limit exceeded: limit {limit}, attempted {attempted}"
             ),
+            Self::StagingLimitExceeded {
+                limit,
+                current,
+                additional,
+            } => write!(
+                formatter,
+                "shared staging byte limit exceeded: limit {limit}, current usage {current}, additional bytes {additional}"
+            ),
             Self::GlobalBlobBudgetExceeded {
                 limit,
                 current,
@@ -636,6 +761,7 @@ impl Error for StoreError {
             | Self::InvalidPageCursor
             | Self::InvalidStatusValue { .. }
             | Self::UploadLimitExceeded { .. }
+            | Self::StagingLimitExceeded { .. }
             | Self::GlobalBlobBudgetExceeded { .. }
             | Self::BlankPublicationTitle
             | Self::BlankPublicationCommentary

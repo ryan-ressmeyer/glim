@@ -43,6 +43,39 @@ fn markdown_and_html_assets_preserve_first_use_order_and_normalized_paths() {
 }
 
 #[test]
+fn html_ignores_iframe_sources_removed_by_the_renderer() {
+    let root = TempDir::new().unwrap();
+    fs::write(
+        root.path().join("entry.html"),
+        r#"<iframe src="missing.html"></iframe>"#,
+    )
+    .unwrap();
+
+    let assets = collect_support_assets(&root.path().join("entry.html")).unwrap();
+
+    assert!(assets.is_empty());
+}
+
+#[test]
+fn srcset_references_are_rejected_at_the_document_limit() {
+    let root = TempDir::new().unwrap();
+    let srcset = (0..513)
+        .map(|index| format!("https://example.test/{index}.png 1x"))
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::write(
+        root.path().join("entry.html"),
+        format!(r#"<img srcset="{srcset}">"#),
+    )
+    .unwrap();
+
+    assert_eq!(
+        collect_support_assets(&root.path().join("entry.html")).unwrap_err(),
+        "entry document exceeds the support-reference limit"
+    );
+}
+
+#[test]
 fn non_document_artifact_is_not_interpreted_as_utf8() {
     let root = TempDir::new().unwrap();
     let entry = root.path().join("plot.png");

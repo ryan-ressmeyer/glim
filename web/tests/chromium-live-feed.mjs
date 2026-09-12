@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -59,7 +59,7 @@ for (const name of [
   "GLIM_STORE_ROOT", "GLIM_BIND", "GLIM_ACCESS_MODE", "GLIM_TOKEN_FILE",
   "GLIM_PUBLIC_ORIGIN", "GLIM_TLS_CERTIFICATE", "GLIM_TLS_PRIVATE_KEY",
   "GLIM_TRUSTED_PROXY_IPS", "GLIM_MAX_UPLOAD_BYTES",
-  "GLIM_MAX_FINALIZED_BLOB_BYTES", "GLIM_LOG_LEVEL",
+  "GLIM_MAX_FINALIZED_BLOB_BYTES", "GLIM_MAX_STAGING_BYTES", "GLIM_MAX_CONCURRENT_PUBLICATIONS", "GLIM_LOG_LEVEL",
 ]) delete daemonEnvironment[name];
 const daemon = spawn(daemonBinary, ["daemon"], {
   env: daemonEnvironment,
@@ -325,7 +325,7 @@ const injected = document.createElement('script'); injected.src = target; docume
   if (pdfState.src !== pdfContentPath || pdfState.loading !== "lazy" || pdfState.title !== "PDF: large-document.pdf") throw new Error(`native PDF frame contract failed: ${JSON.stringify(pdfState)}`);
   if (pdfState.frameCount !== 1 || pdfState.canvasCount !== 0) throw new Error(`large PDF expanded into renderer-owned pages: ${JSON.stringify(pdfState)}`);
   if (Math.abs(pdfState.height - pdfState.viewportHeight * 0.7) > 2) throw new Error(`large PDF frame is not bounded to 70vh: ${JSON.stringify(pdfState)}`);
-  if (pdfState.open !== "Open PDF in new tab" || pdfState.download !== "large-document.pdf") throw new Error(`large PDF fallbacks are missing: ${JSON.stringify(pdfState)}`);
+  if (pdfState.open !== "Open" || pdfState.download !== "large-document.pdf") throw new Error(`large PDF fallbacks are missing: ${JSON.stringify(pdfState)}`);
   let nativePdfFrame;
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const frameTree = (await command("Page.getFrameTree")).frameTree;
@@ -405,12 +405,123 @@ const injected = document.createElement('script'); injected.src = target; docume
   await waitFor(`fetch('/api/v1/sessions/${sessionB}').then((response) => response.json()).then((value) => value.last_activity_at > ${beforeHeartbeat.last_activity_at})`, "visible-session heartbeat");
 
   await evaluate("window.confirm = () => true");
-  await evaluate(`${app}.querySelector('[data-close-session]').click()`);
+  await evaluate(`(() => { const root = ${app}; root.querySelector('[data-actions]').open = true; root.querySelector('[data-close-session]').click(); })()`);
   await waitFor(`${app}?.querySelector('.state')?.textContent === 'Session closed'`, "confirmed browser close");
-  await evaluate(`${app}.querySelector('[data-logout]').click()`);
+  await evaluate(`(() => { const root = ${app}; root.querySelector('[data-actions]').open = true; root.querySelector('[data-logout]').click(); })()`);
   await waitFor("location.pathname === '/login'", "browser logout");
   const postLogoutStatus = await evaluate("fetch('/api/v1/posts').then((response) => response.status)");
   if (postLogoutStatus !== 401) throw new Error(`logout retained API access: ${postLogoutStatus}`);
+
+  // Use another isolated session for inspection and browser-work budgets.
+  const publishInspection = async (title, files, predecessor = null) => {
+    const form = new FormData();
+    form.append("manifest", JSON.stringify({
+      integration_namespace: "pi", external_key: "inspection", project_label: "Visual neuroscience",
+      working_directory: "/tmp/glim-inspection/population-response", title,
+      commentary: "Compare the response curves and inspect the fit summary.\n\nBlue: control. Orange: adapted. These are illustrative test fixtures.",
+      predecessor_post_id: predecessor,
+      files: files.map((file, index) => ({ part: `file${index}`, filename: file.name, caption: file.caption ?? null, support_assets: [] })),
+    }));
+    files.forEach((file, index) => form.append(`file${index}`, new Blob([file.bytes]), file.name));
+    const response = await fetch(`${daemonOrigin}/api/v1/posts`, { method: "POST", headers: authenticatedHeaders(), body: form });
+    if (response.status !== 201) throw new Error(`inspection fixture failed: ${response.status} ${await response.text()}`);
+    return response.json();
+  };
+  const tableBytes = JSON.stringify({ values: Array.from({ length: 12_000 }, (_, index) => index) });
+  let inspection;
+  for (let index = 0; index < 30; index += 1) {
+    inspection = await publishInspection(`Fit summary ${index}`, [{ name: `fit-${index}.json`, bytes: tableBytes }]);
+  }
+  await command("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  await command("Page.navigate", { url: `${daemonOrigin}/login` });
+  await waitFor(`${app}?.querySelector('input[type=password]')`, "inspection login");
+  await evaluate(`(() => { const root=${app}; root.querySelector('input[type=password]').value='${accessToken}'; root.querySelector('form').requestSubmit(); })()`);
+  await waitFor("location.pathname === '/feed'", "inspection login complete");
+  await command("Page.navigate", { url: `${daemonOrigin}/sessions/${inspection.session.public_id}` });
+  await waitFor(`${app}?.querySelectorAll('article').length >= 20`, "long inspection feed");
+  await waitFor(`${app}?.querySelector('glim-artifact')?.shadowRoot?.querySelector('pre')`, "visible document render");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const loading = await evaluate(`(() => {
+    const artifacts=Array.from(${app}.querySelectorAll('glim-artifact'));
+    const requests=performance.getEntriesByType('resource').filter((entry)=>new URL(entry.name).pathname.endsWith('/files/0/content'));
+    return { artifacts:artifacts.length, rendered:artifacts.filter((artifact)=>artifact.shadowRoot.querySelector('pre')).length, downloaded:requests.length, decoded_bytes:requests.reduce((total,entry)=>total+entry.decodedBodySize,0) };
+  })()`);
+  if (loading.downloaded > 6 || loading.rendered > 6 || loading.downloaded === 0) {
+    throw new Error(`offscreen rendering budget exceeded: ${JSON.stringify(loading)}`);
+  }
+
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420"><rect width="1000" height="420" fill="#f8fafc"/><text x="70" y="45" font-family="sans-serif" font-size="24" fill="#182a45">Population response across contrast levels</text><path d="M90 85V345H935" fill="none" stroke="#94a3b8" stroke-width="2"/><path d="M95 331L260 294L425 225L590 151L755 113L920 102" fill="none" stroke="#477be3" stroke-width="5"/><path d="M95 335L260 318L425 281L590 225L755 188L920 174" fill="none" stroke="#e38c48" stroke-width="5"/></svg>';
+  const firstFigure = await publishInspection("Contrast response: initial fit", [{ name: "initial-response.svg", bytes: svg }]);
+  const revision = await publishInspection("Contrast response: revised fit", [
+    { name: "population-response.svg", caption: "Mean response by contrast. Illustrative fixture, not experimental results.", bytes: svg },
+    { name: "fit-summary.json", bytes: JSON.stringify({ model: "Naka-Rushton", conditions: ["control", "adapted"], retained_trials: 184, excluded_trials: 16 }) },
+  ], firstFigure.post.id);
+  await command("Page.navigate", { url: `${daemonOrigin}/sessions/${inspection.session.public_id}` });
+  const revisionRoot = `${app}.querySelector('#post-${revision.post.id} glim-artifact').shadowRoot`;
+  await waitFor(`${app}?.querySelector('#post-${revision.post.id} glim-artifact')?.shadowRoot?.querySelector('img')?.complete`, "revision image");
+  await waitFor(`${app}?.querySelector('nav')?.textContent.includes('Visual neuroscience')`, "project context");
+  const screenshotDirectory = process.env.GLIM_INSPECTION_SCREENSHOTS;
+  const screenshot = async (name) => {
+    if (!screenshotDirectory) return;
+    await mkdir(screenshotDirectory, { recursive: true });
+    const capture = await command("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
+    await writeFile(path.join(screenshotDirectory, name), Buffer.from(capture.data, "base64"));
+  };
+  await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
+  await screenshot("inspection-desktop.png");
+  await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+  await screenshot("inspection-dark.png");
+  await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }, { name: "prefers-reduced-motion", value: "reduce" }] });
+  await command("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await screenshot("inspection-mobile.png");
+  if (await evaluate("document.documentElement.scrollWidth > innerWidth")) throw new Error("mobile feed overflows horizontally");
+  await evaluate(`${revisionRoot}.querySelector('[data-zoom-preview]').click()`);
+  await waitFor(`${revisionRoot}.querySelector('dialog.zoom')?.open`, "native zoom modal");
+  const zoomContrast = await evaluate(`(() => {
+    const style = getComputedStyle(${revisionRoot}.querySelector('dialog.zoom button'));
+    const luminance = color => {
+      const channels = color.match(/[0-9.]+/g).slice(0,3).map(Number).map(value => { const c=value/255; return c<=.04045 ? c/12.92 : ((c+.055)/1.055)**2.4; });
+      return channels[0]*.2126 + channels[1]*.7152 + channels[2]*.0722;
+    };
+    const foreground=luminance(style.color), background=luminance(style.backgroundColor);
+    return (Math.max(foreground,background)+.05)/(Math.min(foreground,background)+.05);
+  })()`);
+  if (zoomContrast < 4.5) throw new Error(`zoom button text contrast is only ${zoomContrast.toFixed(2)}:1`);
+  for (let index = 0; index < 8; index += 1) {
+    await command("Input.dispatchKeyEvent", { type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+    await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+    const backgroundFocused = await evaluate(`(() => { let active=document.activeElement; while(active?.shadowRoot?.activeElement) active=active.shadowRoot.activeElement; return active !== document.body && !active?.closest('dialog.zoom'); })()`);
+    if (backgroundFocused) throw new Error("zoom keyboard focus escaped into background content");
+  }
+  await screenshot("inspection-zoom-mobile.png");
+  await command("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await waitFor(`!${revisionRoot}.querySelector('dialog.zoom')`, "zoom closes with Escape");
+  if (!await evaluate(`${revisionRoot}.activeElement?.matches('[data-zoom-preview]')`)) throw new Error("zoom failed to restore focus");
+  await evaluate(`${app}.querySelector('#post-${revision.post.id} [data-revision]').click()`);
+  await waitFor(`${app}.activeElement?.id === 'post-${firstFigure.post.id}' && scrollY > 0`, "revision scroll and focus");
+
+  const largeBytes = "x".repeat(16 * 1024 * 1024) + "FULL_DOCUMENT_END";
+  const columns = Array.from({ length: 105 }, (_, index) => `column${index}`).join(",");
+  const csv = `${columns}\n${Array.from({ length: 204 }, () => Array(105).fill("1").join(",")).join("\n")}\n\"unterminated`;
+  const documents = await publishInspection("Large-file and CSV inspection", [{ name: "large.txt", bytes: largeBytes }, { name: "wide.csv", bytes: csv }]);
+  await command("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  await command("Page.navigate", { url: `${daemonOrigin}/sessions/${inspection.session.public_id}` });
+  const largeArtifact = `${app}?.querySelector('#post-${documents.post.id} glim-artifact')?.shadowRoot`;
+  const csvArtifact = `${app}?.querySelector('#post-${documents.post.id} li:nth-child(2) glim-artifact')?.shadowRoot`;
+  await waitFor(`${largeArtifact}?.querySelector('[data-load-full]')`, "large document opt-in");
+  const largePath = `/api/v1/posts/${documents.post.id}/files/0/content`;
+  if (await evaluate(`performance.getEntriesByType('resource').some(entry=>new URL(entry.name).pathname==='${largePath}')`)) throw new Error("large document downloaded without consent");
+  await evaluate(`${app}.querySelector('#post-${documents.post.id} li:nth-child(2)').scrollIntoView()`);
+  await waitFor(`${csvArtifact}?.querySelector('table')`, "CSV inspection");
+  const csvState = await evaluate(`({text:${csvArtifact}.textContent,rows:${csvArtifact}.querySelectorAll('tr').length,columns:${csvArtifact}.querySelector('tr').children.length,fullscreen:!!${csvArtifact}.querySelector('[data-fullscreen]')})`);
+  if (!csvState.text.includes("first 200 rows") || !csvState.text.includes("first 100 of 105 columns") || !csvState.text.includes("CSV parse issues") || csvState.rows !== 200 || csvState.columns !== 100 || !csvState.fullscreen) throw new Error(`CSV disclosure failed: ${JSON.stringify(csvState)}`);
+  await evaluate(`${largeArtifact}.querySelector('[data-load-full]').click(); ${app}.querySelector('#post-${documents.post.id}').scrollIntoView()`);
+  await waitFor(`${largeArtifact}?.querySelector('pre')?.textContent.endsWith('FULL_DOCUMENT_END')`, "complete opted-in document", 300);
+  const purgeInspection = await fetch(`${daemonOrigin}/api/v1/sessions/${inspection.session.public_id}`, { method: "DELETE", headers: authenticatedHeaders() });
+  if (!purgeInspection.ok) throw new Error("inspection session purge failed");
+  await waitFor(`${app}?.querySelector('.state')?.textContent === 'Session closed'`, "inspection purge releases renderers");
+  console.log(`Chromium inspection: ${JSON.stringify(loading)}; 16 MiB opt-in, CSV disclosure, native modal, revision navigation, responsive screenshots passed`);
 
   if (runtimeExceptions.length > 0) throw new Error(`browser runtime exceptions: ${JSON.stringify(runtimeExceptions)}`);
   console.log(`Chromium live feed: ${pdfBytes.length}-byte, 200-page native PDF plus capability isolation, insertion, queueing, closure, heartbeat, and confirmed close passed`);

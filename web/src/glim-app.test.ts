@@ -137,6 +137,7 @@ describe("glim-app public route and element behavior", () => {
     TestIntersectionObserver.instances = [];
     FakeEventSource.instances = [];
     vi.stubGlobal("EventSource", FakeEventSource);
+    vi.stubGlobal("IntersectionObserver", undefined);
   });
 
   afterEach(() => {
@@ -342,7 +343,26 @@ describe("glim-app public route and element behavior", () => {
     preview?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     expect(imageArtifact.shadowRoot?.querySelector('[role="dialog"]')).toBeNull();
     preview?.click();
-    expect(imageArtifact.shadowRoot?.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+    const dialog = imageArtifact.shadowRoot?.querySelector<HTMLDialogElement>('[role="dialog"]');
+    expect(dialog?.tagName).toBe("DIALOG");
+    expect(dialog?.open).toBe(true);
+    expect(dialog?.textContent).toContain("Fit to window");
+    expect(dialog?.textContent).toContain("100%");
+    const zoomImage = dialog?.querySelector<HTMLImageElement>("img")!;
+    Object.defineProperties(zoomImage, {
+      naturalWidth: { configurable: true, value: 10_000 },
+      naturalHeight: { configurable: true, value: 1_000 },
+    });
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(390);
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(800);
+    zoomImage.dispatchEvent(new Event("load"));
+    expect(dialog?.querySelector("output")?.textContent).toBe("3%");
+    expect(zoomImage.style.width).toBe("326px");
+    expect(zoomImage.style.transform).toBe("");
+    expect(imageArtifact.shadowRoot?.querySelector("style")?.textContent).toMatch(/\.zoom-controls[^}]*flex-wrap: wrap/);
+    dialog?.querySelectorAll<HTMLButtonElement>("button")[2]?.click();
+    dialog?.querySelectorAll<HTMLButtonElement>("button")[4]?.click();
+    expect(dialog?.querySelector("output")?.textContent).toBe("125%");
     preview?.click();
     expect(imageArtifact.shadowRoot?.querySelectorAll('[role="dialog"]')).toHaveLength(1);
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
@@ -541,7 +561,7 @@ describe("glim-app public route and element behavior", () => {
     expect(artifact.shadowRoot?.querySelector("style")?.textContent).toMatch(/\.pdf-frame[^}]*height: 70vh/);
     expect(artifact.shadowRoot?.querySelectorAll("iframe, canvas")).toHaveLength(1);
     expect(TestIntersectionObserver.instances).toHaveLength(0);
-    expect(links.map((link) => link.textContent)).toEqual(["Open PDF in new tab", "Download paper.pdf"]);
+    expect(links.map((link) => link.textContent)).toEqual(["Open", "Download"]);
     expect(links[0].getAttribute("href")).toBe("/api/v1/posts/57/files/0/content");
     expect(links[0].target).toBe("_blank");
     expect(links[0].rel).toContain("noopener");
@@ -609,6 +629,7 @@ describe("glim-app public route and element behavior", () => {
     expect(iframe.getAttribute("sandbox")).not.toContain("allow-same-origin");
     expect(iframe.referrerPolicy).toBe("no-referrer");
     expect(iframe.title).toContain("page.html");
+    expect(artifact.shadowRoot?.querySelector("style")?.textContent).toMatch(/\.html-frame:fullscreen[^}]*height: 100vh/);
     expect(csp).toContain("script-src 'none'");
     expect(csp).toContain("connect-src 'none'");
     expect(csp).toContain(support);
@@ -713,7 +734,7 @@ describe("glim-app public route and element behavior", () => {
     }));
 
     const element = mount();
-    await rendered(element, "Open or download archive.bin");
+    await rendered(element, "archive.bin");
     const download = element.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector<HTMLAnchorElement>("[download]");
     expect(download?.download).toBe("archive.bin");
     expect(download?.href).toContain("/api/v1/posts/62/files/0/content");
@@ -739,6 +760,7 @@ describe("glim-app public route and element behavior", () => {
     expect(artifactSignal?.aborted).toBe(true);
 
     vi.unstubAllGlobals();
+    vi.stubGlobal("IntersectionObserver", undefined);
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "/api/v1/posts") return jsonResponse({ posts: [textPost], next_cursor: null });
@@ -748,7 +770,9 @@ describe("glim-app public route and element behavior", () => {
     }));
     const failed = mount();
     await rendered(failed, "Could not render large.txt");
-    expect(failed.shadowRoot?.querySelector("glim-artifact")?.shadowRoot?.querySelector<HTMLAnchorElement>("[download]")?.download).toBe("large.txt");
+    const failedArtifact = failed.shadowRoot?.querySelector("glim-artifact")?.shadowRoot;
+    expect(failedArtifact?.querySelector<HTMLAnchorElement>("[download]")?.download).toBe("large.txt");
+    expect(failedArtifact?.querySelector("[data-render-retry]")).not.toBeNull();
   });
 
   test.each([
@@ -853,11 +877,8 @@ describe("glim-app public route and element behavior", () => {
     const element = mount();
     await vi.waitFor(() => {
       const values = Array.from(element.shadowRoot?.querySelectorAll<HTMLElement>("[data-session]") ?? []);
-      expect(values.map((value) => value.textContent)).toEqual([
-        "Provenance unavailable",
-        "Provenance unavailable",
-        "Provenance unavailable",
-      ]);
+      expect(values.map((value) => value.textContent?.startsWith("Provenance unavailable"))).toEqual([true, true, true]);
+      expect(values.filter((value) => value.querySelector("[data-provenance-retry]"))).toHaveLength(1);
     });
   });
 
@@ -1220,5 +1241,435 @@ describe("glim-app public route and element behavior", () => {
     await vi.waitFor(() => expect(element.shadowRoot?.querySelectorAll("main")).toHaveLength(1));
     await rendered(element, "one copy");
     expect(element.shadowRoot?.querySelectorAll("article")).toHaveLength(1);
+  });
+
+  test("invalidates an in-flight reset and reconciles again after session closure", async () => {
+    let pageRequests = 0;
+    let resolveStale: ((response: Response) => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        pageRequests += 1;
+        if (pageRequests === 1) return Promise.resolve(jsonResponse({ posts: [post(2), post(1)], next_cursor: null }));
+        if (pageRequests === 2) return new Promise<Response>((resolve) => { resolveStale = resolve; });
+        return Promise.resolve(jsonResponse({ posts: [], next_cursor: null }));
+      }
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("reset", {});
+    await vi.waitFor(() => expect(resolveStale).toBeDefined());
+    FakeEventSource.instances[0].emit("session-closed", { project_id: 42, session_public_id: "2zY8Ab" });
+    resolveStale?.(jsonResponse({ posts: [post(2), post(1)], next_cursor: null }));
+
+    await rendered(app, "No posts in this feed");
+    await vi.waitFor(() => expect(pageRequests).toBe(3));
+    expect(app.shadowRoot?.querySelector("article")).toBeNull();
+  });
+
+  test("blocks stale pagination during an authoritative reset and restores pagination afterward", async () => {
+    let pageRequests = 0;
+    let resolveReset!: (response: Response) => void;
+    let resolveOlder: ((response: Response) => void) | undefined;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        pageRequests += 1;
+        if (pageRequests === 1) return Promise.resolve(jsonResponse({ posts: [post(6), post(5), post(4)], next_cursor: "stale" }));
+        return new Promise<Response>((resolve) => { resolveReset = resolve; });
+      }
+      if (url.endsWith("cursor=stale")) return new Promise<Response>((resolve) => { resolveOlder = resolve; });
+      if (url.endsWith("cursor=fresh")) return Promise.resolve(jsonResponse({ posts: [post(1)], next_cursor: null }));
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await rendered(app, "Post 4");
+    FakeEventSource.instances[0].emit("reset", {});
+    await vi.waitFor(() => expect(resolveReset).toBeDefined());
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-load-more]")?.click();
+    resolveReset(jsonResponse({ posts: [post(6), post(5), post(4)], next_cursor: "fresh" }));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector<HTMLButtonElement>("[data-load-more]")?.disabled).toBe(false));
+    resolveOlder?.(jsonResponse({ posts: [post(3), post(2)], next_cursor: null }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(Array.from(app.shadowRoot?.querySelectorAll("article") ?? []).map((article) => article.id))
+      .toEqual(["post-6", "post-5", "post-4"]);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("cursor=stale"))).toBe(false);
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-load-more]")?.click();
+    await rendered(app, "Post 1");
+  });
+
+  test("treats an initially missing session as closed without offering retry", async () => {
+    setPath("/sessions/2zY8Ab");
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ error: { code: "session_not_found" } }, 404)));
+    const app = mount();
+    await rendered(app, "Session closed");
+    expect(app.shadowRoot?.querySelector("[data-retry]")).toBeNull();
+    expect(FakeEventSource.instances[0].readyState).toBe(FakeEventSource.CLOSED);
+  });
+
+  test.each(["#post-1", "#invalid", ""])('clears a failed deep-link message when navigating to "%s"', async (hash) => {
+    setPath("/feed#post-999");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (url === "/api/v1/posts/999") return jsonResponse({}, 404);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 999 could not be loaded");
+    setPath(`/feed${hash}`);
+    window.dispatchEvent(new Event("hashchange"));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-target-state]")).toBeNull());
+    if (hash === "#post-1") expect(app.shadowRoot?.activeElement?.id).toBe("post-1");
+  });
+
+  test("treats a missing session during reset as closed", async () => {
+    setPath("/sessions/2zY8Ab");
+    let pageRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/2zY8Ab/posts") {
+        pageRequests += 1;
+        return pageRequests === 1
+          ? jsonResponse({ posts: [post(1)], next_cursor: null })
+          : jsonResponse({ error: { code: "session_not_found" } }, 404);
+      }
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("reset", {});
+
+    await rendered(app, "Session closed");
+    expect(FakeEventSource.instances[0].readyState).toBe(FakeEventSource.CLOSED);
+  });
+
+  test("an obsolete reconciliation cannot release a newer connection's guard", async () => {
+    let pageRequests = 0;
+    let resolveOld: ((response: Response) => void) | undefined;
+    let resolveNew: ((response: Response) => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        pageRequests += 1;
+        if (pageRequests === 2) return new Promise<Response>((resolve) => { resolveOld = resolve; });
+        if (pageRequests === 4) return new Promise<Response>((resolve) => { resolveNew = resolve; });
+        return Promise.resolve(jsonResponse({ posts: [post(1)], next_cursor: null }));
+      }
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("reset", {});
+    await vi.waitFor(() => expect(resolveOld).toBeDefined());
+    app.remove();
+    document.body.append(app);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[1].emit("reset", {});
+    await vi.waitFor(() => expect(resolveNew).toBeDefined());
+    resolveOld?.(jsonResponse({ posts: [post(1)], next_cursor: null }));
+    await Promise.resolve();
+    FakeEventSource.instances[1].emit("reset", {});
+
+    expect(pageRequests).toBe(4);
+    resolveNew?.(jsonResponse({ posts: [post(1)], next_cursor: null }));
+    await vi.waitFor(() => expect(pageRequests).toBe(5));
+  });
+
+  test("invalidates reconciliation when a live post arrives mid-flight", async () => {
+    let pageRequests = 0;
+    let resolveStale: ((response: Response) => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        pageRequests += 1;
+        if (pageRequests === 1) return Promise.resolve(jsonResponse({ posts: [post(1)], next_cursor: null }));
+        if (pageRequests === 2) return new Promise<Response>((resolve) => { resolveStale = resolve; });
+        return Promise.resolve(jsonResponse({ posts: [post(2), post(1)], next_cursor: null }));
+      }
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(0);
+    const app = mount();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("reset", {});
+    await vi.waitFor(() => expect(resolveStale).toBeDefined());
+    FakeEventSource.instances[0].emit("post", post(2), "2");
+    resolveStale?.(jsonResponse({ posts: [post(1)], next_cursor: null }));
+
+    await vi.waitFor(() => expect(pageRequests).toBe(3));
+    await rendered(app, "Post 2");
+    expect(app.shadowRoot?.querySelectorAll("#post-2")).toHaveLength(1);
+  });
+
+  test("reconciles deletions across previously loaded older pages", async () => {
+    let firstPageRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        firstPageRequests += 1;
+        return jsonResponse({ posts: [post(4), post(3)], next_cursor: firstPageRequests === 1 ? "older" : "refreshed" });
+      }
+      if (url === "/api/v1/posts?cursor=older") return jsonResponse({ posts: [post(2), post(1)], next_cursor: null });
+      if (url === "/api/v1/posts?cursor=refreshed") return jsonResponse({ posts: [post(2)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 4");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-load-more]")?.click();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("reset", {});
+
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("#post-1")).toBeNull());
+    expect(Array.from(app.shadowRoot?.querySelectorAll("article") ?? []).map((article) => article.id))
+      .toEqual(["post-4", "post-3", "post-2"]);
+  });
+
+  test("offers sign-in when reconciliation discovers expired authentication", async () => {
+    let pageRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        pageRequests += 1;
+        return pageRequests === 1
+          ? jsonResponse({ posts: [post(1)], next_cursor: null })
+          : jsonResponse({ error: { code: "authentication_required" } }, 401);
+      }
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("reset", {});
+
+    await rendered(app, "Authentication expired");
+    expect(app.shadowRoot?.querySelector('a[href="/login"]')?.textContent).toBe("Sign in");
+  });
+
+  test("allows a bounded retry after transient provenance failure", async () => {
+    let sessionRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") {
+        sessionRequests += 1;
+        return sessionRequests === 1 ? jsonResponse({}, 503) : jsonResponse(session);
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Provenance unavailable");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-provenance-retry]")?.click();
+
+    await rendered(app, "agent-session");
+    expect(sessionRequests).toBe(2);
+  });
+
+  test("bounds automatic provenance attempts while retaining manual retry", async () => {
+    let sessionRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") { sessionRequests += 1; return jsonResponse({}, 503); }
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(0);
+    const app = mount();
+    await vi.waitFor(() => expect(sessionRequests).toBe(1));
+    for (let id = 2; id <= 4; id += 1) {
+      FakeEventSource.instances[0].emit("post", post(id), String(id));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    await vi.waitFor(() => expect(sessionRequests).toBe(3));
+    FakeEventSource.instances[0].emit("post", post(5), "5");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sessionRequests).toBe(3);
+    const manual = app.shadowRoot?.querySelector<HTMLButtonElement>("[data-provenance-retry]");
+    expect(manual?.textContent).toBe("Retry manually");
+    manual?.click();
+    await vi.waitFor(() => expect(sessionRequests).toBe(4));
+  });
+
+  test("updates a focused new-content notice in place", async () => {
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(500);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 1");
+    FakeEventSource.instances[0].emit("post", post(2), "2");
+    const button = app.shadowRoot?.querySelector<HTMLButtonElement>("[data-new-posts]")!;
+    button.focus();
+    FakeEventSource.instances[0].emit("post", post(3), "3");
+
+    await rendered(app, "2 new posts");
+    expect(app.shadowRoot?.querySelector("[data-new-posts]")).toBe(button);
+    expect(app.shadowRoot?.activeElement).toBe(button);
+  });
+
+  test("resolves and focuses a scoped post deep link outside the loaded page", async () => {
+    setPath("/sessions/2zY8Ab#post-1");
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/2zY8Ab/posts") return jsonResponse({ posts: [post(2)], next_cursor: null });
+      if (url === "/api/v1/posts/1") return jsonResponse(post(1));
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+
+    await vi.waitFor(() => expect(app.shadowRoot?.activeElement?.id).toBe("post-1"));
+    expect(scrollIntoView).toHaveBeenCalled();
+    expect(app.shadowRoot?.querySelector("#post-1")).not.toBeNull();
+  });
+
+  test("services the latest deep link and ignores stale target responses", async () => {
+    setPath("/sessions/2zY8Ab#post-1");
+    let resolveOne: ((response: Response) => void) | undefined;
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/2zY8Ab/posts") return Promise.resolve(jsonResponse({ posts: [post(3)], next_cursor: null }));
+      if (url === "/api/v1/posts/1") return new Promise<Response>((resolve) => { resolveOne = resolve; });
+      if (url === "/api/v1/posts/2") return Promise.resolve(jsonResponse(post(2)));
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await vi.waitFor(() => expect(resolveOne).toBeDefined());
+    window.history.pushState({}, "", "/sessions/2zY8Ab#post-2");
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+
+    await vi.waitFor(() => expect(app.shadowRoot?.activeElement?.id).toBe("post-2"));
+    resolveOne?.(jsonResponse(post(1)));
+    await Promise.resolve();
+    expect(app.shadowRoot?.querySelector("#post-1")).toBeNull();
+    const focusCount = scrollIntoView.mock.calls.length;
+    expect(focusCount).toBeGreaterThan(0);
+    FakeEventSource.instances[0].emit("reset", {});
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull());
+    expect(scrollIntoView).toHaveBeenCalledTimes(focusCount);
+  });
+
+  test("does not fetch an oversized text document before informed opt-in", async () => {
+    const large = { ...file(0, "text", "large.txt"), blob: { hash: "hidden", byte_size: 16 * 1024 * 1024 + 1 } };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(1, { files: [large] })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url.endsWith("/content")) return new Response("full document");
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+
+    await rendered(app, "Load full document");
+    expect(composedText(app)).toContain("16.0 MiB");
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/content"))).toBe(false);
+    app.shadowRoot?.querySelector<HTMLElement>("glim-artifact")?.shadowRoot
+      ?.querySelector<HTMLButtonElement>("[data-load-full]")?.click();
+    await rendered(app, "full document");
+  });
+
+  test("defers offscreen text rendering and bounds concurrent document downloads", async () => {
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver as unknown as typeof IntersectionObserver);
+    const resolvers: Array<(response: Response) => void> = [];
+    const files = Array.from({ length: 5 }, (_, index) => file(index, "json", `${index}.json`));
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return Promise.resolve(jsonResponse({ posts: [post(1, { files })], next_cursor: null }));
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      if (url.endsWith("/content")) return new Promise<Response>((resolve) => resolvers.push(resolve));
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await vi.waitFor(() => expect(TestIntersectionObserver.instances).toHaveLength(5));
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/content"))).toHaveLength(0);
+    TestIntersectionObserver.instances.forEach((observer) => {
+      const [target] = observer.observed;
+      observer.trigger(target, true);
+    });
+    await vi.waitFor(() => expect(resolvers).toHaveLength(3));
+    const firstArtifact = app.shadowRoot?.querySelector<HTMLElement>("glim-artifact");
+    expect(firstArtifact?.shadowRoot?.querySelector(".render-placeholder")?.textContent).toContain("Loading");
+    resolvers[0](new Response("{}"));
+    await vi.waitFor(() => expect(resolvers).toHaveLength(4));
+    await vi.waitFor(() => expect(firstArtifact?.shadowRoot?.querySelector(".render-placeholder")).toBeNull());
+    app.remove();
+  });
+
+  test("shows live connection state and groups secondary session actions", async () => {
+    setPath("/sessions/2zY8Ab");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/posts")) return jsonResponse({ posts: [], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${String(input)}`);
+    }));
+    const app = mount();
+    await rendered(app, "Connecting");
+    expect(app.shadowRoot?.querySelector("details[data-actions]")).not.toBeNull();
+    FakeEventSource.instances[0].open();
+    await rendered(app, "Live");
+    FakeEventSource.instances[0].error();
+    await rendered(app, "Reconnecting");
+  });
+
+  test("discloses file type and size in a consistent artifact toolbar", async () => {
+    const textPost = post(1, { files: [{ ...file(0, "text", "notes.txt"), media_type: "text/plain" }] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [textPost], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url.endsWith("/content")) return new Response("notes");
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    vi.stubGlobal("navigator", { clipboard: undefined });
+    const app = mount();
+    await rendered(app, "notes");
+    const toolbar = app.shadowRoot?.querySelector<HTMLElement>("glim-artifact")?.shadowRoot?.querySelector("[data-artifact-toolbar]");
+    expect(toolbar?.textContent).toContain("text/plain");
+    expect(toolbar?.textContent).toContain("12 B");
+    const copy = toolbar?.querySelector<HTMLButtonElement>("[data-copy-link]");
+    expect(copy?.disabled).toBe(true);
+    expect(copy?.textContent).toBe("Copy unavailable");
+    expect(toolbar?.querySelector('a[target="_blank"]')).not.toBeNull();
+  });
+
+  test("discloses CSV column clipping and parse errors with pane controls", async () => {
+    const header = Array.from({ length: 105 }, (_, index) => `column-${index}`).join(",");
+    const csvPost = post(1, { files: [file(0, "csv", "wide.csv")] });
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: vi.fn(async () => undefined) });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [csvPost], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url.endsWith("/content")) return new Response(`${header}\n${Array.from({ length: 12 }, () => '"x"oops,y').join("\n")}`);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+
+    await rendered(app, "CSV parse issues");
+    const artifact = app.shadowRoot?.querySelector<HTMLElement>("glim-artifact")?.shadowRoot!;
+    expect(artifact.textContent).toContain("Showing the first 100 of 105 columns");
+    expect(artifact.querySelector(".table-wrap")?.getAttribute("style")).toContain("resize: vertical");
+    expect(artifact.querySelector("[data-fullscreen]")).not.toBeNull();
+    expect(artifact.querySelectorAll(".csv-errors li")).toHaveLength(10);
+    expect(artifact.textContent).toContain("Showing the first 10 of");
   });
 });

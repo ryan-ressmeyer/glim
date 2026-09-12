@@ -139,6 +139,7 @@ function daemonEnvironment(candidateBin) {
   for (const name of [
     "GLIM_STORE_ROOT", "GLIM_BIND", "GLIM_ACCESS_MODE", "GLIM_TOKEN_FILE", "GLIM_PUBLIC_ORIGIN",
     "GLIM_TLS_CERTIFICATE", "GLIM_TLS_PRIVATE_KEY", "GLIM_TRUSTED_PROXY_IPS", "GLIM_MAX_UPLOAD_BYTES",
+    "GLIM_MAX_STAGING_BYTES", "GLIM_MAX_CONCURRENT_PUBLICATIONS",
     "GLIM_MAX_FINALIZED_BLOB_BYTES", "GLIM_DAEMON_URL", "GLIM_LOG_LEVEL",
   ]) delete env[name];
   env.GLIM_CONFIG = configPath;
@@ -516,6 +517,12 @@ async function inspectBrowser(origin, projectId, primary, isolated) {
   assert.equal(isolation.isolated, 1);
   assert.equal(isolation.sessions.length, 2, "project feed leaked or merged session identity");
   await cdp.waitFor(`(() => { const post=${app}?.querySelector('#post-${primary.post_id}'); if(!post) return false; const artifacts=[...post.querySelectorAll('glim-artifact')]; return artifacts.length >= 9 && artifacts.every(a => a.shadowRoot && !a.shadowRoot.querySelector('.error')); })()`, "representative artifact renderers", 400);
+  const artifactCount = await cdp.evaluate(`${app}.querySelector('#post-${primary.post_id}').querySelectorAll('glim-artifact').length`);
+  for (let index = 0; index < artifactCount; index += 1) {
+    const artifact = `${app}.querySelector('#post-${primary.post_id}').querySelectorAll('glim-artifact')[${index}]`;
+    await cdp.evaluate(`${artifact}.scrollIntoView({ block: 'center', behavior: 'instant' })`);
+    await cdp.waitFor(`${artifact}.shadowRoot && !${artifact}.shadowRoot.querySelector('.render-placeholder, .pending, .error')`, `visible renderer ${index}`, 400);
+  }
   const state = await cdp.evaluate(`(() => { const post=${app}.querySelector('#post-${primary.post_id}'); return [...post.querySelectorAll('glim-artifact')].map(a => ({ renderer:a.data.file.renderer, filename:a.data.file.filename, html:a.shadowRoot.innerHTML, sandbox:a.shadowRoot.querySelector('iframe')?.getAttribute('sandbox') ?? null, media:a.shadowRoot.querySelector('audio,video')?.tagName ?? null })); })()`);
   const byRenderer = new Map(state.map((entry) => [entry.renderer, entry]));
   for (const renderer of rendererNames) assert(byRenderer.has(renderer), `browser lacks ${renderer}`);
@@ -528,11 +535,13 @@ async function inspectBrowser(origin, projectId, primary, isolated) {
   assert.equal(byRenderer.get("html").sandbox, "");
   assert.match(byRenderer.get("html").html, /Safe HTML/);
   assert.match(byRenderer.get("pdf").html, /iframe class="pdf-frame"[^>]+loading="lazy"/);
-  assert.match(byRenderer.get("pdf").html, /Open PDF in new tab/);
+  assert.match(byRenderer.get("pdf").html, /target="_blank"[^>]*>Open<\/a>/);
   assert.match(byRenderer.get("pdf").html, /download="document\.pdf"/);
   assert.equal(byRenderer.get("audio").media, "AUDIO");
   assert.equal(byRenderer.get("video").media, "VIDEO");
   for (const renderer of rendererNames) renderers.set(renderer, "PASS");
+  await cdp.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })");
+  await cdp.waitFor("scrollY <= 8", "top-of-feed revision readiness");
 }
 
 async function assertRevisionLive(revision, predecessor) {

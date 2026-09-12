@@ -126,8 +126,10 @@ export function createGlimExtension(dependencies: Dependencies) {
       const safe = bounded(text);
       if (ctx.hasUI) {
         ctx.ui.notify(safe, level);
+      } else if (ctx.mode === "print") {
+        console.error(safe);
       } else {
-        pi.sendMessage({ customType: COMMAND_MESSAGE, content: safe, display: true, details: { level } }, { deliverAs: "nextTurn" });
+        pi.sendMessage({ customType: COMMAND_MESSAGE, content: safe, display: true, details: { level } });
       }
     };
 

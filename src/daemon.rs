@@ -12,28 +12,34 @@ use serde_json::json;
 
 use crate::{
     logging::{LogLevel, daemon as log_daemon},
-    storage::{LifecycleReport, Store},
+    storage::{LifecycleNotifier, LifecycleReport, Store},
 };
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const DEFAULT_BIND: &str = "127.0.0.1:3030";
 pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 536_870_912;
+pub const DEFAULT_MAX_STAGING_BYTES: u64 = 2_147_483_648;
 pub const DEFAULT_MAX_FINALIZED_BLOB_BYTES: u64 = 21_474_836_480;
+pub const DEFAULT_MAX_CONCURRENT_PUBLICATIONS: u32 = 4;
 pub const RETENTION_SECONDS: u64 = 604_800;
 pub const CLEANUP_INTERVAL_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonLimits {
     pub max_upload_bytes: u64,
+    pub max_staging_bytes: u64,
     pub max_finalized_blob_bytes: u64,
+    pub max_concurrent_publications: u32,
 }
 
 impl Default for DaemonLimits {
     fn default() -> Self {
         Self {
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_staging_bytes: DEFAULT_MAX_STAGING_BYTES,
             max_finalized_blob_bytes: DEFAULT_MAX_FINALIZED_BLOB_BYTES,
+            max_concurrent_publications: DEFAULT_MAX_CONCURRENT_PUBLICATIONS,
         }
     }
 }
@@ -120,7 +126,22 @@ struct FileConfiguration {
 #[serde(deny_unknown_fields)]
 struct FileLimits {
     max_upload_bytes: u64,
+    max_staging_bytes: Option<u64>,
     max_finalized_blob_bytes: u64,
+    max_concurrent_publications: Option<u32>,
+}
+
+fn daemon_limits_from_file(limits: &FileLimits) -> DaemonLimits {
+    DaemonLimits {
+        max_upload_bytes: limits.max_upload_bytes,
+        max_staging_bytes: limits
+            .max_staging_bytes
+            .unwrap_or(DEFAULT_MAX_STAGING_BYTES),
+        max_finalized_blob_bytes: limits.max_finalized_blob_bytes,
+        max_concurrent_publications: limits
+            .max_concurrent_publications
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_PUBLICATIONS),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,10 +218,7 @@ fn resolve_daemon_configuration_base_values(
     let limits = file
         .as_ref()
         .and_then(|configuration| configuration.limits.as_ref())
-        .map_or_else(DaemonLimits::default, |limits| DaemonLimits {
-            max_upload_bytes: limits.max_upload_bytes,
-            max_finalized_blob_bytes: limits.max_finalized_blob_bytes,
-        });
+        .map_or_else(DaemonLimits::default, daemon_limits_from_file);
     let access = match file.and_then(|configuration| configuration.access) {
         None | Some(FileAccessConfiguration::Local) => AccessConfiguration::Local,
         Some(FileAccessConfiguration::Token {
@@ -286,6 +304,11 @@ fn validate_access_bind(bind: &SocketAddr, access: &AccessConfiguration) -> Resu
                 .parse::<axum::http::Uri>()
                 .map_err(|_| "token public origin is invalid".to_owned())?;
             let scheme = origin.scheme_str().unwrap_or_default();
+            if configuration.tls.is_some() != (scheme == "https") {
+                return Err(
+                    "token TLS configuration and public origin scheme must match".to_owned(),
+                );
+            }
             if !bind.ip().is_loopback() && scheme != "https" {
                 return Err("non-loopback token access requires an HTTPS public origin".to_owned());
             }
@@ -643,12 +666,37 @@ fn parse_limit_environment(name: &str, value: Option<&OsStr>) -> Result<Option<u
         .transpose()
 }
 
+fn parse_concurrency_environment(name: &str, value: Option<&OsStr>) -> Result<Option<u32>, String> {
+    value
+        .map(|value| {
+            let value = value
+                .to_str()
+                .ok_or_else(|| format!("{name} must be a decimal integer"))?;
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{name} must be a nonzero decimal integer"));
+            }
+            value
+                .parse::<u32>()
+                .map_err(|_| format!("{name} exceeds the supported integer range"))
+        })
+        .transpose()
+}
+
 fn validate_limits(limits: DaemonLimits) -> Result<(), String> {
-    if limits.max_upload_bytes == 0 || limits.max_finalized_blob_bytes == 0 {
-        return Err("daemon limits must be greater than zero".to_owned());
+    if limits.max_upload_bytes == 0
+        || limits.max_staging_bytes == 0
+        || limits.max_finalized_blob_bytes == 0
+    {
+        return Err("daemon byte limits must be greater than zero".to_owned());
+    }
+    if limits.max_upload_bytes > limits.max_staging_bytes {
+        return Err("max_upload_bytes must not exceed max_staging_bytes".to_owned());
     }
     if limits.max_upload_bytes > limits.max_finalized_blob_bytes {
         return Err("max_upload_bytes must not exceed max_finalized_blob_bytes".to_owned());
+    }
+    if !(1..=DEFAULT_MAX_CONCURRENT_PUBLICATIONS).contains(&limits.max_concurrent_publications) {
+        return Err("max_concurrent_publications must be between 1 and 4".to_owned());
     }
     Ok(())
 }
@@ -674,19 +722,18 @@ pub fn resolve_daemon_configuration_limit_values(
     }
     let from_file = file
         .and_then(|value| value.limits)
-        .map(|limits| DaemonLimits {
-            max_upload_bytes: limits.max_upload_bytes,
-            max_finalized_blob_bytes: limits.max_finalized_blob_bytes,
-        })
+        .map(|limits| daemon_limits_from_file(&limits))
         .unwrap_or_default();
     let limits = DaemonLimits {
         max_upload_bytes: parse_limit_environment("GLIM_MAX_UPLOAD_BYTES", upload_override)?
             .unwrap_or(from_file.max_upload_bytes),
+        max_staging_bytes: from_file.max_staging_bytes,
         max_finalized_blob_bytes: parse_limit_environment(
             "GLIM_MAX_FINALIZED_BLOB_BYTES",
             finalized_override,
         )?
         .unwrap_or(from_file.max_finalized_blob_bytes),
+        max_concurrent_publications: from_file.max_concurrent_publications,
     };
     validate_limits(limits)?;
     Ok(limits)
@@ -722,11 +769,21 @@ pub fn resolve_daemon_configuration() -> Result<DaemonConfiguration, String> {
             std::env::var_os("GLIM_MAX_UPLOAD_BYTES").as_deref(),
         )?
         .unwrap_or(configuration.limits.max_upload_bytes),
+        max_staging_bytes: parse_limit_environment(
+            "GLIM_MAX_STAGING_BYTES",
+            std::env::var_os("GLIM_MAX_STAGING_BYTES").as_deref(),
+        )?
+        .unwrap_or(configuration.limits.max_staging_bytes),
         max_finalized_blob_bytes: parse_limit_environment(
             "GLIM_MAX_FINALIZED_BLOB_BYTES",
             std::env::var_os("GLIM_MAX_FINALIZED_BLOB_BYTES").as_deref(),
         )?
         .unwrap_or(configuration.limits.max_finalized_blob_bytes),
+        max_concurrent_publications: parse_concurrency_environment(
+            "GLIM_MAX_CONCURRENT_PUBLICATIONS",
+            std::env::var_os("GLIM_MAX_CONCURRENT_PUBLICATIONS").as_deref(),
+        )?
+        .unwrap_or(configuration.limits.max_concurrent_publications),
     };
     validate_limits(configuration.limits)?;
     configuration.access = apply_access_environment_values(
@@ -860,12 +917,14 @@ pub fn open_store(root: StoreRoot, limits: DaemonLimits) -> Result<Store, String
             ));
         }
     }
-    Store::open_with_limits(
+    Store::open_with_resource_limits(
         &root.path,
         crate::storage::StoreLimits {
             max_upload_bytes: limits.max_upload_bytes,
             max_finalized_blob_bytes: limits.max_finalized_blob_bytes,
         },
+        limits.max_staging_bytes,
+        limits.max_concurrent_publications,
     )
     .map_err(|error| format!("could not open Glim store: {error}"))
 }
@@ -919,11 +978,39 @@ pub fn spawn_periodic_cleanup(root: StoreRoot, limits: DaemonLimits) {
     ));
 }
 
+pub fn spawn_periodic_cleanup_with_notifier(
+    root: StoreRoot,
+    limits: DaemonLimits,
+    notifier: LifecycleNotifier,
+) {
+    drop(spawn_periodic_cleanup_with_interval_and_notifier(
+        root,
+        limits,
+        std::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS),
+        notifier,
+    ));
+}
+
 #[doc(hidden)]
 pub fn spawn_periodic_cleanup_with_interval(
     root: StoreRoot,
     limits: DaemonLimits,
     cleanup_interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    spawn_periodic_cleanup_with_interval_and_notifier(
+        root,
+        limits,
+        cleanup_interval,
+        LifecycleNotifier::default(),
+    )
+}
+
+#[doc(hidden)]
+pub fn spawn_periodic_cleanup_with_interval_and_notifier(
+    root: StoreRoot,
+    limits: DaemonLimits,
+    cleanup_interval: std::time::Duration,
+    notifier: LifecycleNotifier,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(cleanup_interval);
@@ -939,7 +1026,10 @@ pub fn spawn_periodic_cleanup_with_interval(
             // Cleanup failures are intentionally retried on the next tick. Due-session and
             // queued-deletion counts remain visible through authenticated daemon status.
             match result {
-                Ok(Ok(report)) => log_cleanup_completed("periodic", report),
+                Ok(Ok(report)) => {
+                    notifier.notify_cleanup(report);
+                    log_cleanup_completed("periodic", report);
+                }
                 Ok(Err(_)) => log_daemon(
                     LogLevel::Error,
                     "cleanup_failed",
@@ -1171,6 +1261,8 @@ mod tests {
             br#"{"schema_version":1,"access":{"mode":"token","token_file":"/token","public_origin":"http://127.0.0.1:3030","tls_certificate":"/cert"}}"#.as_slice(),
             br#"{"schema_version":1,"access":{"mode":"token","token_file":"/token"}}"#.as_slice(),
             br#"{"schema_version":1,"access":{"mode":"token","token_file":"/token","public_origin":"https://glim.example/path"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"token","token_file":"/token","public_origin":"https://127.0.0.1:3030"}}"#.as_slice(),
+            br#"{"schema_version":1,"access":{"mode":"token","token_file":"/token","public_origin":"http://127.0.0.1:3030","tls_certificate":"/cert","tls_private_key":"/key"}}"#.as_slice(),
         ] {
             assert!(
                 resolve_daemon_configuration_values(

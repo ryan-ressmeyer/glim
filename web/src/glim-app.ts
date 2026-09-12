@@ -6,6 +6,10 @@ const API = "/api/v1";
 const CSV_MAX_ROWS = 200;
 const CSV_MAX_CELLS_PER_ROW = 100;
 const PROVENANCE_CONCURRENCY = 4;
+const PROVENANCE_RETRY_LIMIT = 3;
+const DOCUMENT_RENDER_LIMIT = 16 * 1024 * 1024;
+const DOCUMENT_CONCURRENCY = 3;
+const VIEWPORT_RENDER_MARGIN = "800px 0px";
 const MEDIA_RELEASE_MARGIN = "1000px 0px";
 // Live delivery is lossy beyond these bounds; reconciliation replaces accumulation.
 const LIVE_PENDING_LIMIT = 100;
@@ -35,6 +39,7 @@ interface PostFile {
   caption: string | null;
   media_type: string;
   renderer: Renderer;
+  blob: { byte_size: number };
   support_assets: SupportAsset[];
 }
 
@@ -334,12 +339,16 @@ const RENDERERS = new Set<unknown>([
 function isPostFile(value: unknown): value is PostFile {
   if (!value || typeof value !== "object") return false;
   const file = value as Record<string, unknown>;
+  const blob = file.blob as Record<string, unknown> | undefined;
   return Number.isSafeInteger(file.position)
     && (file.position as number) >= 0
     && typeof file.filename === "string"
     && (file.caption === null || typeof file.caption === "string")
     && typeof file.media_type === "string"
     && RENDERERS.has(file.renderer)
+    && !!blob
+    && Number.isSafeInteger(blob.byte_size)
+    && (blob.byte_size as number) >= 0
     && Array.isArray(file.support_assets)
     && file.support_assets.every((asset) => !!asset && typeof asset === "object" && typeof (asset as Record<string, unknown>).relative_path === "string");
 }
@@ -421,32 +430,80 @@ function isSession(value: unknown): value is Session {
     && isDateSeconds(candidate.last_activity_at);
 }
 
+const DEFERRED_RENDERERS = new Set<Renderer>(["markdown", "text", "json", "csv", "html"]);
+let documentLoads = 0;
+const documentWaiters: Array<() => void> = [];
+
+async function acquireDocumentLoad(signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return false;
+  if (documentLoads < DOCUMENT_CONCURRENCY) {
+    documentLoads += 1;
+    return true;
+  }
+  return new Promise<boolean>((resolve) => {
+    const start = () => {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted) resolve(false);
+      else { documentLoads += 1; resolve(true); }
+    };
+    const abort = () => {
+      const index = documentWaiters.indexOf(start);
+      if (index >= 0) documentWaiters.splice(index, 1);
+      resolve(false);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    documentWaiters.push(start);
+  });
+}
+
+function releaseDocumentLoad() {
+  documentLoads -= 1;
+  documentWaiters.shift()?.();
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
 const artifactStyles = `
   :host { display: block; }
+  * { box-sizing: border-box; }
   img.preview { cursor: zoom-in; display: block; height: auto; max-width: 100%; width: auto; }
   button, a { font: inherit; }
+  button { background: var(--surface, #fff); border: 1px solid var(--border, #cbd5e1); border-radius: .4rem; color: inherit; cursor: pointer; padding: .38rem .65rem; }
+  a { color: var(--link, #2456a6); text-underline-offset: .15em; }
+  button:focus-visible, a:focus-visible, [tabindex]:focus-visible { outline: 3px solid var(--focus, #2563eb); outline-offset: 2px; }
   .preview-control { background: transparent; border: 0; cursor: zoom-in; max-width: 100%; padding: 0; }
-  .pane { border: 1px solid #cbd5e1; max-height: 75vh; min-height: 10rem; overflow: auto; resize: vertical; }
-  .pane:fullscreen { background: white; max-height: none; padding: 1rem; }
+  .pane { background: var(--surface, #fff); border: 1px solid var(--border, #cbd5e1); max-height: 75vh; min-height: 10rem; overflow: auto; resize: vertical; }
+  .pane:fullscreen, .table-wrap:fullscreen { background: var(--surface, #fff); color: inherit; max-height: none; padding: 1rem; }
   pre { margin: 0; min-width: max-content; padding: 1rem; white-space: pre; }
-  .table-wrap { border: 1px solid #cbd5e1; max-height: 60vh; overflow: auto; }
+  .table-wrap { border: 1px solid var(--border, #cbd5e1); max-height: 60vh; min-height: 10rem; overflow: auto; }
   table { border-collapse: collapse; }
-  th, td { border: 1px solid #cbd5e1; padding: .35rem .55rem; text-align: left; white-space: pre-wrap; }
-  .toolbar { display: flex; justify-content: flex-end; margin-bottom: .35rem; }
-  .pending, .error { border: 1px dashed #94a3b8; padding: 1rem; }
-  .zoom { background: rgb(15 23 42 / 94%); inset: 0; overflow: auto; padding: 4rem; position: fixed; z-index: 1000; }
-  .zoom img { display: block; max-width: none; transform-origin: top left; }
-  .zoom-controls { left: 1rem; position: fixed; top: 1rem; }
-  .zoom-controls button { margin-right: .5rem; }
+  th, td { border: 1px solid var(--border, #cbd5e1); padding: .35rem .55rem; text-align: left; white-space: pre-wrap; }
+  .toolbar { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; justify-content: flex-end; margin-bottom: .5rem; }
+  .artifact-toolbar { color: var(--muted, #526077); font-size: .85rem; justify-content: flex-start; }
+  .artifact-toolbar .spacer { flex: 1; }
+  .artifact-toolbar a { margin: 0; }
+  .pending, .error { background: var(--surface-subtle, #f8fafc); border: 1px dashed var(--border, #94a3b8); min-height: 6rem; padding: 1rem; }
+  .render-placeholder { align-items: center; display: flex; }
+  .zoom { background: #0f172a; border: 0; color: #f8fafc; height: 100%; margin: 0; max-height: none; max-width: none; overflow: auto; padding: 4.5rem 2rem 2rem; width: 100%; }
+  .zoom::backdrop { background: rgb(15 23 42 / 92%); }
+  .zoom img { display: block; height: auto; max-width: none; width: auto; }
+  .zoom-controls { align-items: center; background: #0f172a; display: flex; flex-wrap: wrap; gap: .5rem; left: 1rem; max-width: calc(100% - 2rem); padding: .5rem; position: fixed; right: 1rem; top: .5rem; z-index: 1; }
+  .zoom-controls button { background: #202c43; border-color: #64748b; color: #f8fafc; }
+  .zoom-output { min-width: 4rem; text-align: center; }
   .markdown { overflow-wrap: anywhere; }
   .media { display: block; max-height: 75vh; max-width: 100%; width: auto; }
   audio.media { width: min(100%, 40rem); }
-  .pdf-frame { border: 1px solid #cbd5e1; display: block; height: 70vh; min-height: 18rem; width: 100%; }
-  .pdf-links { display: flex; flex-wrap: wrap; gap: 1rem; }
-  .html-frame { border: 1px solid #cbd5e1; display: block; height: min(60vh, 42rem); max-height: 75vh; min-height: 18rem; width: 100%; }
-  .script-warning { background: #fff7ed; border: 1px solid #fdba74; margin-bottom: .75rem; padding: .75rem; }
-  .script-warning button { display: block; margin-top: .5rem; }
+  .pdf-frame { border: 1px solid var(--border, #cbd5e1); display: block; height: 70vh; min-height: 18rem; width: 100%; }
+  .html-frame { border: 1px solid var(--border, #cbd5e1); display: block; height: min(60vh, 42rem); max-height: 75vh; min-height: 18rem; width: 100%; }
+  .html-frame:fullscreen { border: 0; height: 100vh; max-height: none; width: 100vw; }
+  .script-warning { background: #fff7ed; border: 1px solid #fdba74; color: #431407; margin-bottom: .75rem; padding: .75rem; }
+  .script-warning button { background: #fff7ed; color: #431407; display: block; margin-top: .5rem; }
   .download { display: inline-block; margin-top: .5rem; }
+  @media (max-width: 30rem) { .zoom { padding-top: 8rem; } }
 `;
 
 class GlimArtifact extends HTMLElement {
@@ -454,26 +511,55 @@ class GlimArtifact extends HTMLElement {
   private controller?: AbortController;
   private closeZoom?: (restoreFocus?: boolean) => void;
   private mediaObserver?: IntersectionObserver;
+  private viewportObserver?: IntersectionObserver;
   private renderGeneration = 0;
+  private loadFullDocument = false;
 
   connectedCallback() {
     const generation = ++this.renderGeneration;
     this.controller?.abort();
+    this.viewportObserver?.disconnect();
+    this.viewportObserver = undefined;
     this.releaseRichResources();
     this.destroyHtmlContexts();
     this.removeImageSources();
     this.closeZoom?.(false);
     const root = this.root();
     root.replaceChildren(root.querySelector("style")!);
-    this.render(generation).catch((error: unknown) => {
-      if (this.isRenderActive(generation)
-        && !(error instanceof DOMException && error.name === "AbortError")) this.renderFailure();
-    });
+    const data = this.data;
+    if (!data) return;
+    root.append(this.renderArtifactToolbar(data));
+    if (DEFERRED_RENDERERS.has(data.file.renderer) && data.file.blob.byte_size > DOCUMENT_RENDER_LIMIT && !this.loadFullDocument) {
+      this.renderLargeDocument(root, data, generation);
+      return;
+    }
+    const begin = (pending?: HTMLElement) => {
+      this.viewportObserver?.disconnect();
+      this.viewportObserver = undefined;
+      if (pending) pending.textContent = `Loading ${data.file.filename}`;
+      this.render(generation).then(() => pending?.remove()).catch((error: unknown) => {
+        pending?.remove();
+        if (this.isRenderActive(generation)
+          && !(error instanceof DOMException && error.name === "AbortError")) this.renderFailure();
+      });
+    };
+    if (DEFERRED_RENDERERS.has(data.file.renderer) && typeof IntersectionObserver !== "undefined") {
+      const pending = element("div", `Waiting to render ${data.file.filename}`);
+      pending.className = "pending render-placeholder";
+      root.append(pending);
+      this.viewportObserver = new IntersectionObserver((entries) => {
+        if (!entries.some((entry) => entry.isIntersecting) || !this.isRenderActive(generation)) return;
+        begin(pending);
+      }, { rootMargin: VIEWPORT_RENDER_MARGIN });
+      this.viewportObserver.observe(this);
+    } else begin();
   }
 
   disconnectedCallback() {
     this.renderGeneration += 1;
     this.controller?.abort();
+    this.viewportObserver?.disconnect();
+    this.viewportObserver = undefined;
     this.releaseRichResources();
     this.destroyHtmlContexts();
     this.removeImageSources();
@@ -492,6 +578,34 @@ class GlimArtifact extends HTMLElement {
 
   private isRenderActive(generation: number, signal?: AbortSignal): boolean {
     return generation === this.renderGeneration && this.isConnected && !signal?.aborted;
+  }
+
+  private renderArtifactToolbar(data: ArtifactData): HTMLElement {
+    const toolbar = element("div");
+    toolbar.className = "toolbar artifact-toolbar";
+    toolbar.dataset.artifactToolbar = "";
+    toolbar.append(element("span", `${data.file.media_type || "Unknown type"} · ${formatBytes(data.file.blob.byte_size)}`));
+    const spacer = element("span");
+    spacer.className = "spacer";
+    const open = element("a", "Open");
+    open.href = artifactUrl(data.postId, data.file.position);
+    open.target = "_blank";
+    open.rel = "noopener";
+    const download = downloadLink(data, "Download");
+    const copy = element("button", "Copy link");
+    copy.type = "button";
+    copy.dataset.copyLink = "";
+    if (!navigator.clipboard?.writeText) {
+      copy.textContent = "Copy unavailable";
+      copy.disabled = true;
+    } else {
+      copy.addEventListener("click", () => {
+        const url = new URL(artifactUrl(data.postId, data.file.position), window.location.href).href;
+        void navigator.clipboard.writeText(url).then(() => { copy.textContent = "Copied"; }, () => { copy.textContent = "Copy failed"; });
+      });
+    }
+    toolbar.append(spacer, open, download, copy);
+    return toolbar;
   }
 
   private async fetchHtmlSupportPrefix(data: ArtifactData, generation: number): Promise<string | null> {
@@ -519,12 +633,39 @@ class GlimArtifact extends HTMLElement {
   private async fetchText(data: ArtifactData, generation: number): Promise<string | null> {
     const controller = new AbortController();
     this.controller = controller;
-    const response = await fetch(artifactUrl(data.postId, data.file.position), { signal: controller.signal });
-    if (!this.isRenderActive(generation, controller.signal)) return null;
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const text = await response.text();
-    if (!this.isRenderActive(generation, controller.signal)) return null;
-    return text;
+    if (!await acquireDocumentLoad(controller.signal)) return null;
+    try {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        controller.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+      });
+      const response = await Promise.race([
+        fetch(artifactUrl(data.postId, data.file.position), { signal: controller.signal }),
+        aborted,
+      ]);
+      if (!this.isRenderActive(generation, controller.signal)) return null;
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const text = await Promise.race([response.text(), aborted]);
+      if (!this.isRenderActive(generation, controller.signal)) return null;
+      return text;
+    } finally {
+      releaseDocumentLoad();
+    }
+  }
+
+  private renderLargeDocument(root: ShadowRoot, data: ArtifactData, generation: number) {
+    const pending = element("div");
+    pending.className = "pending large-document";
+    pending.append(element("p", `${data.file.filename} is ${formatBytes(data.file.blob.byte_size)}, above the 16 MiB automatic rendering limit.`));
+    const load = element("button", "Load full document");
+    load.type = "button";
+    load.dataset.loadFull = "";
+    load.addEventListener("click", () => {
+      if (!this.isRenderActive(generation)) return;
+      this.loadFullDocument = true;
+      this.connectedCallback();
+    });
+    pending.append(load, downloadLink(data, `Download ${data.file.filename}`));
+    root.append(pending);
   }
 
   private async render(generation: number) {
@@ -547,21 +688,32 @@ class GlimArtifact extends HTMLElement {
         const text = await this.fetchText(data, generation);
         if (text === null || !this.isRenderActive(generation)) return;
         const container = element("div");
-        container.className = "markdown";
+        container.className = "markdown pane";
+        container.tabIndex = 0;
         container.innerHTML = safeMarkdown(text, supportResolver(data.postId, data.file));
-        root.append(container);
+        const toolbar = element("div");
+        toolbar.className = "toolbar";
+        const fullscreen = element("button", "Fullscreen");
+        fullscreen.type = "button";
+        fullscreen.dataset.fullscreen = "";
+        fullscreen.addEventListener("click", () => {
+          const request = container.requestFullscreen?.();
+          request?.catch(() => undefined);
+        });
+        toolbar.append(fullscreen);
+        root.append(toolbar, container);
         return;
       }
       case "text": {
         const text = await this.fetchText(data, generation);
-        if (text !== null && this.isRenderActive(generation)) this.renderPane(root, text, data);
+        if (text !== null && this.isRenderActive(generation)) this.renderPane(root, text);
         return;
       }
       case "json": {
         const text = await this.fetchText(data, generation);
         if (text === null || !this.isRenderActive(generation)) return;
         try {
-          this.renderPane(root, JSON.stringify(JSON.parse(text), null, 2), data);
+          this.renderPane(root, JSON.stringify(JSON.parse(text), null, 2));
         } catch {
           const error = element("div", "Persisted JSON is malformed");
           error.className = "error";
@@ -585,7 +737,6 @@ class GlimArtifact extends HTMLElement {
         return;
       }
       case "download":
-        root.append(downloadLink(data));
         return;
       default: {
         const pending = element("div", `Renderer pending for ${data.file.filename}`);
@@ -633,14 +784,7 @@ class GlimArtifact extends HTMLElement {
     frame.loading = "lazy";
     frame.title = `PDF: ${data.file.filename}`;
 
-    const links = element("div");
-    links.className = "pdf-links";
-    const open = element("a", "Open PDF in new tab");
-    open.href = url;
-    open.target = "_blank";
-    open.rel = "noopener";
-    links.append(open, downloadLink(data, `Download ${data.file.filename}`));
-    root.append(frame, links);
+    root.append(frame);
   }
 
   private releaseRichResources() {
@@ -672,12 +816,10 @@ class GlimArtifact extends HTMLElement {
   private openZoom(data: ArtifactData, trigger: HTMLElement) {
     this.closeZoom?.(false);
     const root = this.root();
-    const dialog = element("div");
+    const dialog = element("dialog");
     dialog.className = "zoom";
     dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
     dialog.setAttribute("aria-label", `Full-resolution view of ${data.file.filename}`);
-    dialog.tabIndex = -1;
     const image = element("img");
     image.src = artifactUrl(data.postId, data.file.position);
     image.alt = data.file.caption ?? data.file.filename;
@@ -685,35 +827,60 @@ class GlimArtifact extends HTMLElement {
     const controls = element("div");
     controls.className = "zoom-controls";
     const close = element("button", "Close");
+    const fit = element("button", "Fit to window");
+    const actual = element("button", "100%");
     const zoomIn = element("button", "Zoom in");
     const zoomOut = element("button", "Zoom out");
-    const applyScale = () => { image.style.transform = `scale(${scale})`; };
+    const output = element("output", "100%");
+    output.className = "zoom-output";
+    output.setAttribute("aria-live", "polite");
+    const applyScale = () => {
+      if (image.naturalWidth) image.style.width = `${Math.round(image.naturalWidth * scale)}px`;
+      const percentage = scale * 100;
+      output.value = `${percentage < 1 ? percentage.toFixed(1) : Math.round(percentage)}%`;
+    };
+    const fitImage = () => {
+      if (!image.naturalWidth || !image.naturalHeight) return;
+      const width = (dialog.clientWidth || window.innerWidth) - 64;
+      const height = (dialog.clientHeight || window.innerHeight) - controls.getBoundingClientRect().height - 48;
+      scale = Math.min(1, Math.max(1, width) / image.naturalWidth, Math.max(1, height) / image.naturalHeight);
+      applyScale();
+    };
+    fit.addEventListener("click", fitImage);
+    actual.addEventListener("click", () => { scale = 1; applyScale(); });
     zoomIn.addEventListener("click", () => { scale = Math.min(4, scale + 0.25); applyScale(); });
-    zoomOut.addEventListener("click", () => { scale = Math.max(0.25, scale - 0.25); applyScale(); });
+    zoomOut.addEventListener("click", () => { scale = Math.max(0.01, scale - 0.25); applyScale(); });
+    image.addEventListener("load", fitImage, { once: true });
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") this.closeZoom?.();
-      if (event.key === "+") zoomIn.click();
-      if (event.key === "-") zoomOut.click();
+      else if (event.key === "+" || event.key === "=") zoomIn.click();
+      else if (event.key === "-") zoomOut.click();
+      else if (event.key === "0") actual.click();
+      else if (event.key.toLowerCase() === "f") fit.click();
     };
     this.closeZoom = (restoreFocus = true) => {
       window.removeEventListener("keydown", onKey);
       image.removeAttribute("src");
+      if (dialog.open) dialog.close();
       dialog.remove();
       this.closeZoom = undefined;
       if (restoreFocus && trigger.isConnected) trigger.focus();
     };
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); this.closeZoom?.(); });
     close.addEventListener("click", () => this.closeZoom?.());
-    controls.append(close, zoomIn, zoomOut);
+    controls.append(close, fit, actual, zoomOut, zoomIn, output);
     dialog.append(controls, image);
     root.append(dialog);
     window.addEventListener("keydown", onKey);
-    dialog.focus();
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
   }
 
-  private renderPane(root: ShadowRoot, text: string, data: ArtifactData) {
+  private renderPane(root: ShadowRoot, text: string) {
     const toolbar = element("div");
     toolbar.className = "toolbar";
     const fullscreen = element("button", "Fullscreen");
+    fullscreen.type = "button";
     fullscreen.dataset.fullscreen = "";
     const pane = element("div");
     pane.className = "pane";
@@ -727,15 +894,26 @@ class GlimArtifact extends HTMLElement {
     const pre = element("pre");
     pre.textContent = text;
     pane.append(pre);
-    root.append(toolbar, pane, downloadLink(data));
+    root.append(toolbar, pane);
   }
 
   private renderCsv(root: ShadowRoot, text: string, data: ArtifactData) {
     const parsed = Papa.parse<string[]>(text, { skipEmptyLines: false });
     const rows = parsed.data.slice(0, CSV_MAX_ROWS);
+    const toolbar = element("div");
+    toolbar.className = "toolbar";
+    const fullscreen = element("button", "Fullscreen");
+    fullscreen.type = "button";
+    fullscreen.dataset.fullscreen = "";
     const wrapper = element("div");
     wrapper.className = "table-wrap";
+    wrapper.style.resize = "vertical";
     wrapper.tabIndex = 0;
+    fullscreen.addEventListener("click", () => {
+      const request = wrapper.requestFullscreen?.();
+      request?.catch(() => undefined);
+    });
+    toolbar.append(fullscreen);
     const table = element("table");
     table.setAttribute("aria-label", data.file.filename);
     rows.forEach((row, rowIndex) => {
@@ -748,9 +926,24 @@ class GlimArtifact extends HTMLElement {
       table.append(tr);
     });
     wrapper.append(table);
-    root.append(wrapper);
-    if (parsed.data.length > CSV_MAX_ROWS) root.append(element("p", `Showing the first ${CSV_MAX_ROWS} rows`));
-    root.append(downloadLink(data));
+    root.append(toolbar, wrapper);
+    if (parsed.data.length > CSV_MAX_ROWS) root.append(element("p", `Showing the first ${CSV_MAX_ROWS} rows of ${parsed.data.length}`));
+    const widest = parsed.data.reduce((maximum, row) => Math.max(maximum, row.length), 0);
+    if (widest > CSV_MAX_CELLS_PER_ROW) {
+      root.append(element("p", `Showing the first ${CSV_MAX_CELLS_PER_ROW} of ${widest} columns; wider cells remain available in the download.`));
+    }
+    if (parsed.errors.length > 0) {
+      const issues = element("section");
+      issues.className = "csv-errors";
+      issues.append(element("h3", `CSV parse issues (${parsed.errors.length})`));
+      const list = element("ul");
+      for (const error of parsed.errors.slice(0, 10)) {
+        list.append(element("li", `${error.code}${error.row === undefined ? "" : ` at row ${error.row + 1}`}: ${error.message}`));
+      }
+      issues.append(list);
+      if (parsed.errors.length > 10) issues.append(element("p", `Showing the first 10 of ${parsed.errors.length} parse issues.`));
+      root.append(issues);
+    }
   }
 
   private renderHtml(
@@ -763,8 +956,10 @@ class GlimArtifact extends HTMLElement {
     const warning = element("div");
     warning.className = "script-warning";
     warning.dataset.scriptWarning = "";
-    warning.append(document.createTextNode(
-      "Scripts are disabled. Enabling scripts lets this document navigate its own frame and thereby make a network request.",
+    const scriptStatus = element("strong", "Scripts disabled");
+    scriptStatus.dataset.scriptStatus = "";
+    warning.append(scriptStatus, document.createTextNode(
+      ". Enabling scripts lets this document navigate its own frame and thereby make a network request.",
     ));
     const enable = element("button", "Enable sandboxed scripts");
     enable.type = "button";
@@ -791,11 +986,25 @@ class GlimArtifact extends HTMLElement {
         frame.removeAttribute("src");
         frame.replaceWith(replacement);
         frame = replacement;
+        scriptStatus.textContent = "Sandboxed scripts enabled";
       }).catch(() => {
-        if (this.isRenderActive(generation)) enable.disabled = false;
+        if (this.isRenderActive(generation)) {
+          enable.disabled = false;
+          scriptStatus.textContent = "Scripts remain disabled because enabling them failed";
+        }
       });
     });
-    root.append(warning, frame, downloadLink(data));
+    const toolbar = element("div");
+    toolbar.className = "toolbar";
+    const fullscreen = element("button", "Fullscreen document");
+    fullscreen.type = "button";
+    fullscreen.dataset.fullscreen = "";
+    fullscreen.addEventListener("click", () => {
+      const request = frame.requestFullscreen?.();
+      request?.catch(() => undefined);
+    });
+    toolbar.append(fullscreen);
+    root.append(warning, toolbar, frame);
   }
 
   private destroyHtmlContexts() {
@@ -817,34 +1026,66 @@ class GlimArtifact extends HTMLElement {
     this.destroyHtmlContexts();
     const root = this.root();
     root.replaceChildren(root.querySelector("style")!);
+    root.append(this.renderArtifactToolbar(data));
     const error = element("div", `Could not render ${data.file.filename}`);
     error.className = "error";
-    error.append(downloadLink(data));
+    const retry = element("button", "Retry rendering");
+    retry.type = "button";
+    retry.dataset.renderRetry = "";
+    retry.addEventListener("click", () => this.connectedCallback());
+    error.append(element("br"), retry, document.createTextNode(" "), downloadLink(data));
     root.append(error);
   }
 }
 
 const appStyles = `
-  :host { color: #172033; display: block; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+  :host {
+    --background: #f6f7f9; --surface: #fff; --surface-subtle: #f1f3f6; --border: #d9dee7;
+    --text: #172033; --muted: #5b6679; --link: #2456a6; --focus: #2563eb; --danger: #9f1239;
+    background: var(--background); color: var(--text); color-scheme: light dark; display: block;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; min-height: 100vh;
+  }
   * { box-sizing: border-box; }
-  main { margin: 0 auto; max-width: 72rem; padding: 1.5rem; }
-  header { align-items: baseline; display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between; margin-bottom: 2rem; }
-  h1 { font-size: clamp(1.7rem, 4vw, 2.6rem); margin: 0; }
-  nav { display: flex; flex-wrap: wrap; gap: .8rem; }
-  a { color: #2456a6; }
-  article { background: #fff; border: 1px solid #d8dee9; border-radius: .75rem; margin-bottom: 2rem; padding: clamp(1rem, 3vw, 2rem); }
-  article h2 { margin-top: 0; }
+  main { margin: 0 auto; max-width: 76rem; padding: 1rem 1.5rem 3rem; }
+  header { align-items: center; display: grid; gap: .5rem 1rem; grid-template-columns: auto 1fr auto; margin-bottom: 1.25rem; }
+  h1 { font-size: 1.35rem; letter-spacing: -.02em; margin: 0; }
+  h2 { font-size: clamp(1.25rem, 3vw, 1.65rem); line-height: 1.2; }
+  nav { align-items: center; display: flex; flex-wrap: wrap; gap: .75rem; }
+  a { color: var(--link); text-underline-offset: .15em; }
+  button, summary { font: inherit; }
+  button { background: var(--surface); border: 1px solid var(--border); border-radius: .4rem; color: var(--text); cursor: pointer; padding: .42rem .7rem; }
+  button:hover { background: var(--surface-subtle); }
+  button:disabled { cursor: default; opacity: .55; }
+  a:focus-visible, button:focus-visible, summary:focus-visible, article:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+  article { background: var(--surface); border: 1px solid var(--border); border-radius: .65rem; margin-bottom: 1rem; padding: clamp(1rem, 3vw, 1.75rem); scroll-margin-top: 1rem; }
+  article h2 { margin: 0 0 .35rem; }
   .commentary { line-height: 1.6; overflow-wrap: anywhere; }
-  .meta, .provenance { color: #526077; font-size: .9rem; }
-  .files { list-style: none; margin: 1.5rem 0 0; padding: 0; }
-  .files > li { border-top: 1px solid #e5e9f0; padding: 1.25rem 0; }
-  .filename { font-weight: 650; }
+  .meta, .provenance, .connection-status { color: var(--muted); font-size: .875rem; }
+  .connection-status::before { content: "●"; font-size: .65em; margin-right: .4rem; }
+  .provenance { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: .7rem; }
+  .provenance summary { cursor: pointer; width: max-content; }
+  .provenance p { margin: .5rem 0 0; overflow-wrap: anywhere; white-space: pre-line; }
+  .files { list-style: none; margin: 1.25rem 0 0; padding: 0; }
+  .files > li { border-top: 1px solid var(--border); padding: 1rem 0; }
+  .filename { font-weight: 650; overflow-wrap: anywhere; }
   .caption { margin: .35rem 0 .75rem; white-space: pre-wrap; }
-  .state { border: 1px solid #d8dee9; border-radius: .75rem; padding: 2rem; text-align: center; }
-  .live-notice { background: #e8f0ff; padding: .75rem; position: fixed; right: 1rem; top: .5rem; z-index: 2; }
-  .danger { color: #9f1239; }
-  button { font: inherit; padding: .45rem .8rem; }
-  @media (max-width: 36rem) { main { padding: .75rem; } article { border-radius: 0; margin-inline: -.75rem; } }
+  .state { background: var(--surface); border: 1px solid var(--border); border-radius: .65rem; padding: 2rem; text-align: center; }
+  .live-notice { background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; box-shadow: 0 .3rem 1.25rem rgb(15 23 42 / 15%); padding: .5rem; position: fixed; right: 1rem; top: .75rem; z-index: 2; }
+  nav details { position: relative; }
+  nav summary { cursor: pointer; }
+  .action-menu { background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; display: grid; gap: .4rem; padding: .5rem; position: absolute; right: 0; top: calc(100% + .4rem); width: max-content; z-index: 3; }
+  .danger { color: var(--danger); }
+  .target-state { background: var(--surface-subtle); border: 1px solid var(--border); padding: .75rem; }
+  @media (prefers-color-scheme: dark) {
+    :host { --background: #101318; --surface: #171b22; --surface-subtle: #202631; --border: #343c49; --text: #edf1f7; --muted: #aab4c3; --link: #91b9ff; --focus: #70a5ff; --danger: #fda4af; }
+  }
+  @media (max-width: 42rem) {
+    main { padding: .75rem; }
+    header { grid-template-columns: 1fr auto; }
+    nav { grid-column: 1 / -1; }
+    article { border-radius: 0; margin-inline: -.75rem; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
 `;
 
 class GlimApp extends HTMLElement {
@@ -854,12 +1095,14 @@ class GlimApp extends HTMLElement {
   private nextCursor: string | null = null;
   private sessions = new Map<string, Session>();
   private provenanceUnavailable = new Set<string>();
+  private provenanceAttempts = new Map<string, number>();
   private provenanceInFlight = new Map<string, Promise<Session | null>>();
   private provenanceActive = 0;
   private provenanceWaiters: Array<() => void> = [];
   private controller?: AbortController;
   private main?: HTMLElement;
   private navigation?: HTMLElement;
+  private connectionStatus?: HTMLElement;
   private connectionGeneration = 0;
   private events?: EventSource;
   private pendingPosts = new Map<number, Post>();
@@ -867,10 +1110,23 @@ class GlimApp extends HTMLElement {
   private heartbeatController?: AbortController;
   private heartbeatInFlight = false;
   private streamOpen = false;
+  private reconciliationVersion = 0;
+  private reconciliationController?: AbortController;
   private reconciling = false;
   private needsLiveReconciliation = false;
   private closed = false;
+  private authenticationExpired = false;
+  private targetRequestVersion = 0;
+  private targetController?: AbortController;
+  private focusedHash: string | null = null;
   private readonly visibilityHandler = () => this.syncHeartbeat();
+  private readonly hashHandler = () => {
+    this.focusedHash = null;
+    this.targetRequestVersion += 1;
+    this.targetController?.abort();
+    this.targetController = undefined;
+    void this.resolveLocationPost(this.connectionGeneration);
+  };
 
   constructor() {
     super();
@@ -883,6 +1139,10 @@ class GlimApp extends HTMLElement {
   connectedCallback() {
     const generation = ++this.connectionGeneration;
     this.controller?.abort();
+    this.targetRequestVersion += 1;
+    this.targetController?.abort();
+    this.targetController = undefined;
+    this.focusedHash = null;
     this.route = routeFromLocation(window.location.pathname);
     this.renderShell();
     if (this.route.kind === "invalid") {
@@ -894,6 +1154,8 @@ class GlimApp extends HTMLElement {
       return;
     }
     this.closed = false;
+    this.authenticationExpired = false;
+    window.addEventListener("hashchange", this.hashHandler);
     this.startLive(generation);
     this.load(false, generation).catch(() => undefined);
   }
@@ -901,6 +1163,10 @@ class GlimApp extends HTMLElement {
   disconnectedCallback() {
     this.connectionGeneration += 1;
     this.controller?.abort();
+    this.targetRequestVersion += 1;
+    this.targetController?.abort();
+    this.targetController = undefined;
+    window.removeEventListener("hashchange", this.hashHandler);
     this.stopLive();
   }
 
@@ -910,19 +1176,26 @@ class GlimApp extends HTMLElement {
 
   private startLive(generation: number) {
     const endpoint = eventEndpoint(this.route);
-    if (!endpoint || typeof EventSource === "undefined") return;
+    if (!endpoint || typeof EventSource === "undefined") {
+      this.setConnectionStatus("Updates unavailable");
+      return;
+    }
+    this.setConnectionStatus("Connecting");
     this.events?.close();
     const source = new EventSource(endpoint);
     this.events = source;
     source.onopen = () => {
       if (!this.isAppActive(generation) || this.events !== source) return;
       this.streamOpen = true;
+      this.setConnectionStatus("Live");
       this.syncHeartbeat();
     };
     source.onerror = () => {
       if (!this.isAppActive(generation) || this.events !== source) return;
       this.streamOpen = false;
+      this.setConnectionStatus("Reconnecting");
       this.stopHeartbeat();
+      this.reconcileLatest(generation);
     };
     source.addEventListener("post", ((event: MessageEvent<string>) => {
       if (!this.isAppActive(generation) || this.events !== source || this.closed) return;
@@ -968,12 +1241,23 @@ class GlimApp extends HTMLElement {
     this.streamOpen = false;
     document.removeEventListener("visibilitychange", this.visibilityHandler);
     this.stopHeartbeat();
+    this.reconciliationVersion += 1;
+    this.reconciliationController?.abort();
+    this.reconciliationController = undefined;
+    this.reconciling = false;
+    this.targetRequestVersion += 1;
+    this.targetController?.abort();
+    this.targetController = undefined;
     this.pendingPosts.clear();
     this.needsLiveReconciliation = false;
   }
 
   private receivePost(value: Post, generation: number) {
     if (this.needsLiveReconciliation || this.postIds.has(value.id) || this.pendingPosts.has(value.id)) return;
+    if (this.reconciling) {
+      this.reconcileLatest(generation);
+      return;
+    }
     if (window.scrollY <= 8) {
       this.postIds.add(value.id);
       this.posts.push(value);
@@ -993,7 +1277,13 @@ class GlimApp extends HTMLElement {
   }
 
   private showLiveNotice(message: string, reset: boolean) {
-    this.main?.querySelector("[data-live-notice]")?.remove();
+    const existing = this.main?.querySelector<HTMLElement>("[data-live-notice]");
+    const existingButton = existing?.querySelector<HTMLButtonElement>("[data-new-posts]");
+    if (existing && existingButton) {
+      existingButton.textContent = message;
+      existingButton.dataset.reset = String(reset);
+      return;
+    }
     const notice = element("div");
     notice.className = "live-notice";
     notice.dataset.liveNotice = "";
@@ -1001,8 +1291,9 @@ class GlimApp extends HTMLElement {
     const button = element("button", message);
     button.type = "button";
     button.dataset.newPosts = "";
+    button.dataset.reset = String(reset);
     button.addEventListener("click", () => {
-      if (reset) {
+      if (button.dataset.reset === "true") {
         this.reconcileLatest(this.connectionGeneration);
         return;
       }
@@ -1014,7 +1305,10 @@ class GlimApp extends HTMLElement {
       this.posts.sort(comparePosts);
       notice.remove();
       this.renderFeed();
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      window.scrollTo({
+        top: 0,
+        behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+      });
       const newest = this.main?.querySelector<HTMLElement>("article");
       if (newest) { newest.tabIndex = -1; newest.focus(); }
     });
@@ -1024,39 +1318,98 @@ class GlimApp extends HTMLElement {
   }
 
   private reconcileLatest(generation: number) {
-    if (this.reconciling || !this.isAppActive(generation)) return;
+    if (!this.isAppActive(generation)) return;
     const endpoint = pageEndpoint(this.route);
     if (!endpoint) return;
+    this.reconciliationVersion += 1;
+    this.reconciliationController?.abort();
+    this.targetRequestVersion += 1;
+    this.targetController?.abort();
+    this.targetController = undefined;
+    this.controller?.abort();
+    this.controller = new AbortController();
+    if (this.reconciling) return;
+    void this.runReconciliation(generation, endpoint);
+  }
+
+  private async runReconciliation(generation: number, endpoint: string) {
+    const version = this.reconciliationVersion;
+    const controller = new AbortController();
+    this.reconciliationController = controller;
     this.reconciling = true;
-    void fetch(endpoint).then(async (response) => {
-      if (response.status === 404 && this.route.kind === "project" && this.isAppActive(generation)) {
-        this.posts = [];
-        this.postIds.clear();
-        this.pendingPosts.clear();
-        this.renderFeed();
-        return null;
-      }
-      if (!response.ok) throw new Error("reconciliation failed");
-      const payload: unknown = await response.json();
-      if (payload === null) return;
-      if (!this.isAppActive(generation) || !isPage(payload)) throw new Error("malformed reconciliation");
-      const latestIds = new Set(payload.posts.map((post) => post.id));
-      const oldestLatest = payload.posts.at(-1);
-      if (oldestLatest) this.posts = this.posts.filter((post) => comparePosts(post, oldestLatest) >= 0 || latestIds.has(post.id));
-      else this.posts = [];
-      for (const post of payload.posts) {
-        const index = this.posts.findIndex((candidate) => candidate.id === post.id);
-        if (index >= 0) this.posts[index] = post;
-        else this.posts.push(post);
-      }
-      this.posts.sort(comparePosts);
+    this.main?.querySelectorAll<HTMLButtonElement>("[data-load-more], [data-pagination-retry]")
+      .forEach((button) => { button.disabled = true; });
+    const oldestLoaded = this.posts.at(-1);
+    const reconciled: Post[] = [];
+    const reconciledIds = new Set<number>();
+    const visitedCursors = new Set<string>();
+    let cursor: string | null = null;
+    try {
+      do {
+        if (cursor) {
+          if (visitedCursors.has(cursor)) throw new Error("reconciliation cursor made no progress");
+          visitedCursors.add(cursor);
+        }
+        const url = cursor ? `${endpoint}?${new URLSearchParams({ cursor })}` : endpoint;
+        const response = await fetch(url, { signal: controller.signal });
+        if (!this.isAppActive(generation, controller.signal) || version !== this.reconciliationVersion) return;
+        if (response.status === 401) {
+          this.showAuthenticationExpired();
+          return;
+        }
+        if (response.status === 404 && this.route.kind === "session") {
+          this.showClosed();
+          return;
+        }
+        if (response.status === 404 && this.route.kind === "project") {
+          this.posts = [];
+          this.postIds.clear();
+          this.pendingPosts.clear();
+          this.nextCursor = null;
+          this.renderFeed();
+          return;
+        }
+        if (!response.ok) throw new Error("reconciliation failed");
+        const payload: unknown = await response.json();
+        if (!this.isAppActive(generation, controller.signal) || version !== this.reconciliationVersion) return;
+        if (!isPage(payload)) throw new Error("malformed reconciliation");
+        for (const post of payload.posts) {
+          if (!reconciledIds.has(post.id)) {
+            reconciledIds.add(post.id);
+            reconciled.push(post);
+          }
+        }
+        cursor = payload.next_cursor;
+        const fetchedOldest = reconciled.at(-1);
+        if (!cursor || !oldestLoaded || (fetchedOldest && comparePosts(fetchedOldest, oldestLoaded) >= 0)) break;
+      } while (cursor);
+      if (!this.isAppActive(generation, controller.signal) || version !== this.reconciliationVersion) return;
+      this.posts = reconciled.sort(comparePosts);
       this.postIds = new Set(this.posts.map((post) => post.id));
+      this.nextCursor = cursor;
       this.pendingPosts.clear();
       this.needsLiveReconciliation = false;
       this.main?.querySelector("[data-live-notice]")?.remove();
       this.renderFeed();
-    }).catch(() => this.showLiveNotice("Live updates need a retry", true))
-      .finally(() => { this.reconciling = false; });
+      void this.loadProvenance(generation, this.controller?.signal ?? controller.signal);
+      void this.resolveLocationPost(generation);
+    } catch (error) {
+      if (this.isAppActive(generation) && version === this.reconciliationVersion
+        && !(error instanceof DOMException && error.name === "AbortError")) {
+        this.showLiveNotice("Live updates need a retry", true);
+      }
+    } finally {
+      if (this.reconciliationController !== controller) return;
+      this.reconciliationController = undefined;
+      this.reconciling = false;
+      this.main?.querySelectorAll<HTMLButtonElement>("[data-load-more], [data-pagination-retry]")
+        .forEach((button) => { button.disabled = false; });
+      if (this.isAppActive(generation) && !this.authenticationExpired && !this.closed
+        && version !== this.reconciliationVersion) {
+        const currentEndpoint = pageEndpoint(this.route);
+        if (currentEndpoint) void this.runReconciliation(generation, currentEndpoint);
+      }
+    }
   }
 
   private syncHeartbeat() {
@@ -1096,6 +1449,7 @@ class GlimApp extends HTMLElement {
   private showClosed() {
     this.closed = true;
     this.stopLive();
+    this.setConnectionStatus("Closed");
     this.controller?.abort();
     this.showState("Session closed");
   }
@@ -1155,14 +1509,23 @@ class GlimApp extends HTMLElement {
     const main = element("main");
     const header = element("header");
     const heading = element("h1", "Glimse");
+    const status = element("span", "Offline");
+    status.className = "connection-status";
+    status.dataset.connectionStatus = "";
+    status.setAttribute("role", "status");
     const navigation = element("nav");
     navigation.setAttribute("aria-label", "Feed scopes");
-    header.append(heading, navigation);
+    header.append(heading, status, navigation);
     main.append(header);
     this.shadowRoot!.append(main);
     this.main = main;
     this.navigation = navigation;
+    this.connectionStatus = status;
     this.renderNavigation();
+  }
+
+  private setConnectionStatus(value: string) {
+    if (this.connectionStatus) this.connectionStatus.textContent = value;
   }
 
   private renderNavigation(context?: Session) {
@@ -1186,19 +1549,26 @@ class GlimApp extends HTMLElement {
     const globalLink = element("a", "Global feed");
     globalLink.href = "/feed";
     this.navigation.append(globalLink);
+    const actions = element("details");
+    actions.dataset.actions = "";
+    actions.append(element("summary", "Actions"));
+    const actionMenu = element("div");
+    actionMenu.className = "action-menu";
     const logout = element("button", "Log out");
     logout.type = "button";
     logout.dataset.logout = "";
     logout.addEventListener("click", () => { void this.logout(logout); });
-    this.navigation.append(logout);
+    actionMenu.append(logout);
     if (this.route.kind === "session") {
       const close = element("button", "Close session");
       close.type = "button";
       close.className = "danger";
       close.dataset.closeSession = "";
       close.addEventListener("click", () => { void this.closeSession(close); });
-      this.navigation.append(close);
+      actionMenu.append(close);
     }
+    actions.append(actionMenu);
+    this.navigation.append(actions);
   }
 
   private async logout(button: HTMLButtonElement) {
@@ -1235,7 +1605,9 @@ class GlimApp extends HTMLElement {
   }
 
   private showAuthenticationExpired() {
+    this.authenticationExpired = true;
     this.stopLive();
+    this.setConnectionStatus("Sign-in required");
     this.showState("Authentication expired");
     const state = this.main?.querySelector<HTMLElement>(".state");
     if (!state) return;
@@ -1260,7 +1632,7 @@ class GlimApp extends HTMLElement {
 
   private async load(more: boolean, generation = this.connectionGeneration) {
     const endpoint = pageEndpoint(this.route);
-    if (!endpoint || !this.isAppActive(generation)) return;
+    if (!endpoint || !this.isAppActive(generation) || this.reconciling) return;
     if (!more) {
       this.controller?.abort();
       this.controller = new AbortController();
@@ -1269,6 +1641,7 @@ class GlimApp extends HTMLElement {
       this.nextCursor = null;
       this.sessions.clear();
       this.provenanceUnavailable.clear();
+      this.provenanceAttempts.clear();
       this.provenanceInFlight.clear();
       this.showState("Loading feed");
     }
@@ -1289,6 +1662,10 @@ class GlimApp extends HTMLElement {
     if (!response.ok) {
       if (response.status === 401) {
         this.showAuthenticationExpired();
+        return;
+      }
+      if (response.status === 404 && this.route.kind === "session") {
+        this.showClosed();
         return;
       }
       this.handleLoadError(more, `Could not load older posts (HTTP ${response.status})`, `Feed request failed (HTTP ${response.status})`);
@@ -1322,6 +1699,7 @@ class GlimApp extends HTMLElement {
       this.nextCursor = null;
       this.showPaginationState("Pagination stopped because the daemon made no progress", false);
     }
+    await this.resolveLocationPost(generation);
     await this.loadProvenance(generation, controller.signal);
   }
 
@@ -1346,6 +1724,99 @@ class GlimApp extends HTMLElement {
     feed.append(state);
   }
 
+  private async resolveLocationPost(generation: number) {
+    if (!this.isAppActive(generation)) return;
+    this.main?.querySelector("[data-target-state]")?.remove();
+    const requestedHash = window.location.hash;
+    const match = requestedHash.match(/^#post-([1-9][0-9]*)$/);
+    if (!match) return;
+    const postId = Number(match[1]);
+    if (!isPositiveSafeInteger(postId)) return;
+    const existing = this.main?.querySelector<HTMLElement>(`#post-${postId}`);
+    if (existing) {
+      if (this.focusedHash !== requestedHash) {
+        this.focusedHash = requestedHash;
+        this.focusPost(existing);
+      }
+      return;
+    }
+    if (this.targetController && !this.targetController.signal.aborted) return;
+    const requestVersion = this.targetRequestVersion;
+    const controller = new AbortController();
+    this.targetController = controller;
+    const active = () => this.isAppActive(generation, controller.signal)
+      && !this.closed
+      && requestVersion === this.targetRequestVersion
+      && window.location.hash === requestedHash;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      controller.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    });
+    try {
+      const response = await Promise.race([fetch(`${API}/posts/${postId}`, { signal: controller.signal }), aborted]);
+      if (!active()) return;
+      if (response.status === 401) { this.showAuthenticationExpired(); return; }
+      if (!response.ok) throw new Error(`Post ${postId} could not be loaded (HTTP ${response.status})`);
+      const payload: unknown = await Promise.race([response.json(), aborted]);
+      if (!active() || !isPost(payload) || payload.id !== postId) {
+        if (active()) throw new Error(`Post ${postId} returned malformed data`);
+        return;
+      }
+      if (this.route.kind === "session" && payload.session_public_id !== this.route.publicId) {
+        throw new Error(`Post ${postId} is outside this session`);
+      }
+      if (this.route.kind === "project") {
+        const sessionResponse = await Promise.race([
+          fetch(`${API}/sessions/${payload.session_public_id}`, { signal: controller.signal }),
+          aborted,
+        ]);
+        if (!active()) return;
+        if (sessionResponse.status === 401) { this.showAuthenticationExpired(); return; }
+        const sessionPayload: unknown = sessionResponse.ok
+          ? await Promise.race([sessionResponse.json(), aborted])
+          : null;
+        if (!active()) return;
+        if (!isSession(sessionPayload) || sessionPayload.id !== payload.session_id
+          || sessionPayload.public_id !== payload.session_public_id
+          || sessionPayload.project.id !== this.route.projectId) {
+          throw new Error(`Post ${postId} is outside this project`);
+        }
+        this.sessions.set(sessionPayload.public_id, sessionPayload);
+      }
+      if (!active()) return;
+      if (!this.postIds.has(payload.id)) {
+        this.posts.push(payload);
+        this.posts.sort(comparePosts);
+        this.postIds.add(payload.id);
+        this.renderFeed();
+      }
+      void this.loadProvenance(generation, this.controller?.signal ?? controller.signal);
+      const target = this.main?.querySelector<HTMLElement>(`#post-${postId}`);
+      if (target && active() && this.focusedHash !== requestedHash) {
+        this.focusedHash = requestedHash;
+        this.focusPost(target);
+      }
+    } catch (error) {
+      if (!active() || (error instanceof DOMException && error.name === "AbortError")) return;
+      const status = element("p", error instanceof Error ? error.message : `Post ${postId} could not be loaded`);
+      status.dataset.targetState = "";
+      status.className = "target-state";
+      status.setAttribute("role", "status");
+      this.main?.querySelector(".feed")?.prepend(status);
+      if (!status.isConnected) this.main?.append(status);
+    } finally {
+      if (this.targetController === controller) this.targetController = undefined;
+    }
+  }
+
+  private focusPost(article: HTMLElement) {
+    article.tabIndex = -1;
+    article.scrollIntoView({
+      block: "start",
+      behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    });
+    article.focus({ preventScroll: true });
+  }
+
   private renderFeed() {
     this.main?.querySelectorAll(".state").forEach((value) => value.remove());
     if (this.posts.length === 0) {
@@ -1362,17 +1833,26 @@ class GlimApp extends HTMLElement {
     }
     feed.querySelectorAll("[data-load-more], [data-pagination-state]").forEach((value) => value.remove());
     const expectedIds = new Set(this.posts.map((post) => `post-${post.id}`));
-    feed.querySelectorAll<HTMLElement>("article").forEach((article) => {
-      if (!expectedIds.has(article.id)) article.remove();
-    });
-    for (const [index, post] of this.posts.entries()) {
-      const article = feed.querySelector<HTMLElement>(`#post-${post.id}`) ?? this.renderPost(post);
-      const current = feed.querySelectorAll("article")[index];
-      if (current !== article) feed.insertBefore(article, current ?? null);
+    const existing = Array.from(feed.querySelectorAll<HTMLElement>("article"));
+    const byId = new Map(existing.map((article) => [article.id, article]));
+    for (const article of existing) {
+      if (!expectedIds.has(article.id)) {
+        article.remove();
+        byId.delete(article.id);
+      }
+    }
+    let current = feed.firstElementChild;
+    for (const post of this.posts) {
+      const article = byId.get(`post-${post.id}`) ?? this.renderPost(post);
+      while (current && current.tagName !== "ARTICLE") current = current.nextElementSibling;
+      if (current === article) current = current.nextElementSibling;
+      else feed.insertBefore(article, current);
+      byId.set(article.id, article);
     }
     if (this.nextCursor) {
       const button = element("button", "Load older posts");
       button.dataset.loadMore = "";
+      button.disabled = this.reconciling;
       button.addEventListener("click", () => {
         button.disabled = true;
         this.load(true).catch(() => undefined);
@@ -1398,18 +1878,24 @@ class GlimApp extends HTMLElement {
       const revision = element("a", `Revises post ${post.predecessor_post_id}`);
       revision.href = `#post-${post.predecessor_post_id}`;
       revision.dataset.revision = "";
+      revision.addEventListener("click", (event) => {
+        event.preventDefault();
+        window.history.pushState({}, "", revision.href);
+        this.hashHandler();
+      });
       article.append(revision);
     }
+    const provenanceDetails = element("details");
+    provenanceDetails.className = "provenance";
+    provenanceDetails.append(element("summary", "Provenance"));
     const provenance = element("p", "Loading provenance");
-    provenance.className = "provenance";
     provenance.dataset.session = post.session_public_id;
-    article.append(provenance);
+    provenanceDetails.append(provenance);
     if (post.git) {
       const gitParts = [post.git.root, post.git.branch, post.git.commit].filter((value): value is string => !!value);
-      const git = element("p", gitParts.join(" · "));
-      git.className = "provenance";
-      article.append(git);
+      provenanceDetails.append(element("p", gitParts.join(" · ")));
     }
+    article.append(provenanceDetails);
     const files = element("ol");
     files.className = "files";
     for (const postFile of post.files) {
@@ -1447,10 +1933,11 @@ class GlimApp extends HTMLElement {
     }
   }
 
-  private lookupSession(id: string, generation: number, signal: AbortSignal): Promise<Session | null> {
+  private lookupSession(id: string, generation: number, signal: AbortSignal, manual = false): Promise<Session | null> {
     const cached = this.sessions.get(id);
     if (cached) return Promise.resolve(cached);
-    if (this.provenanceUnavailable.has(id)) return Promise.resolve(null);
+    if (this.provenanceUnavailable.has(id)
+      || (!manual && (this.provenanceAttempts.get(id) ?? 0) >= PROVENANCE_RETRY_LIMIT)) return Promise.resolve(null);
     const existing = this.provenanceInFlight.get(id);
     if (existing) return existing;
     let request: Promise<Session | null>;
@@ -1468,7 +1955,12 @@ class GlimApp extends HTMLElement {
       const response = await fetch(`${API}/sessions/${id}`, { signal });
       if (!this.isAppActive(generation, signal)) return null;
       if (!response.ok) {
-        this.provenanceUnavailable.add(id);
+        if (response.status === 401) {
+          this.showAuthenticationExpired();
+          return null;
+        }
+        if (response.status >= 500) this.provenanceAttempts.set(id, (this.provenanceAttempts.get(id) ?? 0) + 1);
+        else this.provenanceUnavailable.add(id);
         return null;
       }
       const payload: unknown = await response.json();
@@ -1481,9 +1973,10 @@ class GlimApp extends HTMLElement {
         return null;
       }
       this.sessions.set(id, payload);
+      this.provenanceAttempts.delete(id);
       return payload;
     } catch {
-      if (!signal.aborted) this.provenanceUnavailable.add(id);
+      if (!signal.aborted) this.provenanceAttempts.set(id, (this.provenanceAttempts.get(id) ?? 0) + 1);
       return null;
     } finally {
       this.releaseProvenanceSlot();
@@ -1510,6 +2003,20 @@ class GlimApp extends HTMLElement {
     for (const target of targets) {
       if (!value) {
         target.textContent = "Provenance unavailable";
+        const attempts = this.provenanceAttempts.get(id) ?? 0;
+        if (!this.provenanceUnavailable.has(id) && attempts > 0) {
+          const retry = element("button", attempts >= PROVENANCE_RETRY_LIMIT ? "Retry manually" : "Retry");
+          retry.type = "button";
+          retry.dataset.provenanceRetry = "";
+          retry.addEventListener("click", () => {
+            retry.disabled = true;
+            const signal = this.controller?.signal ?? new AbortController().signal;
+            void this.lookupSession(id, this.connectionGeneration, signal, true).then((session) => {
+              if (this.isAppActive(this.connectionGeneration, signal)) this.renderProvenance(id, session);
+            });
+          });
+          target.append(document.createTextNode(" · "), retry);
+        }
         continue;
       }
       const sessionLink = element("a", "Session");

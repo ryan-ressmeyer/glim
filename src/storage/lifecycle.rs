@@ -1,4 +1,7 @@
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::json;
+
+use crate::logging::{LogLevel, daemon as log_daemon};
 
 use super::{Store, StoreError, blob};
 
@@ -31,7 +34,7 @@ impl Store {
             None => LifecycleReport::default(),
         };
         transaction.commit()?;
-        report.blobs_deleted = blob::drain_blob_deletion_queue(&self.connection, &self.root)?;
+        report.blobs_deleted = self.drain_committed_blob_cleanup("session_close");
         Ok(report)
     }
 
@@ -48,8 +51,22 @@ impl Store {
         };
         let mut report = purge_sessions(&transaction, &session_ids)?;
         transaction.commit()?;
-        report.blobs_deleted = blob::drain_blob_deletion_queue(&self.connection, &self.root)?;
+        report.blobs_deleted = self.drain_committed_blob_cleanup("retention");
         Ok(report)
+    }
+
+    fn drain_committed_blob_cleanup(&self, trigger: &'static str) -> u64 {
+        match blob::drain_blob_deletion_queue(&self.connection, &self.root) {
+            Ok(deleted) => deleted,
+            Err(_) => {
+                log_daemon(
+                    LogLevel::Warn,
+                    "blob_cleanup_deferred",
+                    &[("trigger", json!(trigger))],
+                );
+                0
+            }
+        }
     }
 }
 

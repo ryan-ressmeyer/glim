@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const root = resolve(import.meta.dirname, "../../..");
 const temp = await mkdtemp(join(tmpdir(), "glim-pi-load-"));
 const observer = join(temp, "observer.ts");
 await writeFile(observer, `
 export default function (pi) {
+  pi.on("before_provider_request", () => { throw new Error("provider call was not expected"); });
   pi.registerCommand("pi-package-inspect", {
     description: "test observer",
     handler: async (_args, ctx) => ctx.ui.notify(JSON.stringify({tools: pi.getAllTools().map(t => t.name)}), "info"),
@@ -20,9 +21,32 @@ export default function (pi) {
 }
 `);
 
-const child = spawn("pi", ["--mode", "rpc", "--no-session", "--approve", "--offline", "--no-context-files", "-e", root, "-e", observer], {
+const piEnv = { ...process.env, PI_CODING_AGENT_DIR: join(temp, "config"), PI_CODING_AGENT_SESSION_DIR: join(temp, "sessions"), PI_OFFLINE: "1" };
+const common = ["--no-session", "--approve", "--offline", "--no-context-files", "-e", root, "-e", observer];
+const print = spawnSync("pi", ["-p", ...common, "/glim-feed"], {
   cwd: root,
-  env: { ...process.env, PI_CODING_AGENT_DIR: join(temp, "config"), PI_CODING_AGENT_SESSION_DIR: join(temp, "sessions"), PI_OFFLINE: "1" },
+  env: piEnv,
+  encoding: "utf8",
+});
+assert.equal(print.status, 0, print.stderr);
+assert.equal(print.stdout, "");
+assert.match(print.stderr, /No confirmed open Glimse publication exists/);
+assert.doesNotMatch(print.stderr, /provider call was not expected/);
+
+const json = spawnSync("pi", ["--mode", "json", ...common, "/glim-feed"], {
+  cwd: root,
+  env: piEnv,
+  encoding: "utf8",
+});
+assert.equal(json.status, 0, json.stderr);
+assert.equal(json.stderr, "");
+const jsonEvents = json.stdout.trim().split("\n").map(line => JSON.parse(line));
+assert.ok(jsonEvents.some(event => event.type === "message_end" && event.message?.role === "custom" &&
+  event.message?.customType === "glimse-pi-command-v1" && event.message?.content?.includes("No confirmed open Glimse publication exists")));
+
+const child = spawn("pi", ["--mode", "rpc", ...common], {
+  cwd: root,
+  env: piEnv,
   stdio: ["pipe", "pipe", "pipe"],
 });
 let stderr = "";

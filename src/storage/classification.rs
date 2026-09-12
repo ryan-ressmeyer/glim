@@ -288,6 +288,10 @@ fn filename_expectation(extension: Option<&str>) -> Option<FilenameExpectation> 
     })
 }
 
+pub(crate) fn validate_declared_media_type(value: &str) -> Result<(), StoreError> {
+    normalize_declared(value).map(|_| ())
+}
+
 fn normalize_declared(value: &str) -> Result<FileClassification, StoreError> {
     Ok(match value.trim().to_ascii_lowercase().as_str() {
         "image/png" => c("image/png", ArtifactRenderer::Image),
