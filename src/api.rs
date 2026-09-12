@@ -260,7 +260,6 @@ pub(crate) async fn authenticate_request(
         || (path == "/api/v1/auth/session" && request.method() == Method::POST)
         || path == "/login"
         || path == "/assets/app.js"
-        || path == "/assets/pdf.worker.mjs"
         || path.starts_with("/cap/");
     if is_public {
         return next.run(request).await;

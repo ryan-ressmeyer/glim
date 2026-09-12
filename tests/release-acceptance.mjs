@@ -527,7 +527,9 @@ async function inspectBrowser(origin, projectId, primary, isolated) {
   assert.match(byRenderer.get("csv").html, /<table/);
   assert.equal(byRenderer.get("html").sandbox, "");
   assert.match(byRenderer.get("html").html, /Safe HTML/);
-  assert.match(byRenderer.get("pdf").html, /pdf-document/);
+  assert.match(byRenderer.get("pdf").html, /iframe class="pdf-frame"[^>]+loading="lazy"/);
+  assert.match(byRenderer.get("pdf").html, /Open PDF in new tab/);
+  assert.match(byRenderer.get("pdf").html, /download="document\.pdf"/);
   assert.equal(byRenderer.get("audio").media, "AUDIO");
   assert.equal(byRenderer.get("video").media, "VIDEO");
   for (const renderer of rendererNames) renderers.set(renderer, "PASS");

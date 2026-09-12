@@ -120,9 +120,9 @@ Phase 2D adds the canonical JSON and one-file publication interfaces, one-value 
 
 ### Phase 3 completed
 
-The first Phase 3 slice serves routed session, project, and global feeds from the embedded frontend. It adds bounded cursor pagination, cached session provenance, scoped navigation, sanitized Markdown commentary, and safe static renderers for images, SVG, Markdown artifacts, text, JSON, CSV, and downloads. The feed remains intentionally fully expanded.
+The first Phase 3 slice serves routed session, project, and global feeds from the embedded frontend. It adds bounded cursor pagination, cached session provenance, scoped navigation, sanitized Markdown commentary, and safe static renderers for images, SVG, Markdown artifacts, text, JSON, CSV, and downloads. The feed keeps every artifact available inline while bounding document viewers that provide their own navigation.
 
-The rich-renderer slice adds native video and audio controls without autoplay. An observer pauses offscreen media and releases each source outside a 1,000-pixel vertical margin, then restores the source without starting playback. The bundled PDF.js renderer requests the artifact URL with 64 KiB range chunks and disabled eval support. It creates ordered placeholders for every page, materializes pages within a 1,500-pixel vertical margin, renders at feed width, and keeps at most three canvases per artifact with deterministic least-recently-used eviction. Disconnect and renderer replacement cancel page work, release media and canvas resources, destroy PDF loading tasks, and suppress expected cancellation rejections. Vite emits the bundled worker at `/assets/pdf.worker.mjs`, and Rust embeds that asset with the application script.
+The rich-renderer slice adds native video and audio controls without autoplay. An observer pauses offscreen media and releases each source outside a 1,000-pixel vertical margin, then restores the source without starting playback. The initial PDF.js renderer created one feed-width placeholder per page and bounded live canvases. It was replaced with a single browser-native iframe because large documents still expanded the feed and required a bundled worker. The current frame loads lazily, remains bounded to 70% of the viewport height, releases its browsing context on disconnect, and provides open-in-new-tab and download links. Vite and Rust now build and embed only the application script.
 
 The HTML-renderer slice fetches each entry through its visible artifact route and parses it in a detached document. It removes untrusted base and policy elements, nested frames and plugins, active forms, and external navigation. Declarative resources resolve only through the file's listed support assets. HTML then renders in a unique-origin iframe with scripts disabled, no lifted sandbox tokens, and a deterministic content security policy. An explicit warning can reload the artifact with only `allow-scripts`. Connection APIs and undeclared subresources remain blocked, but a script can navigate its own frame and thereby make a network request. The warning discloses this browser-platform limitation. Disconnects, reconnects, and failures abort entry fetches and destroy iframe browsing contexts.
 
@@ -149,7 +149,7 @@ Top-of-page viewers receive posts immediately. Scrolled viewers retain at most 1
 3. Markdown with sanitized local-resource handling.
 4. Raw text and highlighted code in resizable virtualized panes.
 5. Structured JSON and CSV panes.
-6. PDF.js page-by-page rendering with lazy materialization.
+6. Browser-native PDF rendering in one bounded lazy frame.
 7. Sandboxed HTML with scripts disabled by default, explicit `allow-scripts` opt-in, unique origin, and a restrictive CSP.
 8. Download fallback for unsupported files.
 

@@ -73,6 +73,32 @@ const authenticatedHeaders = (contentType) => ({
   ...(contentType ? { "content-type": contentType } : {}),
 });
 
+const largePdfBytes = (pageCount) => {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    `<< /Type /Pages /Kids [${Array.from({ length: pageCount }, (_, index) => `${4 + index * 2} 0 R`).join(" ")}] /Count ${pageCount} >>`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  for (let page = 1; page <= pageCount; page += 1) {
+    const content = `BT /F1 18 Tf 72 720 Td (Large PDF page ${page}) Tj ET\n%${"x".repeat(32_768)}\n`;
+    const contentId = 5 + (page - 1) * 2;
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentId} 0 R >>`);
+    objects.push(`<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}endstream`);
+  }
+  const chunks = [Buffer.from("%PDF-1.7\n%Glim\n")];
+  const offsets = [0];
+  let length = chunks[0].length;
+  objects.forEach((object, index) => {
+    offsets[index + 1] = length;
+    const chunk = Buffer.from(`${index + 1} 0 obj\n${object}\nendobj\n`);
+    chunks.push(chunk);
+    length += chunk.length;
+  });
+  const xrefOffset = length;
+  chunks.push(Buffer.from(`xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n `).join("\n")}\ntrailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`));
+  return Buffer.concat(chunks);
+};
+
 const publish = async (externalKey, title) => {
   const boundary = `chromium-${externalKey}-${Date.now()}-${Math.random()}`;
   const manifest = JSON.stringify({
@@ -95,6 +121,27 @@ const publish = async (externalKey, title) => {
     body,
   });
   if (response.status !== 201) throw new Error(`publish ${title} failed: ${response.status} ${await response.text()}`);
+  return response.json();
+};
+
+const publishPdf = async (externalKey, bytes) => {
+  const form = new FormData();
+  form.append("manifest", JSON.stringify({
+    integration_namespace: "chromium",
+    external_key: externalKey,
+    project_label: "Live project",
+    working_directory: "/tmp/glim-live-project",
+    title: "Large PDF",
+    commentary: "Browser-native PDF regression",
+    files: [{ part: "file", filename: "large-document.pdf", support_assets: [] }],
+  }));
+  form.append("file", new Blob([bytes], { type: "application/pdf" }), "large-document.pdf");
+  const response = await fetch(`${daemonOrigin}/api/v1/posts`, {
+    method: "POST",
+    headers: authenticatedHeaders(),
+    body: form,
+  });
+  if (response.status !== 201) throw new Error(`PDF publish failed: ${response.status} ${await response.text()}`);
   return response.json();
 };
 
@@ -144,6 +191,9 @@ try {
 
   const firstA = await publish("session-a", "A initial");
   const firstB = await publish("session-b", "B initial");
+  const pdfBytes = largePdfBytes(200);
+  if (pdfBytes.length < 5 * 1024 * 1024) throw new Error(`large PDF fixture is only ${pdfBytes.length} bytes`);
+  const largePdf = await publishPdf("session-pdf", pdfBytes);
   const victimHtml = await publishHtml(
     "session-b",
     "Boundary victim",
@@ -160,8 +210,17 @@ const injected = document.createElement('script'); injected.src = target; docume
   );
   const sessionA = firstA.session.public_id;
   const sessionB = firstB.session.public_id;
+  const pdfSession = largePdf.session.public_id;
   const projectId = firstA.session.project.id;
-  if (firstB.session.project.id !== projectId) throw new Error("fixtures did not resolve to one project");
+  if (firstB.session.project.id !== projectId || largePdf.session.project.id !== projectId) throw new Error("fixtures did not resolve to one project");
+  const pdfContentPath = `/api/v1/posts/${largePdf.post.id}/files/0/content`;
+  const pdfHeaders = await fetch(`${daemonOrigin}${pdfContentPath}`, {
+    method: "HEAD",
+    headers: authenticatedHeaders(),
+  });
+  if (pdfHeaders.headers.get("content-type") !== "application/pdf") throw new Error("large PDF response lost its media type");
+  if (pdfHeaders.headers.get("accept-ranges") !== "bytes") throw new Error("large PDF response lost range support");
+  if (pdfHeaders.headers.get("content-security-policy") !== "default-src 'none'; sandbox") throw new Error("large PDF response lost its artifact sandbox");
 
   const portProbe = net.createServer();
   await new Promise((resolve) => portProbe.listen(0, "127.0.0.1", resolve));
@@ -245,6 +304,42 @@ const injected = document.createElement('script'); injected.src = target; docume
     root.querySelector('form').requestSubmit();
   })()`);
   await waitFor("location.pathname === '/feed'", "browser session login");
+  await command("Page.navigate", { url: `${daemonOrigin}/sessions/${pdfSession}` });
+  const pdfArtifact = `${app}?.querySelector('#post-${largePdf.post.id} glim-artifact')?.shadowRoot`;
+  await waitFor(`${pdfArtifact}?.querySelector('iframe.pdf-frame')`, "large native PDF frame");
+  const pdfState = await evaluate(`(() => {
+    const root = ${pdfArtifact};
+    const frame = root.querySelector('iframe.pdf-frame');
+    return {
+      src: frame.getAttribute('src'),
+      loading: frame.loading,
+      title: frame.title,
+      height: frame.getBoundingClientRect().height,
+      viewportHeight: innerHeight,
+      frameCount: root.querySelectorAll('iframe').length,
+      canvasCount: root.querySelectorAll('canvas').length,
+      open: root.querySelector('a[target="_blank"]')?.textContent,
+      download: root.querySelector('a[download]')?.getAttribute('download'),
+    };
+  })()`);
+  if (pdfState.src !== pdfContentPath || pdfState.loading !== "lazy" || pdfState.title !== "PDF: large-document.pdf") throw new Error(`native PDF frame contract failed: ${JSON.stringify(pdfState)}`);
+  if (pdfState.frameCount !== 1 || pdfState.canvasCount !== 0) throw new Error(`large PDF expanded into renderer-owned pages: ${JSON.stringify(pdfState)}`);
+  if (Math.abs(pdfState.height - pdfState.viewportHeight * 0.7) > 2) throw new Error(`large PDF frame is not bounded to 70vh: ${JSON.stringify(pdfState)}`);
+  if (pdfState.open !== "Open PDF in new tab" || pdfState.download !== "large-document.pdf") throw new Error(`large PDF fallbacks are missing: ${JSON.stringify(pdfState)}`);
+  let nativePdfFrame;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const frameTree = (await command("Page.getFrameTree")).frameTree;
+    const pendingFrames = [frameTree];
+    while (pendingFrames.length > 0) {
+      const candidate = pendingFrames.pop();
+      if (candidate.frame.url.endsWith(pdfContentPath) && candidate.frame.mimeType === "application/pdf") nativePdfFrame = candidate.frame;
+      pendingFrames.push(...(candidate.childFrames ?? []));
+    }
+    if (nativePdfFrame) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (!nativePdfFrame) throw new Error("Chromium did not load the sandboxed artifact as a native application/pdf frame");
+
   await command("Page.navigate", { url: `${daemonOrigin}/projects/${projectId}` });
   await waitFor(`${app}?.querySelector('#post-${firstA.post.id}') && ${app}?.querySelector('#post-${firstB.post.id}') && ${app}?.querySelector('#post-${victimHtml.post.id}') && ${app}?.querySelector('#post-${authenticatedHtml.post.id}')`, "initial two-session project feed");
   await evaluate(`(() => {
@@ -318,7 +413,7 @@ const injected = document.createElement('script'); injected.src = target; docume
   if (postLogoutStatus !== 401) throw new Error(`logout retained API access: ${postLogoutStatus}`);
 
   if (runtimeExceptions.length > 0) throw new Error(`browser runtime exceptions: ${JSON.stringify(runtimeExceptions)}`);
-  console.log("Chromium live feed: capability isolation, insertion, queueing, closure, heartbeat, and confirmed close passed across two sessions");
+  console.log(`Chromium live feed: ${pdfBytes.length}-byte, 200-page native PDF plus capability isolation, insertion, queueing, closure, heartbeat, and confirmed close passed`);
 } catch (error) {
   throw new Error(`${error.message}\nDaemon stderr:\n${daemonErrors}\nChromium stderr:\n${browserErrors}`);
 } finally {

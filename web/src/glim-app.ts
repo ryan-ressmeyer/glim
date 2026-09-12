@@ -1,14 +1,5 @@
 import { marked } from "marked";
 import Papa from "papaparse";
-import {
-  GlobalWorkerOptions,
-  getDocument,
-  type PDFDocumentLoadingTask,
-  type PDFDocumentProxy,
-  type PDFPageProxy,
-  type RenderTask,
-} from "pdfjs-dist";
-import PDF_WORKER_URL from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import sanitizeHtml from "sanitize-html";
 
 const API = "/api/v1";
@@ -16,13 +7,9 @@ const CSV_MAX_ROWS = 200;
 const CSV_MAX_CELLS_PER_ROW = 100;
 const PROVENANCE_CONCURRENCY = 4;
 const MEDIA_RELEASE_MARGIN = "1000px 0px";
-const PDF_LAZY_MARGIN = "1500px 0px";
-const PDF_RANGE_CHUNK_BYTES = 64 * 1024;
-const PDF_MAX_MATERIALIZED_PAGES = 3;
 // Live delivery is lossy beyond these bounds; reconciliation replaces accumulation.
 const LIVE_PENDING_LIMIT = 100;
 const HEARTBEAT_INTERVAL_MS = 30_000;
-GlobalWorkerOptions.workerSrc = PDF_WORKER_URL;
 const PUBLIC_ID_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const INITIAL_PUBLIC_ID_LENGTH = 6;
 const MAX_DATE_SECONDS = 8_640_000_000_000;
@@ -93,16 +80,6 @@ interface Page {
 interface ArtifactData {
   postId: number;
   file: PostFile;
-}
-
-interface PdfPageResource {
-  canvas: HTMLCanvasElement;
-  page: PDFPageProxy;
-  task: RenderTask;
-}
-
-function ignoreRejection(value: Promise<unknown> | void) {
-  void value?.catch(() => undefined);
 }
 
 function isPublicId(value: unknown): value is string {
@@ -464,10 +441,8 @@ const artifactStyles = `
   .markdown { overflow-wrap: anywhere; }
   .media { display: block; max-height: 75vh; max-width: 100%; width: auto; }
   audio.media { width: min(100%, 40rem); }
-  .pdf-document { display: grid; gap: 1rem; overflow: visible; width: 100%; }
-  .pdf-page { align-items: start; background: #f1f5f9; display: grid; justify-items: center; min-height: 8rem; width: 100%; }
-  .pdf-page canvas { display: block; height: auto; max-width: 100%; width: 100%; }
-  .pdf-page button { margin: 2rem; }
+  .pdf-frame { border: 1px solid #cbd5e1; display: block; height: 70vh; min-height: 18rem; width: 100%; }
+  .pdf-links { display: flex; flex-wrap: wrap; gap: 1rem; }
   .html-frame { border: 1px solid #cbd5e1; display: block; height: min(60vh, 42rem); max-height: 75vh; min-height: 18rem; width: 100%; }
   .script-warning { background: #fff7ed; border: 1px solid #fdba74; margin-bottom: .75rem; padding: .75rem; }
   .script-warning button { display: block; margin-top: .5rem; }
@@ -479,13 +454,6 @@ class GlimArtifact extends HTMLElement {
   private controller?: AbortController;
   private closeZoom?: (restoreFocus?: boolean) => void;
   private mediaObserver?: IntersectionObserver;
-  private pdfObserver?: IntersectionObserver;
-  private pdfLoadingTask?: PDFDocumentLoadingTask;
-  private pdfDocument?: PDFDocumentProxy;
-  private pdfPages = new Map<number, PdfPageResource>();
-  private pdfPageOrder: number[] = [];
-  private pdfPending = new Set<number>();
-  private pdfVisible = new Set<number>();
   private renderGeneration = 0;
 
   connectedCallback() {
@@ -573,7 +541,7 @@ class GlimArtifact extends HTMLElement {
         this.renderMedia(root, data, generation);
         return;
       case "pdf":
-        await this.renderPdf(root, data, generation);
+        this.renderPdf(root, data);
         return;
       case "markdown": {
         const text = await this.fetchText(data, generation);
@@ -657,131 +625,22 @@ class GlimArtifact extends HTMLElement {
     this.mediaObserver.observe(media);
   }
 
-  private async renderPdf(root: ShadowRoot, data: ArtifactData, generation: number) {
-    GlobalWorkerOptions.workerSrc = PDF_WORKER_URL;
-    const options = {
-      url: artifactUrl(data.postId, data.file.position),
-      rangeChunkSize: PDF_RANGE_CHUNK_BYTES,
-      isEvalSupported: false,
-    };
-    const loadingTask = getDocument(options as Parameters<typeof getDocument>[0]);
-    this.pdfLoadingTask = loadingTask;
-    const documentProxy = await loadingTask.promise;
-    if (!this.isRenderActive(generation) || this.pdfLoadingTask !== loadingTask) {
-      ignoreRejection(documentProxy.cleanup());
-      return;
-    }
-    this.pdfDocument = documentProxy;
-    const container = element("div");
-    container.className = "pdf-document";
-    const placeholders: HTMLElement[] = [];
-    for (let number = 1; number <= documentProxy.numPages; number += 1) {
-      const placeholder = element("div", `Page ${number}`);
-      placeholder.className = "pdf-page";
-      placeholder.dataset.page = String(number);
-      placeholders.push(placeholder);
-      container.append(placeholder);
-    }
-    root.append(container, downloadLink(data));
+  private renderPdf(root: ShadowRoot, data: ArtifactData) {
+    const url = artifactUrl(data.postId, data.file.position);
+    const frame = element("iframe");
+    frame.className = "pdf-frame";
+    frame.src = url;
+    frame.loading = "lazy";
+    frame.title = `PDF: ${data.file.filename}`;
 
-    const materialize = (placeholder: HTMLElement) => {
-      const number = Number(placeholder.dataset.page);
-      void this.materializePdfPage(placeholder, number, generation).catch(() => {
-        if (this.isRenderActive(generation)) this.renderFailure();
-      });
-    };
-    if (typeof IntersectionObserver === "undefined") {
-      if (placeholders[0]) {
-        this.pdfVisible.add(1);
-        materialize(placeholders[0]);
-      }
-      return;
-    }
-    this.pdfObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        const placeholder = entry.target as HTMLElement;
-        const number = Number(placeholder.dataset.page);
-        if (entry.isIntersecting) {
-          this.pdfVisible.add(number);
-          materialize(placeholder);
-        } else {
-          this.pdfVisible.delete(number);
-          this.releasePdfPage(number);
-        }
-      }
-    }, { rootMargin: PDF_LAZY_MARGIN });
-    placeholders.forEach((placeholder) => this.pdfObserver?.observe(placeholder));
-  }
-
-  private async materializePdfPage(placeholder: HTMLElement, number: number, generation: number) {
-    if (!this.pdfDocument || this.pdfPending.has(number) || this.pdfPages.has(number)
-      || !this.isRenderActive(generation)) return;
-    this.pdfPending.add(number);
-    let page: PDFPageProxy | undefined;
-    try {
-      page = await this.pdfDocument.getPage(number);
-      if (!this.isRenderActive(generation) || !placeholder.isConnected || !this.pdfVisible.has(number)) {
-        page.cleanup();
-        return;
-      }
-      const natural = page.getViewport({ scale: 1 });
-      const width = placeholder.clientWidth || placeholder.getBoundingClientRect().width || this.clientWidth || natural.width;
-      const viewport = page.getViewport({ scale: width / natural.width });
-      const pixelRatio = window.devicePixelRatio || 1;
-      const canvas = element("canvas");
-      canvas.width = Math.ceil(viewport.width * pixelRatio);
-      canvas.height = Math.ceil(viewport.height * pixelRatio);
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("Canvas rendering is unavailable");
-      const task = page.render({
-        canvas,
-        canvasContext: context,
-        viewport,
-        transform: pixelRatio === 1 ? undefined : [pixelRatio, 0, 0, pixelRatio, 0, 0],
-      });
-      const resource = { canvas, page, task };
-      this.pdfPages.set(number, resource);
-      this.touchPdfPage(number);
-      this.enforcePdfPageLimit(number);
-      try {
-        await task.promise;
-      } catch (error) {
-        const shouldReport = this.isRenderActive(generation) && this.pdfPages.get(number) === resource;
-        if (this.pdfPages.get(number) === resource) this.releasePdfPage(number);
-        if (shouldReport) throw error;
-        return;
-      }
-      if (!this.isRenderActive(generation) || this.pdfPages.get(number) !== resource || !placeholder.isConnected) return;
-      placeholder.replaceChildren(canvas);
-    } finally {
-      this.pdfPending.delete(number);
-      if (page && !this.isRenderActive(generation) && !this.pdfPages.has(number)) page.cleanup();
-    }
-  }
-
-  private touchPdfPage(number: number) {
-    this.pdfPageOrder = this.pdfPageOrder.filter((candidate) => candidate !== number);
-    this.pdfPageOrder.push(number);
-  }
-
-  private enforcePdfPageLimit(preserve: number) {
-    while (this.pdfPages.size > PDF_MAX_MATERIALIZED_PAGES) {
-      const oldest = this.pdfPageOrder.find((number) => number !== preserve);
-      if (oldest === undefined) return;
-      this.releasePdfPage(oldest);
-    }
-  }
-
-  private releasePdfPage(number: number) {
-    const resource = this.pdfPages.get(number);
-    if (!resource) return;
-    this.pdfPages.delete(number);
-    this.pdfPageOrder = this.pdfPageOrder.filter((candidate) => candidate !== number);
-    try { resource.task.cancel(); } catch { /* already settled */ }
-    try { resource.page.cleanup(); } catch { /* already released */ }
-    resource.canvas.remove();
-    const placeholder = this.shadowRoot?.querySelector<HTMLElement>(`.pdf-page[data-page="${number}"]`);
-    if (placeholder && !placeholder.textContent) placeholder.textContent = `Page ${number}`;
+    const links = element("div");
+    links.className = "pdf-links";
+    const open = element("a", "Open PDF in new tab");
+    open.href = url;
+    open.target = "_blank";
+    open.rel = "noopener";
+    links.append(open, downloadLink(data, `Download ${data.file.filename}`));
+    root.append(frame, links);
   }
 
   private releaseRichResources() {
@@ -792,18 +651,6 @@ class GlimArtifact extends HTMLElement {
       media.removeAttribute("src");
       media.load();
     });
-    this.pdfObserver?.disconnect();
-    this.pdfObserver = undefined;
-    for (const number of [...this.pdfPages.keys()]) this.releasePdfPage(number);
-    this.pdfPending.clear();
-    this.pdfVisible.clear();
-    this.pdfPageOrder = [];
-    const loadingTask = this.pdfLoadingTask;
-    const documentProxy = this.pdfDocument;
-    this.pdfLoadingTask = undefined;
-    this.pdfDocument = undefined;
-    if (loadingTask) ignoreRejection(loadingTask.destroy());
-    if (documentProxy) ignoreRejection(documentProxy.cleanup());
   }
 
   private renderImage(root: ShadowRoot, data: ArtifactData) {

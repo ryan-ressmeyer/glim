@@ -50,7 +50,6 @@ use serde::Serialize;
 
 const INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/web/index.html"));
 const APP_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/assets/app.js"));
-const PDF_WORKER_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/assets/pdf.worker.mjs"));
 
 #[derive(Serialize)]
 struct Health {
@@ -110,7 +109,6 @@ fn app_with_state(state: api::ApiState) -> Router {
         .route("/sessions/{public_id}", get(session_page))
         .route("/projects/{project_id}", get(project_page))
         .route("/assets/app.js", get(frontend_script))
-        .route("/assets/pdf.worker.mjs", get(pdf_worker_script))
         .merge(api::capability_routes())
         .nest("/api/v1", v1)
         .fallback(api::root_not_found)
@@ -157,10 +155,6 @@ async fn project_page(Path(project_id): Path<String>) -> Response {
 
 async fn frontend_script() -> impl IntoResponse {
     script_asset(APP_JS)
-}
-
-async fn pdf_worker_script() -> impl IntoResponse {
-    script_asset(PDF_WORKER_JS)
 }
 
 fn script_asset(bytes: &'static [u8]) -> impl IntoResponse {

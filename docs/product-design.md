@@ -103,7 +103,7 @@ Scoped server-sent event streams use post IDs as event IDs. The daemon retains 2
 
 A visible session page sends a heartbeat every 30 seconds only while its event stream is open. Hiding the page, losing the stream, closing the session, or disconnecting the component stops heartbeat work. Session pages require native destructive confirmation before closing.
 
-Complete inline rendering is intentional. Visually heavy posts encourage agents to publish focused figures and demonstrations. The browser may defer offscreen work, release media decoders, or virtualize text without changing the complete presentation.
+Inline artifact access is intentional. Visually heavy posts encourage agents to publish focused figures and demonstrations. The browser may defer offscreen work, release media decoders, bound embedded documents, or virtualize text while keeping every artifact available from the feed.
 
 The CLI always returns a deep link. It opens a local browser only when explicitly requested.
 
@@ -115,7 +115,7 @@ Images display at their natural dimensions up to the feed width and are not upsc
 
 ### PDF
 
-PDF.js renders every page sequentially at feed width. Pages near the viewport materialize lazily to control browser memory without introducing nested document scrolling.
+The browser's native PDF viewer renders inside one lazy iframe bounded to 70% of the viewport height. The frame provides native page navigation without expanding every page into the feed. Separate links open the PDF in a new tab or download it when inline viewing is unavailable.
 
 ### Video and audio
 

@@ -11,7 +11,7 @@ const FRONTEND_FILES: &[&str] = &[
     "tsconfig.json",
     "vite.config.ts",
 ];
-const FRONTEND_ASSETS: &[&str] = &["index.html", "assets/app.js", "assets/pdf.worker.mjs"];
+const FRONTEND_ASSETS: &[&str] = &["index.html", "assets/app.js"];
 
 fn main() {
     for input in [

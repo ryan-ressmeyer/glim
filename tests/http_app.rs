@@ -106,7 +106,7 @@ async fn malformed_feed_page_shapes_are_not_spa_fallbacks() {
 }
 
 #[tokio::test]
-async fn compiled_pdf_worker_is_embedded() {
+async fn removed_pdf_worker_is_not_served() {
     let response = glim::app()
         .oneshot(
             Request::builder()
@@ -117,36 +117,25 @@ async fn compiled_pdf_worker_is_embedded() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "text/javascript; charset=utf-8"
-    );
-    assert!(
-        !response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .is_empty()
-    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn compiled_script_assets_disable_content_sniffing() {
-    for uri in ["/assets/app.js", "/assets/pdf.worker.mjs"] {
-        let response = glim::app()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+async fn compiled_script_asset_disables_content_sniffing() {
+    let response = glim::app()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(
-            response.headers().get("x-content-type-options").unwrap(),
-            "nosniff",
-            "{uri}"
-        );
-    }
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
 }
 
 #[tokio::test]

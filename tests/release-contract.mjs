@@ -27,9 +27,10 @@ test("crate metadata and build inputs support installation from a source checkou
   const build = read("build.rs");
   assert.match(build, /npm[\s\S]*\bci\b/);
   assert.match(build, /npm[\s\S]*run[\s\S]*build/);
-  for (const asset of ["index.html", "assets/app.js", "assets/pdf.worker.mjs"]) {
+  for (const asset of ["index.html", "assets/app.js"]) {
     assert.ok(build.includes(asset), `build script must stage ${asset}`);
   }
+  assert.ok(!build.includes("pdf.worker"), "native PDF rendering must not stage a PDF.js worker");
 });
 
 test("frontend build ignores stale dist and confines generated state to OUT_DIR", () => {
