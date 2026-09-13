@@ -1,6 +1,8 @@
 # Release acceptance record
 
-This record contains no credentials, public IDs, generated URLs, transcripts, or temporary paths. The live-provider matrix below records the earlier release-acceptance run, before the trustworthy-inspection milestone. That matrix has not been rerun for the milestone. Current credential-free checks cover real Pi command output, Chromium inspection/security behavior, and isolated upload/resource acceptance; they do not replace live-provider release acceptance.
+This record contains no credentials, public IDs, generated URLs, transcripts, or temporary paths.
+
+The live acceptance run passed on 2026-09-13 for commit `008eae3ad51f879878c6b878d2117f57bbc3f637` with Pi 0.85.1. The harness installed the candidate from source into a temporary Cargo root and used an isolated daemon and store.
 
 ## Live Pi matrix
 
