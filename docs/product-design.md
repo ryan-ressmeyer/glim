@@ -77,6 +77,16 @@ Every post requires at least one visible artifact. Text-only status messages bel
 
 Posts are immutable snapshots. Revising a result creates a new post at the top of the feed and links it to its predecessor. Publication is atomic, so a failed file, validation error, or storage limit leaves no partial post.
 
+## Revision comparison
+
+A revised post offers a comparison with its immediate predecessor through a scoped `#compare-POST_ID` fragment. The browser validates both the relationship and the current session/project boundary before rendering. Comparison replaces mounted feed artifacts, keeps only one selected artifact pair mounted, and returns to the revised post with focus restored. Navigation, authentication expiry, and session deletion cancel obsolete comparison work.
+
+Unique, nonblank, exact filenames pair automatically. Manual previous/current selectors handle renamed files, duplicates, and one-sided artifacts; file position never determines a cross-revision match. Added, removed, and ambiguous filenames are disclosed. Desktop comparisons use two columns; mobile comparisons stack the panes or previous/current diff cells.
+
+Image and SVG pairs share a zoom percentage and Fit both control while retaining independent scrolling. Text and JSON use inert line-level diffs. JSON formatting changes whitespace without reordering keys or normalizing numeric literals; malformed JSON falls back to raw text with a warning. The formatter also discloses raw fallback beyond 64 nesting levels or 16 MiB of formatted UTF-8 output. Other formats reuse their ordinary renderers, including independent HTML sandbox and script controls.
+
+Comparison preserves the 16 MiB per-file automatic-load threshold and global three-document download limit. Diff work is capped at 250,000 changed-middle comparison cells and 4,000 rendered rows, with bounded temporary line arrays. Exceeding either budget shows full plain text rather than a truncated diff. Open and Download remain available for each source snapshot. Arbitrary revision-chain selection and synchronized image panning remain outside this version.
+
 ## Publication and storage
 
 The CLI resolves source paths and streams file bytes to the daemon in a multipart request. The daemon never receives authority to read arbitrary source paths. A source path may be stored as inert provenance.

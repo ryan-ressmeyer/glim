@@ -295,17 +295,30 @@ async fn periodic_cleanup_retries_after_open_failure() {
         DaemonLimits::default(),
         std::time::Duration::from_millis(20),
     );
-    tokio::time::sleep(std::time::Duration::from_millis(35)).await;
-    std::fs::remove_file(&root_path).unwrap();
-    let mut store = Store::open(&root_path).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !String::from_utf8_lossy(&log.0.lock().unwrap()).contains("\"event\":\"cleanup_failed\"")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cleanup never tried the blocked path"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Prepare a complete database before exposing it to the retrying worker.
+    let prepared = parent.path().join("prepared");
+    let mut store = Store::open(&prepared).unwrap();
     let session = store.resolve_session("test", "stale", "P", "/p").unwrap();
-    rusqlite::Connection::open(root_path.join("metadata.sqlite3"))
+    rusqlite::Connection::open(prepared.join("metadata.sqlite3"))
         .unwrap()
         .execute(
             "UPDATE sessions SET last_activity_at=0 WHERE public_id=?1",
             [&session.public_id],
         )
         .unwrap();
+    drop(store);
+    std::fs::remove_file(&root_path).unwrap();
+    std::fs::rename(prepared, &root_path).unwrap();
+    let store = Store::open(&root_path).unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         if store.session(&session.public_id).is_err() {

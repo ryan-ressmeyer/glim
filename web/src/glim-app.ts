@@ -9,6 +9,10 @@ const PROVENANCE_CONCURRENCY = 4;
 const PROVENANCE_RETRY_LIMIT = 3;
 const DOCUMENT_RENDER_LIMIT = 16 * 1024 * 1024;
 const DOCUMENT_CONCURRENCY = 3;
+const DIFF_WORK_LIMIT = 250_000;
+const DIFF_ROW_LIMIT = 4_000;
+const JSON_FORMAT_DEPTH_LIMIT = 64;
+const JSON_FORMAT_OUTPUT_LIMIT = 16 * 1024 * 1024;
 const VIEWPORT_RENDER_MARGIN = "800px 0px";
 const MEDIA_RELEASE_MARGIN = "1000px 0px";
 // Live delivery is lossy beyond these bounds; reconciliation replaces accumulation.
@@ -87,6 +91,20 @@ interface ArtifactData {
   file: PostFile;
 }
 
+interface ImageComparisonData {
+  older: ArtifactData;
+  newer: ArtifactData;
+}
+
+interface TextComparisonData {
+  older: ArtifactData;
+  newer: ArtifactData;
+}
+
+type DiffLine = { kind: "equal" | "removed" | "added"; older: string; newer: string };
+type DiffResult = { lines: DiffLine[]; fallback: null | "work" | "rows" };
+type JsonFormatResult = { text: string; fallback: null | "depth" | "size" };
+
 function isPublicId(value: unknown): value is string {
   return typeof value === "string"
     && value.length >= INITIAL_PUBLIC_ID_LENGTH
@@ -112,6 +130,13 @@ function routeFromLocation(pathname: string): Route {
     if (isPositiveSafeInteger(projectId)) return { kind: "project", projectId };
   }
   return { kind: "invalid" };
+}
+
+function comparisonPostId(hash: string): number | null {
+  const match = hash.match(/^#compare-([1-9][0-9]*)$/);
+  if (!match) return null;
+  const postId = Number(match[1]);
+  return isPositiveSafeInteger(postId) ? postId : null;
 }
 
 function pageEndpoint(route: Route): string | null {
@@ -461,6 +486,135 @@ function releaseDocumentLoad() {
   documentWaiters.shift()?.();
 }
 
+async function fetchDocumentText(data: ArtifactData, signal: AbortSignal): Promise<string> {
+  if (!await acquireDocumentLoad(signal)) throw new DOMException("aborted", "AbortError");
+  try {
+    const aborted = new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    });
+    const response = await Promise.race([fetch(artifactUrl(data.postId, data.file.position), { signal }), aborted]);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await Promise.race([response.text(), aborted]);
+  } finally {
+    releaseDocumentLoad();
+  }
+}
+
+function formatJsonLexically(source: string): JsonFormatResult {
+  let depth = 0;
+  let lineStart = false;
+  let output = "";
+  let outputBytes = 0;
+  const append = (value: string): boolean => {
+    const remaining = JSON_FORMAT_OUTPUT_LIMIT - outputBytes;
+    if (value.length > remaining) return false;
+    let bytes = 0;
+    for (let index = 0; index < value.length && bytes <= remaining; index += 1) {
+      const code = value.charCodeAt(index);
+      if (code <= 0x7f) bytes += 1;
+      else if (code <= 0x7ff) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff
+        && value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else bytes += 3;
+    }
+    if (bytes > remaining) return false;
+    output += value;
+    outputBytes += bytes;
+    return true;
+  };
+  const indent = () => append(`\n${"  ".repeat(depth)}`);
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (/\s/.test(character)) continue;
+    if (character === "]" || character === "}") {
+      depth -= 1;
+      if (lineStart) lineStart = false;
+      else if (!indent()) return { text: source, fallback: "size" };
+      if (!append(character)) return { text: source, fallback: "size" };
+      continue;
+    }
+    if (lineStart) {
+      if (!indent()) return { text: source, fallback: "size" };
+      lineStart = false;
+    }
+    if (character === '"') {
+      let end = index + 1;
+      let escaped = false;
+      for (; end < source.length; end += 1) {
+        if (!escaped && source[end] === '"') break;
+        escaped = !escaped && source[end] === "\\";
+        if (source[end] !== "\\") escaped = false;
+      }
+      if (!append(source.slice(index, end + 1))) return { text: source, fallback: "size" };
+      index = end;
+    } else if (character === "[" || character === "{") {
+      if (!append(character)) return { text: source, fallback: "size" };
+      depth += 1;
+      if (depth > JSON_FORMAT_DEPTH_LIMIT) return { text: source, fallback: "depth" };
+      lineStart = true;
+    } else if (character === ",") {
+      if (!append(character)) return { text: source, fallback: "size" };
+      lineStart = true;
+    } else if (character === ":") {
+      if (!append(": ")) return { text: source, fallback: "size" };
+    } else {
+      let end = index + 1;
+      while (end < source.length && !/[\s\[\]{},:"]/.test(source[end])) end += 1;
+      if (!append(source.slice(index, end))) return { text: source, fallback: "size" };
+      index = end - 1;
+    }
+  }
+  return { text: output, fallback: null };
+}
+
+function lineDiff(olderText: string, newerText: string): DiffResult {
+  const older = olderText.split(/\r?\n/, DIFF_ROW_LIMIT + 1);
+  const newer = newerText.split(/\r?\n/, DIFF_ROW_LIMIT + 1);
+  if (older.length > DIFF_ROW_LIMIT || newer.length > DIFF_ROW_LIMIT) return { lines: [], fallback: "rows" };
+  let prefix = 0;
+  while (prefix < older.length && prefix < newer.length && older[prefix] === newer[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < older.length - prefix && suffix < newer.length - prefix
+    && older[older.length - suffix - 1] === newer[newer.length - suffix - 1]) suffix += 1;
+  const oldMiddle = older.slice(prefix, older.length - suffix);
+  const newMiddle = newer.slice(prefix, newer.length - suffix);
+  if (prefix + suffix + oldMiddle.length + newMiddle.length > DIFF_ROW_LIMIT) return { lines: [], fallback: "rows" };
+  if (oldMiddle.length * newMiddle.length > DIFF_WORK_LIMIT) return { lines: [], fallback: "work" };
+  const width = newMiddle.length + 1;
+  const lengths = new Uint32Array((oldMiddle.length + 1) * width);
+  for (let oldIndex = oldMiddle.length - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = newMiddle.length - 1; newIndex >= 0; newIndex -= 1) {
+      const index = oldIndex * width + newIndex;
+      lengths[index] = oldMiddle[oldIndex] === newMiddle[newIndex]
+        ? lengths[(oldIndex + 1) * width + newIndex + 1] + 1
+        : Math.max(lengths[(oldIndex + 1) * width + newIndex], lengths[index + 1]);
+    }
+  }
+  const lines: DiffLine[] = older.slice(0, prefix).map((line) => ({ kind: "equal", older: line, newer: line }));
+  let oldIndex = 0;
+  let newIndex = 0;
+  while (oldIndex < oldMiddle.length || newIndex < newMiddle.length) {
+    if (oldIndex < oldMiddle.length && newIndex < newMiddle.length && oldMiddle[oldIndex] === newMiddle[newIndex]) {
+      lines.push({ kind: "equal", older: oldMiddle[oldIndex], newer: newMiddle[newIndex] });
+      oldIndex += 1;
+      newIndex += 1;
+    } else if (newIndex >= newMiddle.length
+      || (oldIndex < oldMiddle.length
+        && lengths[(oldIndex + 1) * width + newIndex] >= lengths[oldIndex * width + newIndex + 1])) {
+      lines.push({ kind: "removed", older: oldMiddle[oldIndex], newer: "" });
+      oldIndex += 1;
+    } else {
+      lines.push({ kind: "added", older: "", newer: newMiddle[newIndex] });
+      newIndex += 1;
+    }
+  }
+  older.slice(older.length - suffix).forEach((line) => lines.push({ kind: "equal", older: line, newer: line }));
+  return { lines, fallback: null };
+}
+
 function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
@@ -633,23 +787,8 @@ class GlimArtifact extends HTMLElement {
   private async fetchText(data: ArtifactData, generation: number): Promise<string | null> {
     const controller = new AbortController();
     this.controller = controller;
-    if (!await acquireDocumentLoad(controller.signal)) return null;
-    try {
-      const aborted = new Promise<never>((_resolve, reject) => {
-        controller.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
-      });
-      const response = await Promise.race([
-        fetch(artifactUrl(data.postId, data.file.position), { signal: controller.signal }),
-        aborted,
-      ]);
-      if (!this.isRenderActive(generation, controller.signal)) return null;
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const text = await Promise.race([response.text(), aborted]);
-      if (!this.isRenderActive(generation, controller.signal)) return null;
-      return text;
-    } finally {
-      releaseDocumentLoad();
-    }
+    const text = await fetchDocumentText(data, controller.signal);
+    return this.isRenderActive(generation, controller.signal) ? text : null;
   }
 
   private renderLargeDocument(root: ShadowRoot, data: ArtifactData, generation: number) {
@@ -1038,6 +1177,279 @@ class GlimArtifact extends HTMLElement {
   }
 }
 
+class GlimTextComparison extends HTMLElement {
+  data?: TextComparisonData;
+  private controller?: AbortController;
+  private observer?: IntersectionObserver;
+  private generation = 0;
+  private loadFull = false;
+
+  connectedCallback() {
+    const generation = ++this.generation;
+    this.controller?.abort();
+    this.observer?.disconnect();
+    this.observer = undefined;
+    this.replaceChildren();
+    const data = this.data;
+    if (!data) return;
+    this.dataset.textComparison = "";
+    const oversized = [data.older, data.newer].filter((artifact) => artifact.file.blob.byte_size > DOCUMENT_RENDER_LIMIT);
+    if (oversized.length > 0 && !this.loadFull) {
+      const pending = element("div");
+      pending.className = "target-state";
+      pending.append(element("p", `${oversized.map((artifact) => `${artifact.file.filename || "Unnamed artifact"} (${formatBytes(artifact.file.blob.byte_size)})`).join(" and ")} exceed the 16 MiB automatic rendering limit.`));
+      const load = element("button", "Load full documents");
+      load.type = "button";
+      load.dataset.loadFullComparison = "";
+      load.addEventListener("click", () => {
+        if (generation !== this.generation || !this.isConnected) return;
+        this.loadFull = true;
+        this.connectedCallback();
+      });
+      pending.append(load, this.renderArtifactLinks(data));
+      this.append(pending);
+      return;
+    }
+    const begin = () => {
+      this.observer?.disconnect();
+      this.observer = undefined;
+      this.replaceChildren(element("p", "Loading documents for comparison"), this.renderArtifactLinks(data));
+      void this.load(generation, data);
+    };
+    if (typeof IntersectionObserver === "undefined") begin();
+    else {
+      const pending = element("p", "Waiting to render document comparison");
+      this.append(pending, this.renderArtifactLinks(data));
+      this.observer = new IntersectionObserver((entries) => {
+        if (entries.some((entry) => entry.isIntersecting) && generation === this.generation && this.isConnected) begin();
+      }, { rootMargin: VIEWPORT_RENDER_MARGIN });
+      this.observer.observe(this);
+    }
+  }
+
+  disconnectedCallback() {
+    this.generation += 1;
+    this.controller?.abort();
+    this.observer?.disconnect();
+    this.observer = undefined;
+  }
+
+  private async load(generation: number, data: TextComparisonData) {
+    const controller = new AbortController();
+    this.controller = controller;
+    try {
+      const [oldSource, newSource] = await Promise.all([
+        fetchDocumentText(data.older, controller.signal),
+        fetchDocumentText(data.newer, controller.signal),
+      ]);
+      if (generation !== this.generation || !this.isConnected || controller.signal.aborted) return;
+      let olderText = oldSource;
+      let newerText = newSource;
+      const malformed: string[] = [];
+      const formatFallbacks: Array<{ side: string; reason: "depth" | "size" }> = [];
+      if (data.older.file.renderer === "json") {
+        try {
+          JSON.parse(oldSource);
+          const formatted = formatJsonLexically(oldSource);
+          olderText = formatted.text;
+          if (formatted.fallback) formatFallbacks.push({ side: "previous", reason: formatted.fallback });
+        } catch { malformed.push("previous"); }
+      }
+      if (data.newer.file.renderer === "json") {
+        try {
+          JSON.parse(newSource);
+          const formatted = formatJsonLexically(newSource);
+          newerText = formatted.text;
+          if (formatted.fallback) formatFallbacks.push({ side: "current", reason: formatted.fallback });
+        } catch { malformed.push("current"); }
+      }
+      const result = lineDiff(olderText, newerText);
+      this.replaceChildren(this.renderArtifactLinks(data));
+      if (malformed.length > 0) {
+        const warning = element("p", `Malformed JSON in the ${malformed.join(" and ")} artifact; comparing disclosed raw text instead.`);
+        warning.dataset.jsonFallback = "";
+        this.append(warning);
+      }
+      for (const fallback of formatFallbacks) {
+        const reason = fallback.reason === "depth"
+          ? `${JSON_FORMAT_DEPTH_LIMIT}-level JSON formatting depth limit`
+          : `${formatBytes(JSON_FORMAT_OUTPUT_LIMIT)} JSON formatting output limit`;
+        const warning = element("p", `The ${fallback.side} artifact exceeds the ${reason}; comparing disclosed raw text instead.`);
+        warning.dataset.jsonFormatFallback = fallback.reason;
+        this.append(warning);
+      }
+      if (result.fallback) {
+        const reason = result.fallback === "work"
+          ? `${DIFF_WORK_LIMIT.toLocaleString()} comparison-cell work budget`
+          : `${DIFF_ROW_LIMIT.toLocaleString()} rendered-row budget`;
+        const notice = element("p", `Line diff exceeds the ${reason}; showing full plain text side by side.`);
+        notice.dataset.diffFallback = result.fallback;
+        this.append(notice, this.renderPlain(data, olderText, newerText));
+      } else this.append(this.renderDiff(data, result.lines));
+    } catch (error) {
+      if (generation !== this.generation || !this.isConnected || controller.signal.aborted
+        || (error instanceof DOMException && error.name === "AbortError")) return;
+      const failure = element("p", "Could not load documents for comparison");
+      failure.className = "target-state";
+      this.replaceChildren(failure, this.renderArtifactLinks(data));
+    }
+  }
+
+  private formatLabel(side: "Previous" | "Current", data: ArtifactData): string {
+    return `${side} · ${data.file.renderer}`;
+  }
+
+  private renderArtifactLinks(data: TextComparisonData): HTMLElement {
+    const navigation = element("nav");
+    navigation.className = "comparison-document-links";
+    navigation.setAttribute("aria-label", "Compared document links");
+    for (const [label, artifact] of [["Previous", data.older], ["Current", data.newer]] as const) {
+      const group = element("span", `${label}: `);
+      const open = element("a", "Open");
+      open.href = artifactUrl(artifact.postId, artifact.file.position);
+      open.target = "_blank";
+      open.rel = "noopener";
+      group.append(open, document.createTextNode(" · "), downloadLink(artifact, "Download"));
+      navigation.append(group);
+    }
+    return navigation;
+  }
+
+  private renderPlain(data: TextComparisonData, olderText: string, newerText: string): HTMLElement {
+    const columns = element("div");
+    columns.className = "comparison-columns";
+    for (const [label, artifact, text] of [["Previous", data.older, olderText], ["Current", data.newer, newerText]] as const) {
+      const side = element("section");
+      side.append(element("h3", this.formatLabel(label, artifact)));
+      const pre = element("pre", text);
+      pre.className = "plain-comparison";
+      side.append(pre);
+      columns.append(side);
+    }
+    return columns;
+  }
+
+  private renderDiff(data: TextComparisonData, lines: DiffLine[]): HTMLElement {
+    const wrapper = element("div");
+    wrapper.className = "diff-wrap";
+    const table = element("table");
+    table.setAttribute("aria-label", `Line comparison of ${data.older.file.filename} and ${data.newer.file.filename}`);
+    const head = element("thead");
+    const heading = element("tr");
+    heading.append(element("th", this.formatLabel("Previous", data.older)), element("th", this.formatLabel("Current", data.newer)));
+    head.append(heading);
+    const body = element("tbody");
+    lines.forEach((line) => {
+      const row = element("tr");
+      row.dataset.diffRow = "";
+      row.dataset.diffKind = line.kind;
+      const previous = element("td", line.older);
+      previous.dataset.diffSide = "Previous";
+      const current = element("td", line.newer);
+      current.dataset.diffSide = "Current";
+      row.append(previous, current);
+      body.append(row);
+    });
+    table.append(head, body);
+    wrapper.append(table);
+    return wrapper;
+  }
+
+}
+
+class GlimImageComparison extends HTMLElement {
+  data?: ImageComparisonData;
+
+  connectedCallback() {
+    this.replaceChildren();
+    const data = this.data;
+    if (!data) return;
+    this.dataset.imageComparison = "";
+    this.tabIndex = 0;
+    this.setAttribute("aria-label", `Image comparison of ${data.older.file.filename} and ${data.newer.file.filename}`);
+    let scale = 1;
+    const controls = element("div");
+    controls.className = "comparison-image-controls";
+    const fit = element("button", "Fit both");
+    fit.type = "button";
+    fit.dataset.compareFit = "";
+    const actual = element("button", "100%");
+    actual.type = "button";
+    actual.dataset.compareActual = "";
+    const zoomOut = element("button", "Zoom out");
+    zoomOut.type = "button";
+    zoomOut.dataset.compareZoomOut = "";
+    const zoomIn = element("button", "Zoom in");
+    zoomIn.type = "button";
+    zoomIn.dataset.compareZoomIn = "";
+    const output = element("output", "100%");
+    output.dataset.compareZoom = "";
+    output.setAttribute("aria-live", "polite");
+    const panes: HTMLElement[] = [];
+    const images: HTMLImageElement[] = [];
+    const applyScale = () => {
+      images.forEach((image) => {
+        if (image.naturalWidth) image.style.width = `${Math.round(image.naturalWidth * scale)}px`;
+      });
+      const percentage = scale * 100;
+      output.value = `${percentage < 1 ? percentage.toFixed(1) : Math.round(percentage)}%`;
+    };
+    const fitBoth = () => {
+      if (images.some((image) => !image.naturalWidth || !image.naturalHeight)) return;
+      scale = Math.min(1, ...images.flatMap((image, index) => [
+        Math.max(1, panes[index].clientWidth) / image.naturalWidth,
+        Math.max(1, panes[index].clientHeight) / image.naturalHeight,
+      ]));
+      applyScale();
+    };
+    fit.addEventListener("click", fitBoth);
+    actual.addEventListener("click", () => { scale = 1; applyScale(); });
+    zoomOut.addEventListener("click", () => { scale = Math.max(0.01, scale - 0.25); applyScale(); });
+    zoomIn.addEventListener("click", () => { scale = Math.min(4, scale + 0.25); applyScale(); });
+    controls.append(fit, actual, zoomOut, zoomIn, output);
+    const columns = element("div");
+    columns.className = "comparison-columns";
+    for (const [label, artifact] of [["Previous", data.older], ["Current", data.newer]] as const) {
+      const side = element("section");
+      side.append(element("h3", `${label}: ${artifact.file.filename || "Unnamed artifact"}`));
+      const artifactToolbar = element("div");
+      artifactToolbar.className = "comparison-artifact-toolbar";
+      artifactToolbar.append(element("span", `${artifact.file.media_type || "Unknown type"} · ${formatBytes(artifact.file.blob.byte_size)}`));
+      const open = element("a", "Open");
+      open.href = artifactUrl(artifact.postId, artifact.file.position);
+      open.target = "_blank";
+      open.rel = "noopener";
+      artifactToolbar.append(open, downloadLink(artifact, "Download"));
+      side.append(artifactToolbar);
+      const pane = element("div");
+      pane.className = "comparison-image-pane";
+      pane.dataset.imagePane = "";
+      pane.tabIndex = 0;
+      const image = element("img");
+      image.dataset.compareImage = "";
+      image.src = artifactUrl(artifact.postId, artifact.file.position);
+      image.alt = artifact.file.caption ?? (artifact.file.filename || "Unnamed artifact");
+      image.addEventListener("load", fitBoth);
+      pane.append(image);
+      side.append(pane);
+      panes.push(pane);
+      images.push(image);
+      columns.append(side);
+    }
+    this.addEventListener("keydown", (event) => {
+      if (event.key === "+" || event.key === "=") zoomIn.click();
+      else if (event.key === "-") zoomOut.click();
+      else if (event.key === "0") actual.click();
+      else if (event.key.toLowerCase() === "f") fit.click();
+    });
+    this.append(controls, columns);
+  }
+
+  disconnectedCallback() {
+    this.querySelectorAll("img[src]").forEach((image) => image.removeAttribute("src"));
+  }
+}
+
 const appStyles = `
   :host {
     --background: #f6f7f9; --surface: #fff; --surface-subtle: #f1f3f6; --border: #d9dee7;
@@ -1076,6 +1488,22 @@ const appStyles = `
   .action-menu { background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; display: grid; gap: .4rem; padding: .5rem; position: absolute; right: 0; top: calc(100% + .4rem); width: max-content; z-index: 3; }
   .danger { color: var(--danger); }
   .target-state { background: var(--surface-subtle); border: 1px solid var(--border); padding: .75rem; }
+  [data-comparison] { background: var(--surface); border: 1px solid var(--border); border-radius: .65rem; padding: clamp(1rem, 3vw, 1.75rem); }
+  .comparison-selectors { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1rem 0; }
+  .comparison-selectors label { display: grid; gap: .25rem; }
+  .comparison-columns { display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); margin-top: 1rem; }
+  .comparison-columns > section { min-width: 0; }
+  .comparison-image-controls, .comparison-artifact-toolbar, .comparison-document-links { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
+  .comparison-document-links { justify-content: space-between; }
+  .comparison-artifact-toolbar { color: var(--muted); font-size: .85rem; }
+  .comparison-artifact-toolbar span { margin-right: auto; }
+  .diff-wrap, .plain-comparison { border: 1px solid var(--border); max-height: 70vh; overflow: auto; }
+  .diff-wrap table { border-collapse: collapse; width: 100%; }
+  .diff-wrap th, .diff-wrap td { border: 1px solid var(--border); padding: .25rem .45rem; text-align: left; vertical-align: top; white-space: pre-wrap; width: 50%; }
+  .diff-wrap tr[data-diff-kind="removed"] td:first-child, .diff-wrap tr[data-diff-kind="added"] td:last-child { background: var(--surface-subtle); }
+  .plain-comparison { margin: 0; min-height: 10rem; padding: .75rem; resize: vertical; white-space: pre; }
+  .comparison-image-pane { border: 1px solid var(--border); height: min(65vh, 42rem); overflow: auto; }
+  .comparison-image-pane img { display: block; height: auto; max-width: none; width: auto; }
   @media (prefers-color-scheme: dark) {
     :host { --background: #101318; --surface: #171b22; --surface-subtle: #202631; --border: #343c49; --text: #edf1f7; --muted: #aab4c3; --link: #91b9ff; --focus: #70a5ff; --danger: #fda4af; }
   }
@@ -1083,7 +1511,11 @@ const appStyles = `
     main { padding: .75rem; }
     header { grid-template-columns: 1fr auto; }
     nav { grid-column: 1 / -1; }
-    article { border-radius: 0; margin-inline: -.75rem; }
+    article, [data-comparison] { border-radius: 0; margin-inline: -.75rem; }
+    .comparison-columns { grid-template-columns: minmax(0, 1fr); }
+    .diff-wrap thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+    .diff-wrap tr, .diff-wrap td { display: block; width: auto; }
+    .diff-wrap td::before { content: attr(data-diff-side) ": "; color: var(--muted); font-size: .8rem; }
   }
   @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
 `;
@@ -1118,13 +1550,20 @@ class GlimApp extends HTMLElement {
   private authenticationExpired = false;
   private targetRequestVersion = 0;
   private targetController?: AbortController;
+  private targetHash?: string;
   private focusedHash: string | null = null;
   private readonly visibilityHandler = () => this.syncHeartbeat();
   private readonly hashHandler = () => {
+    const requestedHash = window.location.hash;
+    if (this.targetController && !this.targetController.signal.aborted && this.targetHash === requestedHash) return;
     this.focusedHash = null;
     this.targetRequestVersion += 1;
     this.targetController?.abort();
     this.targetController = undefined;
+    if (comparisonPostId(window.location.hash) === null) {
+      this.main?.querySelector("[data-comparison]")?.remove();
+      if (this.posts.length > 0) this.renderFeed();
+    }
     void this.resolveLocationPost(this.connectionGeneration);
   };
 
@@ -1617,7 +2056,7 @@ class GlimApp extends HTMLElement {
   }
 
   private showState(message: string, retry = false) {
-    this.main?.querySelectorAll(".state, .feed, [data-live-notice]").forEach((value) => value.remove());
+    this.main?.querySelectorAll(".state, .feed, [data-live-notice], [data-comparison]").forEach((value) => value.remove());
     const state = element("section", message);
     state.className = "state";
     state.setAttribute("aria-live", "polite");
@@ -1728,6 +2167,12 @@ class GlimApp extends HTMLElement {
     if (!this.isAppActive(generation)) return;
     this.main?.querySelector("[data-target-state]")?.remove();
     const requestedHash = window.location.hash;
+    const comparisonId = comparisonPostId(requestedHash);
+    if (comparisonId !== null) {
+      if (this.targetController && !this.targetController.signal.aborted) return;
+      await this.resolveComparison(comparisonId, requestedHash, generation);
+      return;
+    }
     const match = requestedHash.match(/^#post-([1-9][0-9]*)$/);
     if (!match) return;
     const postId = Number(match[1]);
@@ -1744,6 +2189,7 @@ class GlimApp extends HTMLElement {
     const requestVersion = this.targetRequestVersion;
     const controller = new AbortController();
     this.targetController = controller;
+    this.targetHash = requestedHash;
     const active = () => this.isAppActive(generation, controller.signal)
       && !this.closed
       && requestVersion === this.targetRequestVersion
@@ -1804,8 +2250,217 @@ class GlimApp extends HTMLElement {
       this.main?.querySelector(".feed")?.prepend(status);
       if (!status.isConnected) this.main?.append(status);
     } finally {
-      if (this.targetController === controller) this.targetController = undefined;
+      if (this.targetController === controller) {
+        this.targetController = undefined;
+        this.targetHash = undefined;
+      }
     }
+  }
+
+  private async resolveComparison(postId: number, requestedHash: string, generation: number) {
+    const requestVersion = this.targetRequestVersion;
+    const controller = new AbortController();
+    this.targetController = controller;
+    this.targetHash = requestedHash;
+    const active = () => this.isAppActive(generation, controller.signal)
+      && !this.closed
+      && requestVersion === this.targetRequestVersion
+      && window.location.hash === requestedHash;
+    const fetchPost = async (id: number): Promise<Post | null> => {
+      const existing = this.posts.find((post) => post.id === id);
+      if (existing) return existing;
+      const response = await fetch(`${API}/posts/${id}`, { signal: controller.signal });
+      if (!active()) return null;
+      if (response.status === 401) { this.showAuthenticationExpired(); return null; }
+      if (!response.ok) throw new Error(`Post ${id} could not be loaded (HTTP ${response.status})`);
+      const payload: unknown = await response.json();
+      if (!active()) return null;
+      if (!isPost(payload) || payload.id !== id) throw new Error(`Post ${id} returned malformed data`);
+      return payload;
+    };
+    const validateScope = async (post: Post): Promise<boolean> => {
+      if (this.route.kind === "session" && post.session_public_id !== this.route.publicId) {
+        throw new Error(`Post ${post.id} is outside this session`);
+      }
+      if (this.route.kind !== "project") return true;
+      let context = this.sessions.get(post.session_public_id);
+      if (!context) {
+        const response = await fetch(`${API}/sessions/${post.session_public_id}`, { signal: controller.signal });
+        if (!active()) return false;
+        if (response.status === 401) { this.showAuthenticationExpired(); return false; }
+        const payload: unknown = response.ok ? await response.json() : null;
+        if (!active()) return false;
+        if (!isSession(payload)) throw new Error(`Post ${post.id} is outside this project`);
+        context = payload;
+      }
+      if (context.id !== post.session_id || context.public_id !== post.session_public_id
+        || context.project.id !== this.route.projectId) throw new Error(`Post ${post.id} is outside this project`);
+      this.sessions.set(context.public_id, context);
+      return true;
+    };
+    try {
+      const newer = await fetchPost(postId);
+      if (!newer || !active() || !await validateScope(newer) || !active()) return;
+      if (newer.predecessor_post_id === null) throw new Error(`Post ${postId} has no predecessor`);
+      const older = await fetchPost(newer.predecessor_post_id);
+      if (!older || !active()) return;
+      if (older.id !== newer.predecessor_post_id
+        || older.session_id !== newer.session_id
+        || older.session_public_id !== newer.session_public_id) {
+        throw new Error("The predecessor relationship is invalid");
+      }
+      if (active()) this.renderComparison(newer, older);
+    } catch (error) {
+      if (!active() || (error instanceof DOMException && error.name === "AbortError")) return;
+      this.main?.querySelector("[data-comparison]")?.remove();
+      const status = element("p", error instanceof Error ? error.message : `Post ${postId} could not be compared`);
+      status.dataset.targetState = "";
+      status.className = "target-state";
+      status.setAttribute("role", "status");
+      this.main?.append(status);
+    } finally {
+      if (this.targetController === controller) {
+        this.targetController = undefined;
+        this.targetHash = undefined;
+      }
+    }
+  }
+
+  private navigateHash(hash: string) {
+    window.history.pushState({}, "", hash);
+    this.hashHandler();
+  }
+
+  private renderComparison(newer: Post, older: Post) {
+    this.main?.querySelectorAll(".state, .feed, [data-comparison]").forEach((value) => value.remove());
+    const comparison = element("section");
+    comparison.dataset.comparison = "";
+    const heading = element("h2", `Comparing post ${newer.id} with post ${older.id}`);
+    heading.tabIndex = -1;
+    const back = element("a", `Return to post ${newer.id}`);
+    back.href = `#post-${newer.id}`;
+    back.dataset.returnPost = "";
+    back.addEventListener("click", (event) => {
+      event.preventDefault();
+      this.navigateHash(back.hash);
+    });
+    comparison.append(heading, back);
+    const hasFilename = (file: PostFile) => file.filename.trim().length > 0;
+    const comparisonFilename = (file: PostFile) => hasFilename(file) ? file.filename : "Unnamed artifact";
+    const oldCounts = new Map<string, number>();
+    const newCounts = new Map<string, number>();
+    older.files.forEach((file) => oldCounts.set(file.filename, (oldCounts.get(file.filename) ?? 0) + 1));
+    newer.files.forEach((file) => newCounts.set(file.filename, (newCounts.get(file.filename) ?? 0) + 1));
+    const autoPairs = newer.files.flatMap((newFile) => {
+      if (!hasFilename(newFile) || newCounts.get(newFile.filename) !== 1 || oldCounts.get(newFile.filename) !== 1) return [];
+      const oldFile = older.files.find((candidate) => candidate.filename === newFile.filename);
+      return oldFile ? [{ oldFile, newFile }] : [];
+    });
+    const added = [...new Set(newer.files.filter((file) => hasFilename(file) && !oldCounts.has(file.filename)).map((file) => file.filename))];
+    const removed = [...new Set(older.files.filter((file) => hasFilename(file) && !newCounts.has(file.filename)).map((file) => file.filename))];
+    const manual = [...new Set([...older.files, ...newer.files]
+      .filter((file) => !hasFilename(file) || (oldCounts.get(file.filename) ?? 0) > 1 || (newCounts.get(file.filename) ?? 0) > 1)
+      .map((file) => hasFilename(file) ? file.filename : "unnamed artifacts"))];
+    const statusParts = [
+      added.length ? `Added: ${added.join(", ")}` : "",
+      removed.length ? `Removed: ${removed.join(", ")}` : "",
+      manual.length ? `Manual pairing required: ${manual.join(", ")}` : "",
+    ].filter(Boolean);
+    const status = element("p", statusParts.join(" · ") || "All artifacts paired by unique exact filename");
+    status.dataset.pairingStatus = "";
+    comparison.append(status);
+
+    const selectors = element("div");
+    selectors.className = "comparison-selectors";
+    const makeSelect = (labelText: string, files: PostFile[], marker: "oldArtifact" | "newArtifact") => {
+      const label = element("label", labelText);
+      const select = element("select");
+      select.dataset[marker] = "";
+      const none = element("option", `No ${labelText.toLowerCase()}`);
+      none.value = "";
+      select.append(none);
+      files.forEach((file) => {
+        const option = element("option", `${comparisonFilename(file)} (artifact ${file.position + 1})`);
+        option.value = String(file.position);
+        select.append(option);
+      });
+      label.append(select);
+      selectors.append(label);
+      return select;
+    };
+    const oldSelect = makeSelect("Previous artifact", older.files, "oldArtifact");
+    const newSelect = makeSelect("Current artifact", newer.files, "newArtifact");
+    if (autoPairs[0]) {
+      oldSelect.value = String(autoPairs[0].oldFile.position);
+      newSelect.value = String(autoPairs[0].newFile.position);
+    }
+    comparison.append(selectors);
+    const renderPair = () => {
+      comparison.querySelector("[data-selected-pair]")?.remove();
+      const oldFile = oldSelect.value === "" ? undefined : older.files[Number(oldSelect.value)];
+      const newFile = newSelect.value === "" ? undefined : newer.files[Number(newSelect.value)];
+      const selected = element("div");
+      selected.dataset.selectedPair = "";
+      if (!oldFile || !newFile) {
+        const state = element("p", oldFile
+          ? `Removed after post ${older.id}: ${comparisonFilename(oldFile)}`
+          : newFile
+            ? `Added in post ${newer.id}: ${comparisonFilename(newFile)}`
+            : "Choose artifacts to compare");
+        state.dataset.pairState = "";
+        selected.append(state);
+      }
+      if (oldFile && newFile && ["text", "json"].includes(oldFile.renderer) && ["text", "json"].includes(newFile.renderer)) {
+        const textComparison = document.createElement("glim-text-comparison") as GlimTextComparison;
+        textComparison.data = {
+          older: { postId: older.id, file: oldFile },
+          newer: { postId: newer.id, file: newFile },
+        };
+        selected.append(textComparison);
+      } else if (oldFile && newFile && ["image", "svg"].includes(oldFile.renderer) && ["image", "svg"].includes(newFile.renderer)) {
+        const images = document.createElement("glim-image-comparison") as GlimImageComparison;
+        images.data = {
+          older: { postId: older.id, file: oldFile },
+          newer: { postId: newer.id, file: newFile },
+        };
+        selected.append(images);
+      } else {
+        const columns = element("div");
+        columns.className = "comparison-columns";
+        for (const [label, post, file, sideName] of [
+          ["Previous", older, oldFile, "old"],
+          ["Current", newer, newFile, "new"],
+        ] as const) {
+          if (!file) continue;
+          const side = element("section");
+          side.dataset.compareSide = sideName;
+          side.append(element("h3", `${label}: ${file.filename || "Unnamed artifact"}`));
+          const artifact = document.createElement("glim-artifact") as GlimArtifact;
+          artifact.data = { postId: post.id, file };
+          side.append(artifact);
+          columns.append(side);
+        }
+        selected.append(columns);
+      }
+      comparison.append(selected);
+    };
+    oldSelect.addEventListener("change", () => {
+      const oldFile = oldSelect.value === "" ? undefined : older.files[Number(oldSelect.value)];
+      if (oldFile && hasFilename(oldFile) && oldCounts.get(oldFile.filename) === 1 && newCounts.get(oldFile.filename) === 1) {
+        newSelect.value = String(newer.files.find((file) => file.filename === oldFile.filename)!.position);
+      }
+      renderPair();
+    });
+    newSelect.addEventListener("change", () => {
+      const newFile = newSelect.value === "" ? undefined : newer.files[Number(newSelect.value)];
+      if (newFile && hasFilename(newFile) && newCounts.get(newFile.filename) === 1 && oldCounts.get(newFile.filename) === 1) {
+        oldSelect.value = String(older.files.find((file) => file.filename === newFile.filename)!.position);
+      }
+      renderPair();
+    });
+    renderPair();
+    this.main?.append(comparison);
+    heading.focus();
   }
 
   private focusPost(article: HTMLElement) {
@@ -1818,6 +2473,7 @@ class GlimApp extends HTMLElement {
   }
 
   private renderFeed() {
+    if (comparisonPostId(window.location.hash) !== null) return;
     this.main?.querySelectorAll(".state").forEach((value) => value.remove());
     if (this.posts.length === 0) {
       this.main?.querySelector(".feed")?.remove();
@@ -1883,7 +2539,14 @@ class GlimApp extends HTMLElement {
         window.history.pushState({}, "", revision.href);
         this.hashHandler();
       });
-      article.append(revision);
+      const compare = element("a", "Compare revisions");
+      compare.href = `#compare-${post.id}`;
+      compare.dataset.compare = "";
+      compare.addEventListener("click", (event) => {
+        event.preventDefault();
+        this.navigateHash(compare.hash);
+      });
+      article.append(revision, document.createTextNode(" · "), compare);
     }
     const provenanceDetails = element("details");
     provenanceDetails.className = "provenance";
@@ -2035,4 +2698,6 @@ class GlimApp extends HTMLElement {
 }
 
 if (!customElements.get("glim-artifact")) customElements.define("glim-artifact", GlimArtifact);
+if (!customElements.get("glim-text-comparison")) customElements.define("glim-text-comparison", GlimTextComparison);
+if (!customElements.get("glim-image-comparison")) customElements.define("glim-image-comparison", GlimImageComparison);
 if (!customElements.get("glim-app")) customElements.define("glim-app", GlimApp);

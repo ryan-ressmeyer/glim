@@ -267,6 +267,635 @@ describe("glim-app public route and element behavior", () => {
     expect(root.textContent).not.toContain("never-render-this-hash");
   });
 
+  test("opens an immediate-predecessor comparison without letting live rendering replace it and returns focus to the post", async () => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "download", "result.bin")] });
+    const older = post(9, { files: [file(0, "download", "result.bin")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+
+    await rendered(app, "Comparing post 10 with post 9");
+    expect(window.location.hash).toBe("#compare-10");
+    expect(app.shadowRoot?.querySelector("[data-comparison]")).not.toBeNull();
+    expect(app.shadowRoot?.querySelector(".feed")).toBeNull();
+    expect(app.shadowRoot?.querySelectorAll("[data-comparison] glim-artifact")).toHaveLength(2);
+    FakeEventSource.instances[0].emit("post", post(11));
+    expect(app.shadowRoot?.querySelector("[data-comparison]")).not.toBeNull();
+    expect(app.shadowRoot?.querySelector(".feed")).toBeNull();
+
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-return-post]")?.click();
+    await vi.waitFor(() => expect(app.shadowRoot?.activeElement?.id).toBe("post-10"));
+    expect(window.location.hash).toBe("#post-10");
+  });
+
+  test("restores a cold scoped comparison by fetching and validating the revised post", async () => {
+    setPath("/sessions/2zY8Ab#compare-10");
+    const newer = post(10, { predecessor_post_id: 9 });
+    const older = post(9);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/2zY8Ab/posts") return jsonResponse({ posts: [post(11)], next_cursor: null });
+      if (url === "/api/v1/posts/10") return jsonResponse(newer);
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+
+    const app = mount();
+
+    await rendered(app, "Comparing post 10 with post 9");
+    expect(app.shadowRoot?.querySelector("#post-10")).toBeNull();
+    expect(app.shadowRoot?.querySelector("[data-comparison]")).not.toBeNull();
+  });
+
+  test("pairs only unique nonblank exact filenames and supports manual renamed or duplicate selection", async () => {
+    const newer = post(10, {
+      predecessor_post_id: 9,
+      files: [
+        file(0, "download", "duplicate.bin"),
+        file(1, "download", "stable.bin"),
+        file(2, "download", "duplicate.bin"),
+        file(3, "download", "added.bin"),
+        file(4, "download", ""),
+        file(5, "download", "second-stable.bin"),
+      ],
+    });
+    const older = post(9, {
+      files: [
+        file(0, "download", "stable.bin"),
+        file(1, "download", "duplicate.bin"),
+        file(2, "download", "duplicate.bin"),
+        file(3, "download", "removed.bin"),
+        file(4, "download", ""),
+        file(5, "download", "second-stable.bin"),
+      ],
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+    await rendered(app, "Comparing post 10 with post 9");
+
+    const oldSelect = app.shadowRoot?.querySelector<HTMLSelectElement>("[data-old-artifact]")!;
+    const newSelect = app.shadowRoot?.querySelector<HTMLSelectElement>("[data-new-artifact]")!;
+    expect(oldSelect.value).toBe("0");
+    expect(newSelect.value).toBe("1");
+    expect(app.shadowRoot?.querySelector("[data-pairing-status]")?.textContent).toContain("Added: added.bin");
+    expect(app.shadowRoot?.querySelector("[data-pairing-status]")?.textContent).toContain("Removed: removed.bin");
+    expect(app.shadowRoot?.querySelector("[data-pairing-status]")?.textContent).toContain("Manual pairing required: duplicate.bin, unnamed artifacts");
+    newSelect.value = "5";
+    newSelect.dispatchEvent(new Event("change"));
+    expect(oldSelect.value).toBe("5");
+
+    oldSelect.value = "1";
+    oldSelect.dispatchEvent(new Event("change"));
+    newSelect.value = "0";
+    newSelect.dispatchEvent(new Event("change"));
+    const links = Array.from(app.shadowRoot?.querySelectorAll<HTMLElement>("[data-selected-pair] glim-artifact") ?? [])
+      .map((artifact) => artifact.shadowRoot?.querySelector<HTMLAnchorElement>("a[download]")?.getAttribute("href"));
+    expect(links).toEqual([
+      "/api/v1/posts/9/files/1/content",
+      "/api/v1/posts/10/files/0/content",
+    ]);
+
+    oldSelect.value = "";
+    oldSelect.dispatchEvent(new Event("change"));
+    newSelect.value = "3";
+    newSelect.dispatchEvent(new Event("change"));
+    expect(app.shadowRoot?.querySelector("[data-pair-state]")?.textContent).toBe("Added in post 10: added.bin");
+    expect(app.shadowRoot?.querySelectorAll("[data-selected-pair] glim-artifact")).toHaveLength(1);
+  });
+
+  test("requires whitespace-only filenames to be paired manually", async () => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "download", "   ")] });
+    const older = post(9, { files: [file(0, "download", "   ")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+    await rendered(app, "Comparing post 10 with post 9");
+
+    expect(app.shadowRoot?.querySelector<HTMLSelectElement>("[data-old-artifact]")?.value).toBe("");
+    expect(app.shadowRoot?.querySelector<HTMLSelectElement>("[data-new-artifact]")?.value).toBe("");
+    expect(app.shadowRoot?.querySelector("[data-pairing-status]")?.textContent).toContain("Manual pairing required: unnamed artifacts");
+  });
+
+  test("renders image revisions in independent panes with shared percentage zoom and Fit both", async () => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "image", "plot.png", "Current plot")] });
+    const older = post(9, { files: [file(0, "image", "plot.png", "Previous plot")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+    await rendered(app, "Comparing post 10 with post 9");
+
+    const imageComparison = app.shadowRoot?.querySelector<HTMLElement>("[data-image-comparison]")!;
+    const images = Array.from(imageComparison.querySelectorAll<HTMLImageElement>("[data-compare-image]"));
+    const panes = Array.from(imageComparison.querySelectorAll<HTMLElement>("[data-image-pane]"));
+    expect(images).toHaveLength(2);
+    expect(panes).toHaveLength(2);
+    expect(imageComparison.querySelector("[data-compare-actual]")).not.toBeNull();
+    expect(imageComparison.querySelector("[data-compare-zoom-out]")).not.toBeNull();
+    expect(Array.from(imageComparison.querySelectorAll<HTMLAnchorElement>("a[download]")).map((link) => link.getAttribute("href"))).toEqual([
+      "/api/v1/posts/9/files/0/content",
+      "/api/v1/posts/10/files/0/content",
+    ]);
+    Object.defineProperties(images[0], {
+      naturalWidth: { configurable: true, value: 1_000 },
+      naturalHeight: { configurable: true, value: 500 },
+    });
+    Object.defineProperties(images[1], {
+      naturalWidth: { configurable: true, value: 2_000 },
+      naturalHeight: { configurable: true, value: 1_000 },
+    });
+    panes.forEach((pane) => Object.defineProperties(pane, {
+      clientWidth: { configurable: true, value: 500 },
+      clientHeight: { configurable: true, value: 400 },
+    }));
+    images.forEach((image) => image.dispatchEvent(new Event("load")));
+    imageComparison.querySelector<HTMLButtonElement>("[data-compare-fit]")?.click();
+    expect(imageComparison.querySelector("[data-compare-zoom]")?.textContent).toBe("25%");
+    expect(images.map((image) => image.style.width)).toEqual(["250px", "500px"]);
+    imageComparison.querySelector<HTMLButtonElement>("[data-compare-zoom-in]")?.click();
+    expect(imageComparison.querySelector("[data-compare-zoom]")?.textContent).toBe("50%");
+    expect(images.map((image) => image.style.width)).toEqual(["500px", "1000px"]);
+    panes[0].scrollLeft = 100;
+    expect(panes[1].scrollLeft).toBe(0);
+
+    const retainedImages = [...images];
+    const oldSelect = app.shadowRoot?.querySelector<HTMLSelectElement>("[data-old-artifact]")!;
+    oldSelect.value = "";
+    oldSelect.dispatchEvent(new Event("change"));
+    expect(retainedImages.every((image) => !image.hasAttribute("src"))).toBe(true);
+  });
+
+  test("aligns text revisions by line and renders hostile diff text inertly", async () => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "text", "notes.txt")] });
+    const older = post(9, { files: [file(0, "text", "notes.txt")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/9/files/0/content") return new Response("alpha\nold <img src=x onerror=alert(1)>\nomega");
+      if (url === "/api/v1/posts/10/files/0/content") return new Response("alpha\nnew\nomega");
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelectorAll("[data-diff-row]")).toHaveLength(4));
+    const diff = app.shadowRoot?.querySelector<HTMLElement>("[data-text-comparison]")!;
+    expect(Array.from(diff.querySelectorAll<HTMLElement>("[data-diff-row]")).map((row) => row.dataset.diffKind))
+      .toEqual(["equal", "removed", "added", "equal"]);
+    expect(diff.textContent).toContain("old <img src=x onerror=alert(1)>");
+    expect(diff.querySelector("img")).toBeNull();
+    expect(diff.innerHTML).not.toContain("<img src=x");
+    expect(diff.textContent).toContain("Previous · text");
+    expect(diff.textContent).toContain("Current · text");
+    expect(Array.from(diff.querySelectorAll<HTMLAnchorElement>("a[download]")).map((link) => link.getAttribute("href"))).toEqual([
+      "/api/v1/posts/9/files/0/content",
+      "/api/v1/posts/10/files/0/content",
+    ]);
+  });
+
+  test("pretty-prints JSON before mixed-format comparison and discloses malformed raw fallback", async () => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "text", "renamed.txt")] });
+    const older = post(9, { files: [file(0, "json", "data.json")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/9/files/0/content") return new Response('{"b":2,"a":1}');
+      if (url === "/api/v1/posts/10/files/0/content") return new Response("plain text");
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+    await rendered(app, "Comparing post 10 with post 9");
+    const oldSelect = app.shadowRoot?.querySelector<HTMLSelectElement>("[data-old-artifact]")!;
+    const newSelect = app.shadowRoot?.querySelector<HTMLSelectElement>("[data-new-artifact]")!;
+    oldSelect.value = "0";
+    oldSelect.dispatchEvent(new Event("change"));
+    newSelect.value = "0";
+    newSelect.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-text-comparison]")?.textContent).toContain('"b": 2'));
+    const comparison = app.shadowRoot?.querySelector<HTMLElement>("[data-text-comparison]")!;
+    expect(comparison.textContent).toContain("Previous · json");
+    expect(comparison.textContent).toContain("Current · text");
+    expect(comparison.textContent?.indexOf('"b": 2')).toBeLessThan(comparison.textContent!.indexOf('"a": 1'));
+
+    comparison.remove();
+    const malformedNewer = post(12, { predecessor_post_id: 9, files: [file(0, "json", "data.json")] });
+    const malformed = document.createElement("glim-text-comparison") as HTMLElement & { data: unknown };
+    malformed.data = {
+      older: { postId: older.id, file: older.files[0] },
+      newer: { postId: malformedNewer.id, file: malformedNewer.files[0] },
+    };
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts/9/files/0/content") return new Response('{"ok":true}');
+      if (url === "/api/v1/posts/12/files/0/content") return new Response('{"unsafe":"<script>", broken');
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    app.shadowRoot?.querySelector("[data-selected-pair]")?.append(malformed);
+    await vi.waitFor(() => expect(malformed.querySelector("[data-json-fallback]")).not.toBeNull());
+    expect(malformed.textContent).toContain("comparing disclosed raw text instead");
+    expect(malformed.textContent).toContain('<script>');
+    expect(malformed.querySelector("script")).toBeNull();
+  });
+
+  test("preserves JSON key order, duplicate keys, numeric literals, and escaped punctuation", async () => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "json", "data.json")] });
+    const older = post(9, { files: [file(0, "json", "data.json")] });
+    const oldSource = '{"2":"b","1":"a","duplicate":1,"duplicate":2,"large":900719925474099312345,"escaped":"comma, colon: braces {} [] quote \\" slash \\\\"}';
+    const newSource = '{"1":"a","2":"b","duplicate":2,"large":900719925474099312346,"escaped":"comma, colon: braces {} [] quote \\" slash \\\\"}';
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/9/files/0/content") return new Response(oldSource);
+      if (url === "/api/v1/posts/10/files/0/content") return new Response(newSource);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelectorAll("[data-diff-row]").length).toBeGreaterThan(0));
+    const rows = Array.from(app.shadowRoot?.querySelectorAll<HTMLElement>("[data-diff-row]") ?? []);
+    const previous = rows.map((row) => row.children[0]?.textContent ?? "").join("\n");
+    const current = rows.map((row) => row.children[1]?.textContent ?? "").join("\n");
+    expect(previous.indexOf('"2": "b"')).toBeLessThan(previous.indexOf('"1": "a"'));
+    expect(previous.match(/"duplicate"/g)).toHaveLength(2);
+    expect(previous).toContain("900719925474099312345");
+    expect(current).toContain("900719925474099312346");
+    expect(previous).toContain('"escaped": "comma, colon: braces {} [] quote \\" slash \\\\"');
+    expect(rows.some((row) => row.dataset.diffKind !== "equal")).toBe(true);
+  });
+
+  test.each([
+    ["depth", "depth", "[".repeat(65) + "0" + "]".repeat(65), "64-level JSON formatting depth limit"],
+    ["ASCII size", "size", "[".repeat(64) + Array.from({ length: 140_000 }, () => "0").join(",") + "]".repeat(64), "16.0 MiB JSON formatting output limit"],
+    ["UTF-8 size", "size", "[".repeat(64) + Array.from({ length: 70_000 }, () => `"${"é".repeat(64)}"`).join(",") + "]".repeat(64), "16.0 MiB JSON formatting output limit"],
+  ])("falls back to raw text when JSON formatting exceeds the %s budget", async (_case, fallback, oversizedJson, disclosure) => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "json", "data.json")] });
+    const older = post(9, { files: [file(0, "json", "data.json")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url.endsWith("/content")) return new Response(oversizedJson);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector(`[data-json-format-fallback="${fallback}"]`)).not.toBeNull());
+    const comparison = app.shadowRoot?.querySelector<HTMLElement>("[data-text-comparison]")!;
+    expect(comparison.textContent).toContain(disclosure);
+    expect(comparison.textContent).not.toContain("Malformed JSON");
+    expect(comparison.textContent).toContain(oversizedJson.slice(0, 80));
+  });
+
+  test.each([
+    ["work", Array.from({ length: 501 }, (_, index) => `old-${index}`).join("\n"), Array.from({ length: 500 }, (_, index) => `new-${index}`).join("\n"), "250,000 comparison-cell"],
+    ["rows", Array.from({ length: 4_001 }, (_, index) => `same-${index}`).join("\n"), Array.from({ length: 4_001 }, (_, index) => `same-${index}`).join("\n"), "4,000 rendered-row"],
+  ])("falls back to finite plain viewing when the %s diff budget is exceeded", async (budget, oldText, newText, disclosure) => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "text", "large.txt")] });
+    const older = post(9, { files: [file(0, "text", "large.txt")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/9/files/0/content") return new Response(oldText);
+      if (url === "/api/v1/posts/10/files/0/content") return new Response(newText);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector(`[data-diff-fallback="${budget}"]`)).not.toBeNull());
+    const comparison = app.shadowRoot?.querySelector<HTMLElement>("[data-text-comparison]")!;
+    expect(comparison.textContent).toContain(disclosure);
+    expect(comparison.querySelectorAll("pre.plain-comparison")).toHaveLength(2);
+    expect(comparison.querySelector("[data-diff-row]")).toBeNull();
+  });
+
+  test("requires per-file large-document opt-in, defers the diff, and aborts both loads when deselected", async () => {
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver as unknown as typeof IntersectionObserver);
+    const large = { ...file(0, "text", "notes.txt"), blob: { hash: "hidden", byte_size: 16 * 1024 * 1024 + 1 } };
+    const newer = post(10, { predecessor_post_id: 9, files: [large] });
+    const older = post(9, { files: [file(0, "text", "notes.txt")] });
+    const signals: AbortSignal[] = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return Promise.resolve(jsonResponse({ posts: [newer], next_cursor: null }));
+      if (url === "/api/v1/posts/9") return Promise.resolve(jsonResponse(older));
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      if (url.endsWith("/content")) {
+        signals.push(init?.signal as AbortSignal);
+        return new Promise<Response>(() => undefined);
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await rendered(app, "Post 10");
+    await rendered(app, "agent-session");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+
+    await rendered(app, "Load full documents");
+    expect(composedText(app)).toContain("16.0 MiB");
+    expect(app.shadowRoot?.querySelector("[data-text-comparison]")?.querySelectorAll("a[download]")).toHaveLength(2);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/content"))).toBe(false);
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-load-full-comparison]")?.click();
+    await vi.waitFor(() => expect(TestIntersectionObserver.instances).toHaveLength(1));
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/content"))).toBe(false);
+    const observer = TestIntersectionObserver.instances[0];
+    const [target] = observer.observed;
+    observer.trigger(target, true);
+    await vi.waitFor(() => expect(signals).toHaveLength(2));
+
+    const oldSelect = app.shadowRoot?.querySelector<HTMLSelectElement>("[data-old-artifact]")!;
+    oldSelect.value = "";
+    oldSelect.dispatchEvent(new Event("change"));
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    app.remove();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  test("keeps comparison source downloads available when document loading fails", async () => {
+    vi.stubGlobal("IntersectionObserver", undefined);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+    const comparison = document.createElement("glim-text-comparison") as HTMLElement & { data: unknown };
+    comparison.data = {
+      older: { postId: 100, file: file(0, "text", "notes.txt") },
+      newer: { postId: 101, file: file(0, "text", "notes.txt") },
+    };
+    document.body.append(comparison);
+    try {
+      await vi.waitFor(() => expect(comparison.textContent).toContain("Could not load documents"));
+      expect(comparison.querySelectorAll("a[download]")).toHaveLength(2);
+    } finally { comparison.remove(); }
+  });
+
+  test("bounds temporary line arrays before falling back for newline-heavy documents", async () => {
+    vi.stubGlobal("IntersectionObserver", undefined);
+    const source = "line\n".repeat(20_000);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(source)));
+    const split = vi.spyOn(String.prototype, "split");
+    const comparison = document.createElement("glim-text-comparison") as HTMLElement & { data: unknown };
+    comparison.data = {
+      older: { postId: 100, file: file(0, "text", "lines.txt") },
+      newer: { postId: 101, file: file(0, "text", "lines.txt") },
+    };
+    document.body.append(comparison);
+    try {
+      await vi.waitFor(() => expect(comparison.querySelector('[data-diff-fallback="rows"]')).not.toBeNull());
+      const arrays = split.mock.results.filter((result, index) => String(split.mock.contexts[index]) === source && result.type === "return");
+      expect(arrays.length).toBeGreaterThan(0);
+      expect(arrays.every((result) => result.value.length <= 4_001)).toBe(true);
+      expect(Array.from(comparison.querySelectorAll("pre")).every((pre) => pre.textContent === source)).toBe(true);
+    } finally {
+      split.mockRestore();
+      comparison.remove();
+    }
+  });
+
+  test("shares the global three-document load budget across text comparison elements", async () => {
+    vi.stubGlobal("IntersectionObserver", undefined);
+    const resolvers: Array<(response: Response) => void> = [];
+    const fetchMock = vi.fn((_input: RequestInfo | URL) => new Promise<Response>((resolve) => resolvers.push(resolve)));
+    vi.stubGlobal("fetch", fetchMock);
+    const makeComparison = (base: number) => {
+      const comparison = document.createElement("glim-text-comparison") as HTMLElement & { data: unknown };
+      comparison.data = {
+        older: { postId: base, file: file(0, "text", `${base}.txt`) },
+        newer: { postId: base + 1, file: file(0, "text", `${base}.txt`) },
+      };
+      return comparison;
+    };
+    const first = makeComparison(100);
+    const second = makeComparison(200);
+    document.body.append(first, second);
+
+    await vi.waitFor(() => expect(resolvers).toHaveLength(3));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    resolvers[0](new Response("released"));
+    await vi.waitFor(() => expect(resolvers).toHaveLength(4));
+    first.remove();
+    second.remove();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  test("services only the latest comparison target when predecessor responses arrive out of order", async () => {
+    const newerTen = post(10, { predecessor_post_id: 9 });
+    const newerTwenty = post(20, { predecessor_post_id: 19 });
+    let resolveNine: ((response: Response) => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return Promise.resolve(jsonResponse({ posts: [newerTwenty, newerTen], next_cursor: null }));
+      if (url === "/api/v1/posts/9") return new Promise<Response>((resolve) => { resolveNine = resolve; });
+      if (url === "/api/v1/posts/19") return Promise.resolve(jsonResponse(post(19)));
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("#post-10 [data-compare]")?.click();
+    await vi.waitFor(() => expect(resolveNine).toBeDefined());
+    window.history.pushState({}, "", "#compare-20");
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+
+    await rendered(app, "Comparing post 20 with post 19");
+    resolveNine?.(jsonResponse(post(9)));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(app.shadowRoot?.querySelector("[data-comparison]")?.textContent).toContain("Comparing post 20 with post 19");
+    expect(app.shadowRoot?.textContent).not.toContain("Comparing post 10 with post 9");
+  });
+
+  test("does not duplicate an active comparison request and aborts it when the hash changes", async () => {
+    const newer = post(10, { predecessor_post_id: 9 });
+    let pageRequests = 0;
+    let resolveReconciliation: ((response: Response) => void) | undefined;
+    const targetSignals: AbortSignal[] = [];
+    const targetResolvers: Array<(response: Response) => void> = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        pageRequests += 1;
+        return pageRequests === 1
+          ? Promise.resolve(jsonResponse({ posts: [newer], next_cursor: null }))
+          : new Promise<Response>((resolve) => { resolveReconciliation = resolve; });
+      }
+      if (url === "/api/v1/posts/9") {
+        targetSignals.push(init?.signal as AbortSignal);
+        return new Promise<Response>((resolve) => targetResolvers.push(resolve));
+      }
+      if (url === "/api/v1/sessions/2zY8Ab") return Promise.resolve(jsonResponse(session));
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await rendered(app, "Post 10");
+    FakeEventSource.instances[0].emit("reset", {});
+    await vi.waitFor(() => expect(resolveReconciliation).toBeDefined());
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+    await vi.waitFor(() => expect(targetResolvers).toHaveLength(1));
+
+    resolveReconciliation?.(jsonResponse({ posts: [newer], next_cursor: null }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(targetResolvers).toHaveLength(1);
+
+    window.location.hash = "#post-10";
+    await vi.waitFor(() => expect(targetSignals[0].aborted).toBe(true));
+    expect(app.shadowRoot?.querySelector("#post-10")).not.toBeNull();
+  });
+
+  test("rejects a cold comparison whose revised post is outside the project route", async () => {
+    setPath("/projects/42#compare-10");
+    const outside = post(10, { session_id: 8, session_public_id: "3zY8Ab", predecessor_post_id: 9 });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/projects/42/posts") return jsonResponse({ posts: [], next_cursor: null });
+      if (url === "/api/v1/posts/10") return jsonResponse(outside);
+      if (url === "/api/v1/sessions/3zY8Ab") return jsonResponse({
+        ...session,
+        id: 8,
+        public_id: "3zY8Ab",
+        project: { ...session.project, id: 43 },
+      });
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+
+    await rendered(app, "Post 10 is outside this project");
+    expect(app.shadowRoot?.querySelector("[data-comparison]")).toBeNull();
+  });
+
+  test("rejects a predecessor whose validated identity leaves the revised post session", async () => {
+    const newer = post(10, { predecessor_post_id: 9 });
+    const wrongPredecessor = post(9, { session_id: 8, session_public_id: "3zY8Ab" });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(wrongPredecessor);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+
+    await rendered(app, "The predecessor relationship is invalid");
+    expect(app.shadowRoot?.querySelector("[data-comparison]")).toBeNull();
+  });
+
+  test("removes a comparison when authoritative reconciliation deletes its revised post", async () => {
+    const newer = post(10, { predecessor_post_id: 9 });
+    let pageRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") {
+        pageRequests += 1;
+        return pageRequests === 1
+          ? jsonResponse({ posts: [newer], next_cursor: null })
+          : jsonResponse({ posts: [post(11)], next_cursor: null });
+      }
+      if (url === "/api/v1/posts/9") return jsonResponse(post(9));
+      if (url === "/api/v1/posts/10") return jsonResponse({}, 404);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+    await rendered(app, "Comparing post 10 with post 9");
+
+    FakeEventSource.instances[0].emit("reset", {});
+
+    await rendered(app, "Post 10 could not be loaded (HTTP 404)");
+    expect(app.shadowRoot?.querySelector("[data-comparison]")).toBeNull();
+    expect(app.shadowRoot?.querySelector("#post-10")).toBeNull();
+  });
+
+  test("reuses isolated ordinary HTML artifact renderers in comparison", async () => {
+    const newer = post(10, { predecessor_post_id: 9, files: [file(0, "html", "page.html")] });
+    const older = post(9, { files: [file(0, "html", "page.html")] });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [newer], next_cursor: null });
+      if (url === "/api/v1/posts/9") return jsonResponse(older);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url.endsWith("/content")) return new Response("<script>parent.document.body.textContent='unsafe'</script>");
+      if (url.endsWith("/html-capability")) {
+        const match = url.match(/posts\/(\d+)\/files\/(\d+)/)!;
+        return jsonResponse({ path_prefix: `/api/v1/posts/${match[1]}/files/${match[2]}/support/`, expires_in_seconds: 300 });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 10");
+    app.shadowRoot?.querySelector<HTMLAnchorElement>("[data-compare]")?.click();
+    await vi.waitFor(() => {
+      const artifacts = Array.from(app.shadowRoot?.querySelectorAll<HTMLElement>("[data-comparison] glim-artifact") ?? []);
+      expect(artifacts).toHaveLength(2);
+      expect(artifacts.map((artifact) => artifact.shadowRoot?.querySelector("iframe")?.getAttribute("sandbox"))).toEqual(["", ""]);
+    });
+  });
+
+  test.each(["#compare-9007199254740992", "#compare-0", "#compare-invalid"])('ignores malformed comparison target "%s" without suppressing the feed', async (hash) => {
+    setPath(`/feed${hash}`);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+
+    await rendered(app, "Post 1");
+    expect(app.shadowRoot?.querySelector(".feed")).not.toBeNull();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("9007199254740992"))).toBe(false);
+  });
+
   test("shows loading, empty, malformed, HTTP error, and retry states without injecting errors", async () => {
     let resolveFirst: ((response: Response) => void) | undefined;
     const fetchMock = vi.fn((input: RequestInfo | URL) => {

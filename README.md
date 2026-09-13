@@ -135,6 +135,16 @@ Each valid feed route opens a scoped server-sent event stream. The daemon retain
 
 At the top of the page, live posts enter the feed immediately. Away from the top, the browser retains at most 100 pending posts without changing the feed or viewport. The new-content control merges that queue and returns focus to the newest post. A larger burst switches to reconciliation instead of retaining more data. Session pages send a heartbeat every 30 seconds only while visible and while SSE is open. They also provide a confirmed close control that stops live work and releases renderer resources after successful deletion.
 
+## Revision comparison
+
+Select **Compare revisions** on a revised post to inspect it beside its immediate predecessor. Comparison links use `#compare-POST_ID` within the current feed, session, or project route. **Return to post** restores the feed and focuses the revised post.
+
+Only one artifact pair is mounted at a time. Unique, nonblank, exact filenames pair automatically; use the Previous/Current selectors for renamed or duplicate names. Glimse reports added, removed, and ambiguous artifacts without guessing matches from file position. Desktop panes sit side by side; mobile panes and diff cells stack.
+
+Image/SVG pairs share **Fit both**, **100%**, and zoom controls, with independent scrolling. Focus the image comparison to use `+`, `-`, `0`, and `f`. Text and JSON pairs show inert line-level additions and removals. JSON formatting preserves source key order, duplicate keys, and numeric literals; malformed input uses disclosed raw text. Other formats retain their ordinary renderers and HTML isolation.
+
+Comparison retains the 16 MiB per-file opt-in and three concurrent document downloads. Line diffs stop at 250,000 changed-middle comparison cells or 4,000 rendered rows; temporary line arrays are also bounded. Beyond those limits, both complete documents remain available as plain side-by-side text. JSON formatting separately falls back to raw text beyond 64 nesting levels or 16 MiB of formatted UTF-8 output. Open and Download remain available; comparisons never modify either snapshot.
+
 ## CLI
 
 Every short-lived CLI command writes one JSON value to standard output. Failures use the same output channel and exit nonzero. A committed publication remains successful if an explicitly requested browser launch fails; `result.browser_launch` reports the launch outcome. `GLIM_DAEMON_URL` accepts an HTTP or HTTPS origin and defaults to `http://127.0.0.1:3030`. In token mode the CLI reads the configured token file and adds the Bearer credential without including it in output URLs.

@@ -501,6 +501,67 @@ const injected = document.createElement('script'); injected.src = target; docume
   await evaluate(`${app}.querySelector('#post-${revision.post.id} [data-revision]').click()`);
   await waitFor(`${app}.activeElement?.id === 'post-${firstFigure.post.id}' && scrollY > 0`, "revision scroll and focus");
 
+  // Renamed figures require deliberate manual pairing, never position inference.
+  await command("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  await evaluate(`${app}.querySelector('#post-${revision.post.id} [data-compare]').click()`);
+  await waitFor(`${app}?.querySelector('[data-comparison]')`, "comparison navigation");
+  if (await evaluate(`${app}.querySelector('[data-selected-pair] img') !== null || ${app}.querySelector('.feed') !== null`)) throw new Error("comparison guessed a renamed pair or retained feed renderers");
+  const selectCompared = async (marker, value) => {
+    await evaluate(`(() => { const select=${app}.querySelector('[data-${marker}-artifact]'); select.value=${JSON.stringify(String(value))}; select.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+  };
+  await selectCompared("old", 0);
+  await selectCompared("new", 0);
+  await waitFor(`${app}?.querySelectorAll('[data-compare-image]').length === 2 && [...${app}.querySelectorAll('[data-compare-image]')].every(img => img.complete && img.naturalWidth > 0)`, "manually paired images");
+  await evaluate(`${app}.querySelector('[data-compare-actual]').click(); ${app}.querySelector('[data-compare-zoom-in]').click()`);
+  const scales = await evaluate(`[...${app}.querySelectorAll('[data-compare-image]')].map(img => parseFloat(img.style.width)/img.naturalWidth)`);
+  if (scales.some(scale => Math.abs(scale - 1.25) > .001)) throw new Error(`image zoom was not shared: ${JSON.stringify(scales)}`);
+  await evaluate(`${app}.querySelector('[data-compare-fit]').click(); window.scrollTo(0,0)`);
+  await screenshot("comparison-images-desktop.png");
+  await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+  await screenshot("comparison-images-dark.png");
+  await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }, { name: "prefers-reduced-motion", value: "reduce" }] });
+  await command("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await evaluate(`${app}.querySelector('[data-compare-fit]').click()`);
+  if (await evaluate(`document.documentElement.scrollWidth > innerWidth || [...${app}.querySelectorAll('[data-image-pane]')].some(pane => pane.scrollWidth > pane.clientWidth + 1)`)) throw new Error("fitted mobile comparison overflows");
+  await screenshot("comparison-images-mobile.png");
+  await evaluate(`${app}.querySelector('[data-return-post]').click()`);
+  await waitFor(`${app}.activeElement?.id === 'post-${revision.post.id}' && !${app}.querySelector('[data-comparison]')`, "comparison returns to post with focus");
+
+  const comparisonFiles = (changed) => [
+    { name: "notes.txt", bytes: `first\n${changed ? "new" : "old"}\n<img src=x onerror=alert(1)>\nlast` },
+    { name: "fit.json", bytes: changed ? '{"2":"b","1":"a","fit":0.9}' : '{"1":"a","2":"b","fit":0.8}' },
+    { name: "safe.html", bytes: '<!doctype html><h1>Comparison HTML</h1><script>parent.document.body.dataset.comparisonEscape="yes"</script>' },
+    { name: "work.txt", bytes: Array.from({length: 501}, (_, i) => `${changed ? "new" : "old"}-${i}`).join("\n") },
+    { name: "rows.txt", bytes: Array.from({length: 4001}, (_, i) => `line-${i}`).join("\n") },
+  ];
+  const previousComparison = await publishInspection("Comparison baseline", comparisonFiles(false));
+  const currentComparison = await publishInspection("Comparison revised", comparisonFiles(true), previousComparison.post.id);
+  const comparisonUrl = `${daemonOrigin}/sessions/${inspection.session.public_id}#compare-${currentComparison.post.id}`;
+  await command("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  await command("Page.navigate", { url: comparisonUrl });
+  await waitFor(`${app}?.querySelector('[data-diff-row][data-diff-kind="added"]')`, "cold comparison text diff");
+  const inertDiff = await evaluate(`(() => { const view=${app}.querySelector('[data-text-comparison]'); return view.textContent.includes('<img src=x onerror=alert(1)>') && !view.querySelector('img,script'); })()`);
+  if (!inertDiff) throw new Error("text comparison content was not inert");
+  await screenshot("comparison-text-desktop.png");
+  await selectCompared("new", 1);
+  await waitFor(`${app}?.querySelector('[data-text-comparison]')?.textContent.includes('0.9')`, "JSON comparison formatting");
+  if (!await evaluate(`${app}.querySelector('[data-text-comparison]').textContent.includes('"2": "b"')`)) throw new Error("JSON comparison not pretty printed");
+  await selectCompared("new", 3);
+  await waitFor(`${app}?.querySelector('[data-diff-fallback="work"]')`, "bounded diff work fallback");
+  if (await evaluate(`${app}.querySelectorAll('pre.plain-comparison').length !== 2 || ${app}.querySelectorAll('[data-diff-row]').length !== 0`)) throw new Error("diff work fallback lost full documents");
+  await selectCompared("new", 4);
+  await waitFor(`${app}?.querySelector('[data-diff-fallback="rows"]')`, "bounded diff DOM fallback");
+  if (!await evaluate(`[...${app}.querySelectorAll('pre.plain-comparison')].every(pre => pre.textContent.endsWith('line-4000'))`)) throw new Error("diff row fallback truncated text");
+  await selectCompared("new", 2);
+  await waitFor(`${app}?.querySelectorAll('[data-comparison] glim-artifact').length === 2 && [...${app}.querySelectorAll('[data-comparison] glim-artifact')].every(artifact => artifact.shadowRoot.querySelector('iframe'))`, "sandboxed comparison HTML");
+  if (!await evaluate(`[...${app}.querySelectorAll('[data-comparison] glim-artifact')].every(artifact => artifact.shadowRoot.querySelector('iframe').getAttribute('sandbox') === '') && !document.body.dataset.comparisonEscape`)) throw new Error("comparison weakened HTML sandbox");
+  await selectCompared("new", 0);
+  await waitFor(`${app}?.querySelector('[data-diff-row]')`, "comparison pair switch releases HTML frames");
+  await command("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  if (await evaluate("document.documentElement.scrollWidth > innerWidth")) throw new Error("mobile text comparison overflows horizontally");
+  if (!await evaluate(`(() => { const cells=${app}.querySelector('[data-diff-row]').children; return cells[1].getBoundingClientRect().top >= cells[0].getBoundingClientRect().bottom; })()`)) throw new Error("mobile text comparison did not stack previous/current lines");
+  await screenshot("comparison-text-mobile.png");
+
   const largeBytes = "x".repeat(16 * 1024 * 1024) + "FULL_DOCUMENT_END";
   const columns = Array.from({ length: 105 }, (_, index) => `column${index}`).join(",");
   const csv = `${columns}\n${Array.from({ length: 204 }, () => Array(105).fill("1").join(",")).join("\n")}\n\"unterminated`;
@@ -518,9 +579,17 @@ const injected = document.createElement('script'); injected.src = target; docume
   if (!csvState.text.includes("first 200 rows") || !csvState.text.includes("first 100 of 105 columns") || !csvState.text.includes("CSV parse issues") || csvState.rows !== 200 || csvState.columns !== 100 || !csvState.fullscreen) throw new Error(`CSV disclosure failed: ${JSON.stringify(csvState)}`);
   await evaluate(`${largeArtifact}.querySelector('[data-load-full]').click(); ${app}.querySelector('#post-${documents.post.id}').scrollIntoView()`);
   await waitFor(`${largeArtifact}?.querySelector('pre')?.textContent.endsWith('FULL_DOCUMENT_END')`, "complete opted-in document", 300);
+  const oversizedRevision = await publishInspection("Large comparison revision", [{ name: "large.txt", bytes: "small replacement" }], documents.post.id);
+  await command("Page.navigate", { url: "about:blank" });
+  await command("Page.navigate", { url: `${daemonOrigin}/sessions/${inspection.session.public_id}#compare-${oversizedRevision.post.id}` });
+  await waitFor(`${app}?.querySelector('[data-load-full-comparison]')`, "comparison oversized-file opt-in");
+  if (await evaluate(`performance.getEntriesByType('resource').some(entry=>new URL(entry.name).pathname==='${largePath}')`)) throw new Error("comparison downloaded large document before opt-in");
+  await evaluate(`${app}.querySelector('[data-load-full-comparison]').click()`);
+  await waitFor(`${app}?.querySelector('[data-text-comparison]')?.textContent.includes('FULL_DOCUMENT_END')`, "comparison preserves complete opted-in text", 300);
   const purgeInspection = await fetch(`${daemonOrigin}/api/v1/sessions/${inspection.session.public_id}`, { method: "DELETE", headers: authenticatedHeaders() });
   if (!purgeInspection.ok) throw new Error("inspection session purge failed");
   await waitFor(`${app}?.querySelector('.state')?.textContent === 'Session closed'`, "inspection purge releases renderers");
+  console.log('Chromium comparison: cold links, manual pairing, shared image zoom, inert text/JSON, bounded diffs, HTML isolation, mobile layout, oversized opt-in, and deletion passed');
   console.log(`Chromium inspection: ${JSON.stringify(loading)}; 16 MiB opt-in, CSV disclosure, native modal, revision navigation, responsive screenshots passed`);
 
   if (runtimeExceptions.length > 0) throw new Error(`browser runtime exceptions: ${JSON.stringify(runtimeExceptions)}`);
