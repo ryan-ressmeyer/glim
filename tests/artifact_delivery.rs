@@ -629,7 +629,7 @@ async fn support_dependencies_receive_safe_nosniff_compatible_media_types() {
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
-            "private, max-age=31536000, immutable"
+            "private, no-cache"
         );
         assert_eq!(
             response
@@ -677,7 +677,7 @@ async fn visible_artifact_get_head_and_single_ranges_have_exact_headers_and_byte
     assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
     assert_eq!(
         response.headers()[header::CACHE_CONTROL],
-        "private, max-age=31536000, immutable"
+        "private, no-cache"
     );
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     let disposition = response.headers()[header::CONTENT_DISPOSITION]
@@ -903,4 +903,97 @@ async fn missing_or_corrupt_finalized_artifacts_return_sanitized_integrity_error
         assert!(!payload.to_string().contains("blobs"));
         assert!(!payload.to_string().contains(root.path().to_str().unwrap()));
     }
+}
+
+#[tokio::test]
+async fn reused_post_ids_revalidate_by_blob_hash_instead_of_immutable_caching() {
+    let root = TempDir::new().unwrap();
+    let (store, first_id) = artifact_store(&root, "figure.txt", b"first bytes");
+    let uri = format!("/api/v1/posts/{first_id}/files/0/content");
+    let first = artifact_request(glim::app_with_store(store), Method::GET, &uri, None).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.headers()[header::CACHE_CONTROL], "private, no-cache");
+    let first_etag = first.headers()[header::ETAG].to_str().unwrap().to_owned();
+    assert!(first_etag.starts_with('"') && first_etag.ends_with('"') && first_etag.len() > 2);
+
+    let mut store = Store::open(root.path()).unwrap();
+    let session = store
+        .resolve_session("pi", "delivery", "Glim", "/tmp/delivery")
+        .unwrap();
+    store.close_session(&session.public_id).unwrap();
+    drop(store);
+    let (store, second_id) = artifact_store(&root, "figure.txt", b"second bytes");
+    assert_eq!(second_id, first_id, "SQLite reissues the purged post id");
+    let app = glim::app_with_store(store);
+
+    let stale = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .header(header::IF_NONE_MATCH, &first_etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stale.status(),
+        StatusCode::OK,
+        "stale validator must not produce 304"
+    );
+    let second_etag = stale.headers()[header::ETAG].to_str().unwrap().to_owned();
+    assert_ne!(second_etag, first_etag);
+    assert_eq!(
+        stale.into_body().collect().await.unwrap().to_bytes(),
+        "second bytes"
+    );
+
+    for validator in [second_etag.as_str(), "*", &format!("W/{second_etag}")] {
+        let fresh = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&uri)
+                    .header(header::IF_NONE_MATCH, validator)
+                    .header(header::RANGE, "bytes=0-2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh.status(), StatusCode::NOT_MODIFIED, "{validator}");
+        assert_eq!(fresh.headers()[header::ETAG], second_etag.as_str());
+        assert_eq!(fresh.headers()[header::CACHE_CONTROL], "private, no-cache");
+        assert!(
+            fresh
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .is_none_or(|v| v == "0")
+        );
+        assert!(
+            fresh
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
+    let support = artifact_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/posts/{second_id}/files/0/support/nested/asset.png"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        support.headers()[header::CACHE_CONTROL],
+        "private, no-cache"
+    );
+    assert!(support.headers().contains_key(header::ETAG));
 }

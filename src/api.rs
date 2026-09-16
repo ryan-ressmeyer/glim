@@ -1328,6 +1328,18 @@ async fn artifact_response(
     headers: HeaderMap,
     artifact: crate::storage::AssociatedArtifact,
 ) -> Result<Response, ApiError> {
+    if if_none_match_matches(headers.get(header::IF_NONE_MATCH), &artifact.hash) {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-cache"),
+        );
+        response
+            .headers_mut()
+            .insert(header::ETAG, artifact_etag(&artifact)?);
+        return Ok(response);
+    }
     let range = parse_range(headers.get(header::RANGE), artifact.byte_size);
     let (status, start, length, content_range) = match range {
         Ok(Some((start, end))) => (
@@ -1387,8 +1399,9 @@ fn artifact_headers(
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=31536000, immutable"),
+        HeaderValue::from_static("private, no-cache"),
     );
+    headers.insert(header::ETAG, artifact_etag(artifact)?);
     headers.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
@@ -2001,4 +2014,19 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(self.body)).into_response()
     }
+}
+
+fn artifact_etag(artifact: &crate::storage::AssociatedArtifact) -> Result<HeaderValue, ApiError> {
+    HeaderValue::from_str(&format!("\"{}\"", artifact.hash)).map_err(|_| ApiError::internal())
+}
+
+/// Weak comparison per RFC 9110 §13.1.2: `*`, and `W/` prefixes are ignored.
+fn if_none_match_matches(value: Option<&HeaderValue>, hash: &str) -> bool {
+    let Some(value) = value.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let quoted = format!("\"{hash}\"");
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == quoted
+    })
 }

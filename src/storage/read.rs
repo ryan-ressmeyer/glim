@@ -81,6 +81,7 @@ pub(crate) struct AssociatedArtifact {
     pub filename: String,
     pub media_type: String,
     pub byte_size: u64,
+    pub hash: String,
 }
 
 #[derive(Clone, Copy)]
@@ -265,6 +266,7 @@ impl Store {
             filename: found.0,
             media_type,
             byte_size,
+            hash: found.1,
         })
     }
 
@@ -275,14 +277,15 @@ impl Store {
         hash: String,
         byte_size: i64,
     ) -> Result<AssociatedArtifact, StoreError> {
-        let hash = BlobHash::parse(&hash).map_err(|_| invalid_metadata("blob hash"))?;
+        let parsed = BlobHash::parse(&hash).map_err(|_| invalid_metadata("blob hash"))?;
         let byte_size = u64::try_from(byte_size).map_err(|_| invalid_metadata("blob byte size"))?;
-        let file = self.open_blob(&BlobRecord::from_parts(hash, byte_size))?;
+        let file = self.open_blob(&BlobRecord::from_parts(parsed, byte_size))?;
         Ok(AssociatedArtifact {
             file,
             filename,
             media_type,
             byte_size,
+            hash,
         })
     }
 
