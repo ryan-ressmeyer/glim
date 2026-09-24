@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type, type Static } from "typebox";
 
 import { GlimCliError, runGlim, type CliRunner } from "./client.js";
@@ -7,6 +8,9 @@ import type { BrowserLaunch, PublicationDetails } from "./types.js";
 
 export const GLIM_CLOSE_ENTRY = "glimse-pi-close-v1";
 const COMMAND_MESSAGE = "glimse-pi-command-v1";
+const GLIM_PUBLISH_TOOL = "glim_publish";
+const GLIM_SKILL = resolve(dirname(fileURLToPath(import.meta.url)), "../../generic-skill/glim/SKILL.md");
+const AVAILABILITY_TIMEOUT_MS = 2000;
 const MAX_COMMAND_TEXT = 4096;
 
 const FileSchema = Type.Object({
@@ -42,6 +46,21 @@ interface Dependencies {
 function bounded(text: unknown, limit = MAX_COMMAND_TEXT): string {
   const value = String(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "�");
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+}
+
+function isUsableStatus(value: unknown): boolean {
+  const status = value as any;
+  const nonnegative = (field: string) => Number.isSafeInteger(status?.[field]) && status[field] >= 0;
+  const positive = (field: string) => Number.isSafeInteger(status?.[field]) && status[field] > 0;
+  return !!status && typeof status === "object" && status.ok === true &&
+    typeof status.version === "string" && status.version.trim().length > 0 &&
+    ["finalized_unique_blob_bytes", "active_sessions", "sessions_due_for_purge", "queued_blob_deletions"].every(nonnegative) &&
+    ["max_upload_bytes", "max_finalized_blob_bytes", "retention_seconds", "cleanup_interval_seconds"].every(positive) &&
+    status.max_upload_bytes <= status.max_finalized_blob_bytes &&
+    (status.staging_bytes_in_use === undefined || nonnegative("staging_bytes_in_use")) &&
+    (status.max_staging_bytes === undefined || (positive("max_staging_bytes") && status.max_upload_bytes <= status.max_staging_bytes)) &&
+    (status.max_concurrent_publications === undefined ||
+      (Number.isSafeInteger(status.max_concurrent_publications) && status.max_concurrent_publications >= 1 && status.max_concurrent_publications <= 4));
 }
 
 function requirePublicationResult(value: unknown): PublicationResult {
@@ -107,6 +126,13 @@ function formatFailure(error: unknown): string {
 export function createGlimExtension(dependencies: Dependencies) {
   return function glimExtension(pi: ExtensionAPI): void {
     let current: PublicationDetails | undefined;
+    let available = false;
+
+    const setAvailable = (next: boolean) => {
+      available = next;
+      const active = pi.getActiveTools().filter((name) => name !== GLIM_PUBLISH_TOOL);
+      pi.setActiveTools(next ? [...active, GLIM_PUBLISH_TOOL] : active);
+    };
 
     const reconstruct = (ctx: ExtensionContext) => {
       current = undefined;
@@ -133,11 +159,20 @@ export function createGlimExtension(dependencies: Dependencies) {
       }
     };
 
-    pi.on("session_start", async (_event, ctx) => reconstruct(ctx));
+    pi.on("session_start", async (_event, ctx) => {
+      reconstruct(ctx);
+      try {
+        const envelope = await dependencies.run(["status"], undefined, undefined, { timeoutMs: AVAILABILITY_TIMEOUT_MS });
+        setAvailable(isUsableStatus(envelope.result));
+      } catch {
+        setAvailable(false);
+      }
+    });
     pi.on("session_tree", async (_event, ctx) => reconstruct(ctx));
+    pi.on("resources_discover", () => available ? { skillPaths: [GLIM_SKILL] } : {});
 
     pi.registerTool({
-      name: "glim_publish",
+      name: GLIM_PUBLISH_TOOL,
       label: "Publish with Glimse",
       description: "Publish one immutable Glimse post containing an ordered set of deliberate visual or inspectable artifacts. The existing glim CLI handles files, assets, Git provenance, authentication, HTTP, and daemon validation.",
       promptSnippet: "Publish deliberate inspectable artifacts as an immutable Glimse post",

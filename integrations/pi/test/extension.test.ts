@@ -16,16 +16,41 @@ function success(publicId = "Public123", postId = 41, opened = false) {
   };
 }
 
+function healthyStatus(ok = true) {
+  return {
+    schema_version: 1 as const,
+    ok: true as const,
+    result: {
+      ok,
+      version: "0.1.0",
+      staging_bytes_in_use: 0,
+      finalized_unique_blob_bytes: 10,
+      max_upload_bytes: 20,
+      max_staging_bytes: 40,
+      max_finalized_blob_bytes: 30,
+      max_concurrent_publications: 4,
+      active_sessions: 2,
+      sessions_due_for_purge: 1,
+      queued_blob_deletions: 3,
+      retention_seconds: 604800,
+      cleanup_interval_seconds: 3600,
+    },
+  };
+}
+
 function harness(sessionId = "session-A", branch: unknown[] = [], mode: "tui" | "rpc" | "json" | "print" = "tui") {
   const hasUI = mode === "tui" || mode === "rpc";
   const tools: any[] = [];
+  let activeTools = ["read", "bash"];
   const commands = new Map<string, any>();
   const handlers = new Map<string, any[]>();
   const entries: any[] = [];
   const messages: any[] = [];
   const notifications: any[] = [];
   const pi: any = {
-    registerTool: (tool: any) => tools.push(tool),
+    registerTool: (tool: any) => { tools.push(tool); activeTools.push(tool.name); },
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (names: string[]) => { activeTools = [...names]; },
     registerCommand: (name: string, command: any) => commands.set(name, command),
     on: (event: string, handler: any) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
     appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }),
@@ -38,7 +63,7 @@ function harness(sessionId = "session-A", branch: unknown[] = [], mode: "tui" | 
     sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
     ui: { notify: (text: string, level: string) => notifications.push({ text, level }) },
   };
-  return { pi, ctx, tools, commands, handlers, entries, messages, notifications };
+  return { pi, ctx, tools, commands, handlers, entries, messages, notifications, activeTools: () => activeTools };
 }
 
 describe("registration", () => {
@@ -67,7 +92,53 @@ describe("registration", () => {
     expect(files.items.required).toEqual(["path"]);
     expect(Object.keys(files.items.properties)).toEqual(["path", "published_filename", "caption", "media_type", "collect_assets"]);
     expect([...h.commands.keys()]).toEqual(["glim-feed", "glim-status", "glim-close"]);
+    expect(h.activeTools()).toEqual(["read", "bash", "glim_publish"]);
     expect(h.handlers.has("session_shutdown")).toBe(false);
+  });
+});
+
+describe("availability gating", () => {
+  test("publishes the tool and bundled skill only after one bounded healthy status probe", async () => {
+    const run = vi.fn<CliRunner>().mockResolvedValue(healthyStatus());
+    const h = harness();
+    createGlimExtension({ run })(h.pi);
+
+    await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledWith(["status"], undefined, undefined, { timeoutMs: 2000 });
+    expect(h.activeTools()).toEqual(["read", "bash", "glim_publish"]);
+    const resources = await h.handlers.get("resources_discover")![0]({ reason: "startup" }, h.ctx);
+    expect(resources.skillPaths).toHaveLength(1);
+    expect(resources.skillPaths[0]).toMatch(/integrations\/generic-skill\/glim\/SKILL\.md$/);
+    expect(h.notifications).toHaveLength(0);
+    expect(h.messages).toHaveLength(0);
+  });
+
+  test("silently hides the tool and skill when status is malformed, unhealthy, or unreachable, including after reload", async () => {
+    const run = vi.fn<CliRunner>()
+      .mockResolvedValueOnce(healthyStatus())
+      .mockResolvedValueOnce({ schema_version: 1, ok: true, result: { ok: true } })
+      .mockResolvedValueOnce(healthyStatus(false))
+      .mockRejectedValueOnce(new Error("missing glim"));
+    const h = harness();
+    createGlimExtension({ run })(h.pi);
+    const sessionStart = h.handlers.get("session_start")![0];
+    const discover = h.handlers.get("resources_discover")![0];
+
+    await sessionStart({ reason: "startup" }, h.ctx);
+    expect(h.activeTools()).toContain("glim_publish");
+    expect((await discover({ reason: "startup" }, h.ctx)).skillPaths).toHaveLength(1);
+
+    for (const reason of ["reload", "reload", "reload"]) {
+      await sessionStart({ reason }, h.ctx);
+      expect(h.activeTools()).toEqual(["read", "bash"]);
+      expect(await discover({ reason }, h.ctx)).toEqual({});
+    }
+
+    expect(run).toHaveBeenCalledTimes(4);
+    expect(h.notifications).toHaveLength(0);
+    expect(h.messages).toHaveLength(0);
   });
 });
 
@@ -193,12 +264,11 @@ describe("branch state and commands", () => {
   });
 
   test("status displays only bounded aggregate fields", async () => {
-    const run = vi.fn<CliRunner>().mockResolvedValue({ schema_version: 1, ok: true, result: {
-      ok: true, version: "0.1.0", finalized_unique_blob_bytes: 10, max_upload_bytes: 20,
-      max_finalized_blob_bytes: 30, active_sessions: 2, sessions_due_for_purge: 1,
-      queued_blob_deletions: 3, retention_seconds: 604800, cleanup_interval_seconds: 3600,
-      token: "secret", store_root: "/private/path",
-    } });
+    const response = healthyStatus();
+    const run = vi.fn<CliRunner>().mockResolvedValue({
+      ...response,
+      result: { ...response.result, token: "secret", store_root: "/private/path" },
+    });
     const h = harness();
     createGlimExtension({ run })(h.pi);
     await h.commands.get("glim-status").handler("", h.ctx);
@@ -209,7 +279,10 @@ describe("branch state and commands", () => {
   test("close persists and clears only after confirmed success; failure preserves state", async () => {
     const valid: any = { pi_session_id: "session-A", public_session_id: "Close88", post_id: 2, viewer_url: "https://h/sessions/Close88", post_url: "https://h/sessions/Close88#post-2", browser_launch: {}, external_session_key: "pi-session-A", project_label: "p", working_directory: "/p" };
     const branch = [{ type: "message", message: { role: "toolResult", toolName: "glim_publish", isError: false, details: valid } }];
-    const run = vi.fn<CliRunner>().mockRejectedValueOnce(Object.assign(new Error("busy"), { code: "daemon_unavailable" })).mockResolvedValueOnce({ schema_version: 1, ok: true, result: {} });
+    const run = vi.fn<CliRunner>()
+      .mockResolvedValueOnce(healthyStatus())
+      .mockRejectedValueOnce(Object.assign(new Error("busy"), { code: "daemon_unavailable" }))
+      .mockResolvedValueOnce({ schema_version: 1, ok: true, result: {} });
     const h = harness("session-A", branch);
     createGlimExtension({ run })(h.pi);
     await h.handlers.get("session_start")![0]({}, h.ctx);
@@ -217,7 +290,7 @@ describe("branch state and commands", () => {
     await h.commands.get("glim-feed").handler("", h.ctx);
     expect(h.notifications.at(-1).text).toContain("Close88");
     await h.commands.get("glim-close").handler("", h.ctx);
-    expect(run.mock.calls[1][0]).toEqual(["close", "Close88"]);
+    expect(run.mock.calls[2][0]).toEqual(["close", "Close88"]);
     expect(h.entries).toEqual([{ customType: GLIM_CLOSE_ENTRY, data: { pi_session_id: "session-A", public_session_id: "Close88" } }]);
     expect(h.notifications.at(-1).text).toContain("purged");
   });

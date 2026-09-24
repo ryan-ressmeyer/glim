@@ -6,11 +6,10 @@ import { resolve } from "node:path";
 const root = resolve(import.meta.dirname, "../../..");
 const manifest = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
 
-test("root manifest discovers exactly the Pi extension and generic skill", async () => {
+test("root manifest discovers only the Pi extension so it can gate the bundled skill", async () => {
   assert.deepEqual(manifest.keywords, ["pi-package"]);
   assert.deepEqual(manifest.pi, {
     extensions: ["./integrations/pi/src/index.ts"],
-    skills: ["./integrations/generic-skill/glim"],
   });
   await access(resolve(root, "integrations/pi/src/index.ts"));
   await access(resolve(root, "integrations/generic-skill/glim/SKILL.md"));

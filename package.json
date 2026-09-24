@@ -8,8 +8,7 @@
     "node": ">=22.19 <25"
   },
   "pi": {
-    "extensions": ["./integrations/pi/src/index.ts"],
-    "skills": ["./integrations/generic-skill/glim"]
+    "extensions": ["./integrations/pi/src/index.ts"]
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p integrations/pi/tsconfig.json",

@@ -20,6 +20,7 @@ export type CliRunner = (
   args: string[],
   input?: unknown,
   signal?: AbortSignal,
+  options?: RunOptions,
 ) => Promise<CliSuccess<any>>;
 
 export class GlimCliError extends Error {
