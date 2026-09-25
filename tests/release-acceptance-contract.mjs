@@ -41,7 +41,7 @@ test("opt-in release acceptance is wired into Make and static CI only", async ()
   assert.match(makefile, /^check: .*release-acceptance-check/m);
 
   const ci = await read(".github/workflows/ci.yml");
-  assert.match(ci, /run: make check/);
+  assert.match(ci, /^\s+make check$/m);
   assert.doesNotMatch(ci, /make release-acceptance(?:\s|$)/);
 });
 

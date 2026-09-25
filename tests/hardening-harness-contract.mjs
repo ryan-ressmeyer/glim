@@ -22,6 +22,16 @@ test("acceptance overrides remain independently configurable", () => {
   assert.equal(configuration.maxHwmGrowthBytes, 2097152);
 });
 
+test("complete checks run Rust before Chromium while Chromium builds the frontend", async () => {
+  const makefile = await readFile(new URL("../Makefile", import.meta.url), "utf8");
+  const prerequisites = makefile.match(/^check: (.+)$/m)?.[1].split(" ");
+  assert.ok(prerequisites, "make check must declare prerequisites");
+  assert.ok(prerequisites.includes("rust-checks") && prerequisites.includes("chromium-security-check"), "complete checks must include Rust and Chromium");
+  assert.ok(prerequisites.indexOf("rust-checks") < prerequisites.indexOf("chromium-security-check"), "Rust checks must precede Chromium checks");
+  assert.match(makefile, /^chromium-security-check: build$/m);
+  assert.match(makefile, /^build: frontend-build$/m);
+});
+
 test("ordinary Chromium daemon regression allocates an ephemeral port", () => {
   assert.doesNotMatch(chromiumHarness, /127\.0\.0\.1:3030|listen\(3030/);
   assert.match(chromiumHarness, /listen\(0, "127\.0\.0\.1"/);

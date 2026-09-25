@@ -52,7 +52,11 @@ jobs:
         working-directory: web
         run: npm ci
       - name: Run complete repository checks
-        run: make check
+        env:
+          CHROMIUM: /usr/bin/google-chrome
+        run: |
+          "$CHROMIUM" --version
+          make check
       - name: Build release binary with embedded frontend
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu
       - name: Package binary and checksum

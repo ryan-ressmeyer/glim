@@ -83,13 +83,20 @@ test("tag release workflow builds and publishes a traceable checked Linux artifa
   assert.match(workflow, /files: \|[\s\S]*\.tar\.gz[\s\S]*\.tar\.gz\.sha256/);
 });
 
+test("complete CI checks select and report the runner's Google Chrome", () => {
+  for (const path of [".github/workflows/ci.yml", ".github/workflows/release.yml"]) {
+    const workflow = read(path);
+    assert.match(workflow, /- name: Run complete(?: repository)? checks\n\s+env:\n\s+CHROMIUM: \/usr\/bin\/google-chrome\n\s+run: \|\n\s+"\$CHROMIUM" --version\n\s+make check/, path);
+  }
+});
+
 test("ordinary CI and make check enforce the release contract without publishing", () => {
   const makefile = read("Makefile");
   assert.match(makefile, /^release-contract-check:\n\tnode tests\/release-contract\.mjs$/m);
   assert.match(makefile, /^check: .*release-contract-check/m);
 
   const ci = read(".github/workflows/ci.yml");
-  assert.match(ci, /run: make check/);
+  assert.match(ci, /^\s+make check$/m);
   assert.doesNotMatch(ci, /action-gh-release|upload-release-asset|gh release/);
 });
 

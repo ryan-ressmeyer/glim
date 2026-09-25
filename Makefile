@@ -62,4 +62,4 @@ pi-package-check: pi-package-typecheck pi-package-test
 	npm run check:package
 	npm run test:pi-load
 
-check: check-frontend generic-skill-check pi-package-check release-contract-check release-acceptance-check chromium-security-check benchmark-compile resource-acceptance-check rust-checks
+check: check-frontend generic-skill-check pi-package-check release-contract-check release-acceptance-check rust-checks chromium-security-check benchmark-compile resource-acceptance-check
