@@ -176,8 +176,12 @@ const publishHtml = async (externalKey, title, supportScript) => {
 };
 
 let browser;
+let browserStart;
 let socket;
+let browserOutput = "";
 let browserErrors = "";
+let browserSpawnError;
+let browserExit = "running";
 try {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
@@ -229,6 +233,7 @@ const injected = document.createElement('script'); injected.src = target; docume
   const debuggingPort = probeAddress.port;
   await new Promise((resolve, reject) => portProbe.close((error) => error ? reject(error) : resolve()));
 
+  browserStart = performance.now();
   browser = spawn(chromium, [
     "--headless=new",
     "--no-sandbox",
@@ -236,8 +241,11 @@ const injected = document.createElement('script'); injected.src = target; docume
     `--remote-debugging-port=${debuggingPort}`,
     `--user-data-dir=${profile}`,
     "about:blank",
-  ], { stdio: ["ignore", "ignore", "pipe"] });
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  browser.stdout.on("data", (chunk) => { browserOutput += chunk; });
   browser.stderr.on("data", (chunk) => { browserErrors += chunk; });
+  browser.on("error", (error) => { browserSpawnError = error; });
+  browser.on("exit", (code, signal) => { browserExit = `code=${code} signal=${signal}`; });
 
   let version;
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -252,7 +260,7 @@ const injected = document.createElement('script'); injected.src = target; docume
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  if (!version) throw new Error(`Chromium debugging endpoint did not start\n${browserErrors}`);
+  if (!version) throw new Error("Chromium debugging endpoint did not start");
   const pages = await (await fetch(`http://127.0.0.1:${debuggingPort}/json/list`)).json();
   const pageTarget = pages.find((candidate) => candidate.type === "page");
   if (!pageTarget) throw new Error("Chromium did not expose a page target");
@@ -595,7 +603,7 @@ const injected = document.createElement('script'); injected.src = target; docume
   if (runtimeExceptions.length > 0) throw new Error(`browser runtime exceptions: ${JSON.stringify(runtimeExceptions)}`);
   console.log(`Chromium live feed: ${pdfBytes.length}-byte, 200-page native PDF plus capability isolation, insertion, queueing, closure, heartbeat, and confirmed close passed`);
 } catch (error) {
-  throw new Error(`${error.message}\nDaemon stderr:\n${daemonErrors}\nChromium stderr:\n${browserErrors}`);
+  throw new Error(`${error.message}\nDaemon stderr:\n${daemonErrors}${browser ? `\nChromium startup: executable=${chromium} elapsed=${Math.round(performance.now() - browserStart)}ms spawn error=${browserSpawnError?.message ?? "none"} exit=${browserExit}\nChromium stdout:\n${browserOutput}` : ""}\nChromium stderr:\n${browserErrors}`);
 } finally {
   socket?.close();
   browser?.kill("SIGTERM");

@@ -113,6 +113,7 @@ if (!probeAddress || typeof probeAddress === "string") throw new Error("could no
 const debuggingPort = probeAddress.port;
 await new Promise((resolve, reject) => portProbe.close((error) => error ? reject(error) : resolve()));
 const profile = await mkdtemp(path.join(os.tmpdir(), "glim-chromium-"));
+const browserStart = performance.now();
 const browser = spawn(chromium, [
   "--headless=new",
   "--no-sandbox",
@@ -120,9 +121,15 @@ const browser = spawn(chromium, [
   `--remote-debugging-port=${debuggingPort}`,
   `--user-data-dir=${profile}`,
   "about:blank",
-], { stdio: ["ignore", "ignore", "pipe"] });
+], { stdio: ["ignore", "pipe", "pipe"] });
+let browserOutput = "";
 let browserErrors = "";
+let browserSpawnError;
+let browserExit = "running";
+browser.stdout.on("data", (chunk) => { browserOutput += chunk; });
 browser.stderr.on("data", (chunk) => { browserErrors += chunk; });
+browser.on("error", (error) => { browserSpawnError = error; });
+browser.on("exit", (code, signal) => { browserExit = `code=${code} signal=${signal}`; });
 
 let socket;
 try {
@@ -139,7 +146,7 @@ try {
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  if (!version) throw new Error(`Chromium debugging endpoint did not start\n${browserErrors}`);
+  if (!version) throw new Error("Chromium debugging endpoint did not start");
   const pages = await (await fetch(`http://127.0.0.1:${debuggingPort}/json/list`)).json();
   const pageTarget = pages.find((candidate) => candidate.type === "page");
   if (!pageTarget) throw new Error("Chromium did not expose a page target");
@@ -208,7 +215,7 @@ try {
   }
   console.log("Chromium HTML opt-in: safe mode inert and opaque; opt-in scripts isolated with fetch blocked");
 } catch (error) {
-  throw new Error(`${error.message}\nChromium stderr:\n${browserErrors}`);
+  throw new Error(`${error.message}\nChromium startup: executable=${chromium} elapsed=${Math.round(performance.now() - browserStart)}ms spawn error=${browserSpawnError?.message ?? "none"} exit=${browserExit}\nChromium stdout:\n${browserOutput}\nChromium stderr:\n${browserErrors}`);
 } finally {
   socket?.close();
   browser.kill("SIGTERM");
