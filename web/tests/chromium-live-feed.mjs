@@ -3,6 +3,7 @@ import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { stopChild } from "./stop-child.mjs";
 
 const chromiumCandidates = [
   process.env.CHROMIUM,
@@ -606,8 +607,8 @@ const injected = document.createElement('script'); injected.src = target; docume
   throw new Error(`${error.message}\nDaemon stderr:\n${daemonErrors}${browser ? `\nChromium startup: executable=${chromium} elapsed=${Math.round(performance.now() - browserStart)}ms spawn error=${browserSpawnError?.message ?? "none"} exit=${browserExit}\nChromium stdout:\n${browserOutput}` : ""}\nChromium stderr:\n${browserErrors}`);
 } finally {
   socket?.close();
-  browser?.kill("SIGTERM");
-  daemon.kill("SIGTERM");
+  await stopChild(browser);
+  await stopChild(daemon);
   await rm(profile, { recursive: true, force: true });
   await rm(storeRoot, { recursive: true, force: true });
 }

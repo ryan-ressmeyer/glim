@@ -3,6 +3,7 @@ import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { stopChild } from "./stop-child.mjs";
 const chromiumCandidates = [
   process.env.CHROMIUM,
   "/snap/bin/chromium",
@@ -218,7 +219,7 @@ try {
   throw new Error(`${error.message}\nChromium startup: executable=${chromium} elapsed=${Math.round(performance.now() - browserStart)}ms spawn error=${browserSpawnError?.message ?? "none"} exit=${browserExit}\nChromium stdout:\n${browserOutput}\nChromium stderr:\n${browserErrors}`);
 } finally {
   socket?.close();
-  browser.kill("SIGTERM");
+  await stopChild(browser);
   await rm(profile, { recursive: true, force: true });
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
