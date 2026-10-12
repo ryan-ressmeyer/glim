@@ -85,6 +85,9 @@ fn storage_status_is_consistent_and_rejects_negative_metadata() {
     assert_eq!(snapshot.active_sessions, 1);
     assert_eq!(snapshot.sessions_due_for_purge, 1);
     assert_eq!(snapshot.queued_blob_deletions, 1);
+    assert!(snapshot.metadata_disk_bytes > 0);
+    assert_eq!(snapshot.saved_posts, 0);
+    assert_eq!(snapshot.total_posts, 0);
     assert_eq!(
         snapshot.limits,
         StoreLimits {
@@ -99,6 +102,30 @@ fn storage_status_is_consistent_and_rejects_negative_metadata() {
         store.status_snapshot(100),
         Err(StoreError::InvalidStatusValue { .. })
     ));
+}
+
+#[test]
+fn metadata_disk_usage_matches_database_wal_and_shm_file_lengths() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    store
+        .resolve_session("pi", "disk", "Disk", "/disk")
+        .unwrap();
+    let connection = rusqlite::Connection::open(sqlite_path(&root)).unwrap();
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL; SELECT COUNT(*) FROM sessions;")
+        .unwrap();
+    assert!(root.path().join("metadata.sqlite3-shm").exists());
+    let actual = store.status_snapshot(0).unwrap().metadata_disk_bytes;
+    let expected: u64 = [
+        "metadata.sqlite3",
+        "metadata.sqlite3-wal",
+        "metadata.sqlite3-shm",
+    ]
+    .into_iter()
+    .map(|name| std::fs::metadata(root.path().join(name)).unwrap().len())
+    .sum();
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]

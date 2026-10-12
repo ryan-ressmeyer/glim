@@ -906,7 +906,7 @@ async fn missing_or_corrupt_finalized_artifacts_return_sanitized_integrity_error
 }
 
 #[tokio::test]
-async fn reused_post_ids_revalidate_by_blob_hash_instead_of_immutable_caching() {
+async fn deleted_artifact_links_stay_gone_and_new_links_validate_by_blob_hash() {
     let root = TempDir::new().unwrap();
     let (store, first_id) = artifact_store(&root, "figure.txt", b"first bytes");
     let uri = format!("/api/v1/posts/{first_id}/files/0/content");
@@ -923,7 +923,7 @@ async fn reused_post_ids_revalidate_by_blob_hash_instead_of_immutable_caching() 
     store.close_session(&session.public_id).unwrap();
     drop(store);
     let (store, second_id) = artifact_store(&root, "figure.txt", b"second bytes");
-    assert_eq!(second_id, first_id, "SQLite reissues the purged post id");
+    assert!(second_id > first_id);
     let app = glim::app_with_store(store);
 
     let stale = app
@@ -938,15 +938,14 @@ async fn reused_post_ids_revalidate_by_blob_hash_instead_of_immutable_caching() 
         )
         .await
         .unwrap();
-    assert_eq!(
-        stale.status(),
-        StatusCode::OK,
-        "stale validator must not produce 304"
-    );
-    let second_etag = stale.headers()[header::ETAG].to_str().unwrap().to_owned();
+    assert_eq!(stale.status(), StatusCode::NOT_FOUND);
+    let new_uri = format!("/api/v1/posts/{second_id}/files/0/content");
+    let second = artifact_request(app.clone(), Method::GET, &new_uri, None).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_etag = second.headers()[header::ETAG].to_str().unwrap().to_owned();
     assert_ne!(second_etag, first_etag);
     assert_eq!(
-        stale.into_body().collect().await.unwrap().to_bytes(),
+        second.into_body().collect().await.unwrap().to_bytes(),
         "second bytes"
     );
 
@@ -956,7 +955,7 @@ async fn reused_post_ids_revalidate_by_blob_hash_instead_of_immutable_caching() 
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
-                    .uri(&uri)
+                    .uri(&new_uri)
                     .header(header::IF_NONE_MATCH, validator)
                     .header(header::RANGE, "bytes=0-2")
                     .body(Body::empty())

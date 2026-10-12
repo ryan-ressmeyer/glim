@@ -150,7 +150,7 @@ describe("glim-app public route and element behavior", () => {
     ["/sessions/2zY8Ab", "/api/v1/sessions/2zY8Ab/posts"],
     ["/projects/42", "/api/v1/projects/42/posts"],
     ["/feed", "/api/v1/posts"],
-    ["/", "/api/v1/posts"],
+    ["/saved", "/api/v1/saved/posts"],
   ])("selects the feed endpoint for %s", async (path, endpoint) => {
     setPath(path);
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -162,7 +162,7 @@ describe("glim-app public route and element behavior", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const element = mount();
-    await rendered(element, "No posts in this feed");
+    await rendered(element, path === "/saved" ? "No saved posts" : "No posts in this feed");
 
     expect(fetchMock).toHaveBeenCalledWith(endpoint, expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
@@ -189,6 +189,614 @@ describe("glim-app public route and element behavior", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     },
   );
+
+  test("Home groups paginated sessions by project and preserves closed saved contexts", async () => {
+    setPath("/");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions?limit=50") return jsonResponse({ sessions: [
+        { ...session, label: "Analysis", post_count: 2, saved_count: 1, closed: false },
+        { ...session, id: 6, public_id: "2zY8Ac", label: "Saved draft", post_count: 1, saved_count: 1, closed: true },
+      ], next_cursor: "6" });
+      if (url === "/api/v1/sessions?limit=50&cursor=6") return jsonResponse({ sessions: [
+        { ...session, id: 5, public_id: "2zY8Ad", project: { ...session.project, id: 43, label: "Other" }, label: "Review", post_count: 1, saved_count: 0, closed: false },
+      ], next_cursor: null });
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Saved draft");
+    expect(app.shadowRoot?.querySelector('a[href="/projects/42"]')).not.toBeNull();
+    expect(composedText(app)).toContain("Closed · retained content · 1 post");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-load-more]")?.click();
+    await rendered(app, "Other");
+  });
+
+  test("Home reconciles loaded pages without hiding them, deduplicates and removes stale sessions", async () => {
+    setPath("/");
+    let first = [{ ...session, id: 9, label: "Newest", post_count: 1, saved_count: 0, closed: false },
+      { ...session, id: 8, public_id: "2zY8Ac", label: "Removed", post_count: 1, saved_count: 0, closed: false }];
+    let second = [{ ...session, id: 7, public_id: "2zY8Ad", label: "Older", post_count: 1, saved_count: 0, closed: false }];
+    let stall = false;
+    let resolveStale: ((response: Response) => void) | undefined;
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = String(input); calls.push(url);
+      if (url === "/api/v1/sessions?limit=50") {
+        if (stall) return new Promise<Response>((resolve) => { resolveStale = resolve; });
+        return Promise.resolve(jsonResponse({ sessions: first, next_cursor: "8" }));
+      }
+      if (url === "/api/v1/sessions?limit=50&cursor=8") return Promise.resolve(jsonResponse({ sessions: second, next_cursor: null }));
+      if (url === "/api/v1/sessions?limit=50&cursor=9") return Promise.resolve(jsonResponse({ sessions: second, next_cursor: null }));
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount(); await rendered(app, "Newest");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-load-more]")?.click();
+    await rendered(app, "Older");
+    // A stalled refresh must leave the loaded directory visible; a second event supersedes it.
+    stall = true;
+    FakeEventSource.instances[0].emit("reset", {});
+    expect(composedText(app)).toContain("Older");
+    expect(composedText(app)).not.toContain("Loading library");
+    first = [{ ...first[0], label: "Updated", post_count: 2 },
+      { ...session, id: 10, public_id: "2zY8Ae", label: "New arrival", post_count: 1, saved_count: 0, closed: false }];
+    stall = false;
+    FakeEventSource.instances[0].emit("post", post(15), "15");
+    await vi.waitFor(() => expect(composedText(app)).toContain("Updated"));
+    expect(composedText(app)).toContain("Older");
+    expect(composedText(app)).not.toContain("Removed");
+    resolveStale?.(jsonResponse({ sessions: [{ ...session, id: 8, label: "Stale", post_count: 1, saved_count: 0 }], next_cursor: null }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(composedText(app)).not.toContain("Stale");
+    expect(app.shadowRoot?.querySelectorAll(".library-grid article")).toHaveLength(3);
+    expect(calls.filter((url) => url.includes("cursor="))).toHaveLength(2);
+  });
+
+  test("changing to an already loaded project does not cancel a pending directory refresh", async () => {
+    setPath("/");
+    let pending: AbortSignal | undefined;
+    let requests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (++requests === 1) return jsonResponse({ sessions: [
+        { ...session, post_count: 1, saved_count: 0, closed: false },
+      ], next_cursor: null });
+      pending = init?.signal as AbortSignal;
+      return new Promise<Response>(() => {});
+    }));
+    const app = mount(); await rendered(app, "agent-session");
+    FakeEventSource.instances[0].emit("reset", {});
+    await vi.waitFor(() => expect(pending).toBeDefined());
+    window.history.replaceState({}, "", "/#project-42"); window.dispatchEvent(new Event("hashchange"));
+    expect(pending?.aborted).toBe(false);
+  });
+
+  test("Home keeps the same visible session anchored during a background refresh", async () => {
+    setPath("/");
+    let label = "Old";
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ sessions: [
+      { ...session, label, post_count: 1, saved_count: 0, closed: false },
+    ], next_cursor: null })));
+    const scroll = vi.spyOn(window, "scrollBy").mockImplementation(() => {});
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const top = this.textContent?.includes("Updated") ? 180 : 80;
+      return { top, bottom: top + 100 } as DOMRect;
+    });
+    const app = mount(); await rendered(app, "Old");
+    label = "Updated";
+    FakeEventSource.instances[0].emit("reset", {});
+    await rendered(app, "Updated");
+    expect(scroll).toHaveBeenCalledWith(0, 100);
+  });
+
+  test("Home keeps its visible sessions and offers retry after a background refresh fails", async () => {
+    setPath("/");
+    let fail = false;
+    vi.stubGlobal("fetch", vi.fn(async () => fail ? jsonResponse({}, 500) : jsonResponse({ sessions: [
+      { ...session, label: "Visible", post_count: 1, saved_count: 0, closed: false },
+    ], next_cursor: null })));
+    const app = mount(); await rendered(app, "Visible");
+    fail = true; FakeEventSource.instances[0].emit("reset", {});
+    await rendered(app, "Could not load library");
+    expect(app.shadowRoot?.querySelector(".library-grid")?.textContent).toContain("Visible");
+    fail = false; app.shadowRoot?.querySelector<HTMLButtonElement>("[data-library-retry] button")?.click();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-library-retry]")).toBeNull());
+  });
+
+  test("project hash loads bounded directory pages until the project is found", async () => {
+    setPath("/#project-42");
+    const other = { ...session, id: 10, public_id: "2zY8Ae", project: { ...session.project, id: 43 }, label: "Other", post_count: 1, saved_count: 0, closed: false };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/sessions?limit=50") return jsonResponse({ sessions: [other], next_cursor: "10" });
+      if (String(input) === "/api/v1/sessions?limit=50&cursor=10") return jsonResponse({ sessions: [
+        { ...session, label: "Target", post_count: 1, saved_count: 0, closed: false },
+      ], next_cursor: null });
+      throw new Error(`unexpected ${String(input)}`);
+    }); vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await rendered(app, "Target");
+    expect(app.shadowRoot?.querySelector("#project-42")?.textContent).toContain("Target");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/sessions?limit=50&cursor=10", expect.anything());
+  });
+
+  test("missing project hash reports not found after exhausting pages and handles hash changes", async () => {
+    setPath("/");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => jsonResponse({ sessions: [
+      { ...session, id: 10, public_id: "2zY8Ae", project: { ...session.project, id: 43 }, post_count: 1, saved_count: 0, closed: false },
+    ], next_cursor: String(input).includes("cursor=") ? null : "10" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount(); await rendered(app, "agent-session");
+    window.history.replaceState({}, "", "/#project-42"); window.dispatchEvent(new Event("hashchange"));
+    await rendered(app, "Project sessions not found");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/sessions?limit=50&cursor=10", expect.anything());
+  });
+
+  test("Saved lists saved posts only, reconciles on reset, and never inserts ordinary live posts", async () => {
+    setPath("/saved");
+    let saved = [post(2, { saved: true })];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/saved/posts") return jsonResponse({ posts: saved, next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse({ ...session, label: "Post 2", closed: false, post_count: 1, saved_count: 1 });
+      throw new Error(`unexpected fetch ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 2");
+    FakeEventSource.instances[0].emit("post", post(3, { saved: false }), "3");
+    expect(composedText(app)).not.toContain("Post 3");
+    saved = [];
+    FakeEventSource.instances[0].emit("reset", { reason: "saved_changed" });
+    await rendered(app, "No saved posts");
+  });
+
+  test("saved cards offer stable session-scoped post links", async () => {
+    setPath("/saved");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/saved/posts") return jsonResponse({ posts: [post(2, { saved: true })], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected ${String(input)}`);
+    }));
+    const app = mount(); await rendered(app, "Post 2");
+    expect(app.shadowRoot?.querySelector('a[href="/sessions/2zY8Ab#post-2"]')?.textContent).toContain("session");
+  });
+
+  test("a reset updates an existing post's saved action without replacing its artifact", async () => {
+    let saved = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [post(2, { saved })], next_cursor: null });
+      if (String(input) === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected ${String(input)}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 2");
+    const article = app.shadowRoot?.querySelector("#post-2");
+    saved = true;
+    FakeEventSource.instances[0].emit("reset", { reason: "saved_changed" });
+    await vi.waitFor(() => expect(article?.querySelector("[data-save-post]")?.textContent).toBe("Unsave post"));
+    expect(app.shadowRoot?.querySelector("#post-2")).toBe(article);
+  });
+
+  test("an unrelated deletion conflict does not request saved confirmation", async () => {
+    const confirm = vi.fn(() => true); vi.stubGlobal("confirm", confirm);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(2, { saved: false })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/2" && init?.method === "DELETE") return jsonResponse({ error: { code: "other_conflict" } }, 409);
+      throw new Error(`unexpected ${url}`);
+    }); vi.stubGlobal("fetch", fetchMock);
+    const app = mount(); await rendered(app, "Post 2");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-delete-post]")?.click();
+    await rendered(app, "Change failed");
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull();
+  });
+
+  test("known-saved deletion uses one explicit confirmation and never sends an unconfirmed delete", async () => {
+    setPath("/saved");
+    const confirm = vi.fn(() => true); vi.stubGlobal("confirm", confirm);
+    let deleted = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/saved/posts") return jsonResponse({ posts: deleted ? [] : [post(2, { saved: true })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/2?confirm_saved=true") { deleted = true; return jsonResponse({ posts_deleted: 1 }); }
+      throw new Error(`unexpected ${url}`);
+    }); vi.stubGlobal("fetch", fetchMock);
+    const app = mount(); await rendered(app, "Post 2");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-delete-post]")?.click();
+    await rendered(app, "No saved posts");
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("saved post"));
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/posts/2?"))).toHaveLength(1);
+  });
+
+  test("a raced save requires fresh explicit deletion confirmation", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(2, { saved: false })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse({ ...session, label: "Post 2", closed: false, post_count: 1, saved_count: 1 });
+      if (url === "/api/v1/posts/2" && init?.method === "DELETE") return jsonResponse({ error: { code: "saved_post_confirmation_required" } }, 409);
+      if (url === "/api/v1/posts/2?confirm_saved=true") return jsonResponse({ posts_deleted: 1 });
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await rendered(app, "Post 2");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-delete-post]")?.click();
+    await vi.waitFor(() => expect(window.confirm).toHaveBeenCalledTimes(2));
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/posts/2?confirm_saved=true", expect.objectContaining({ method: "DELETE" }));
+  });
+
+  test("saving a post changes the visible action without rebuilding its artifact", async () => {
+    let saved = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(2, { saved })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/2/saved" && init?.method === "PUT") { saved = true; return jsonResponse(post(2, { saved })); }
+      if (url === "/api/v1/posts/2/saved" && init?.method === "DELETE") { saved = false; return jsonResponse(post(2, { saved })); }
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Post 2");
+    const article = app.shadowRoot?.querySelector("#post-2");
+    article?.querySelector<HTMLButtonElement>("[data-save-post]")?.click();
+    await vi.waitFor(() => expect(article?.querySelector("[data-save-post]")?.textContent).toBe("Unsave post"));
+    expect(app.shadowRoot?.querySelector("#post-2")).toBe(article);
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    article?.querySelector<HTMLButtonElement>("[data-save-post]")?.click();
+    await vi.waitFor(() => expect((fetch as ReturnType<typeof vi.fn>).mock.calls.some(([url, init]) => url === "/api/v1/posts/2/saved" && init?.method === "DELETE")).toBe(true));
+  });
+
+  test("saving a post updates its action and closed saved sessions retain the original link", async () => {
+    setPath("/sessions/2zY8Ab");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return jsonResponse({ posts: [post(2, { saved: init?.method !== "PUT" })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE") return jsonResponse({ sessions_retained: 1, posts_deleted: 0 });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse({ ...session, closed: true, label: "Post 2", post_count: 1, saved_count: 1 });
+      if (url === "/api/v1/posts/2/saved") return jsonResponse(post(2, { saved: true }));
+      throw new Error(`unexpected ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const app = mount();
+    await rendered(app, "Post 2");
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-close-session]")).toBeNull());
+    expect(composedText(app)).toContain("closed, retained content");
+    expect(app.shadowRoot?.querySelector('a[href="/sessions/2zY8Ab"]')).not.toBeNull();
+  });
+
+  test("a retained close refreshes context when the initial provenance request is in flight", async () => {
+    setPath("/sessions/2zY8Ab");
+    let resolveInitial!: (value: Response) => void;
+    let calls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/2zY8Ab/posts") return jsonResponse({ posts: [post(2, { saved: true })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE") return jsonResponse({ sessions_retained: 1 });
+      if (url === "/api/v1/sessions/2zY8Ab") {
+        calls++;
+        if (calls === 1) return new Promise<Response>((resolve) => { resolveInitial = resolve; });
+        return jsonResponse({ ...session, closed: true, label: "Post 2", post_count: 1, saved_count: 1 });
+      }
+      throw new Error(`unexpected ${url}`);
+    }));
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const app = mount();
+    await rendered(app, "Post 2");
+    await vi.waitFor(() => expect(calls).toBe(1));
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-close-session]")?.click();
+    await vi.waitFor(() => expect((fetch as ReturnType<typeof vi.fn>).mock.calls.some(([url, init]) => url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE")).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    resolveInitial(jsonResponse(session));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("closed"));
+    expect(app.shadowRoot?.querySelector("[data-close-session]")).toBeNull();
+  });
+
+  test("retained close removes unsaved posts immediately while preserving saved posts", async () => {
+    setPath("/sessions/2zY8Ab");
+    let feedCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/2zY8Ab/posts") {
+        if (++feedCalls > 1) return new Promise<Response>(() => {});
+        return jsonResponse({ posts: [post(3, { saved: false }), post(2, { saved: true })], next_cursor: null });
+      }
+      if (url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE") return jsonResponse({ sessions_retained: 1, posts_deleted: 1 });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse({ ...session, closed: false, label: "Post 3", post_count: 2, saved_count: 1 });
+      throw new Error(`unexpected ${url}`);
+    }));
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const app = mount(); await rendered(app, "Post 3");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-close-session]")?.click();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("closed"));
+    expect(app.shadowRoot?.querySelector("#post-3")).toBeNull();
+    expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull();
+    expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("Post 2");
+    FakeEventSource.instances[0].emit("post", post(4, { saved: false }), "4");
+    expect(app.shadowRoot?.querySelector("#post-4")).toBeNull();
+  });
+
+  test("late unsaved post events cannot resurrect content after retained close", async () => {
+    setPath("/sessions/2zY8Ab");
+    let closed = false;
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return jsonResponse({ posts: [post(2, { saved: true })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE") { closed = true; return jsonResponse({ sessions_retained: 1 }); }
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse({ ...session, closed, label: "Post 2", post_count: 1, saved_count: 1 });
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount(); await rendered(app, "Post 2");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-close-session]")?.click();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("closed"));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-load-more]")).toBeNull());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    FakeEventSource.instances[0].emit("post", post(3, { saved: false }), "3");
+    expect(app.shadowRoot?.querySelector("#post-3")).toBeNull();
+  });
+
+  test("retained close uses a post label while provenance is still loading", async () => {
+    setPath("/sessions/2zY8Ab");
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return jsonResponse({ posts: [post(2, { saved: true, title: "Result plot" })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE") return jsonResponse({ sessions_retained: 1 });
+      if (url === "/api/v1/sessions/2zY8Ab") return new Promise<Response>(() => {});
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount(); await rendered(app, "Result plot");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-close-session]")?.click();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("closed"));
+    expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("Result plot");
+    expect(app.shadowRoot?.querySelector('a[href="/projects/"]')).toBeNull();
+  });
+
+  test("retained close presents closed context even if feed reconciliation stalls", async () => {
+    setPath("/sessions/2zY8Ab");
+    let closed = false;
+    let feedCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/2zY8Ab/posts") {
+        feedCalls++;
+        if (feedCalls > 1) return new Promise<Response>(() => {});
+        return jsonResponse({ posts: [post(2, { saved: true })], next_cursor: null });
+      }
+      if (url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE") { closed = true; return jsonResponse({ sessions_retained: 1 }); }
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse({ ...session, closed, label: "Post 2", post_count: 1, saved_count: 1 });
+      throw new Error(`unexpected ${url}`);
+    }));
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const app = mount(); await rendered(app, "Post 2");
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("Post 2"));
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-close-session]")?.click();
+    await vi.waitFor(() => expect(closed).toBe(true));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("closed"));
+    expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull();
+  });
+
+  test("pagehide closes the live stream before navigation leaves the document", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [], next_cursor: null });
+      throw new Error(`unexpected ${String(input)}`);
+    }));
+    mount();
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    window.dispatchEvent(new Event("pagehide"));
+    expect(FakeEventSource.instances[0].readyState).toBe(FakeEventSource.CLOSED);
+  });
+
+  test("returning from browser back-forward cache restarts a stopped stream", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/posts") return jsonResponse({ posts: [], next_cursor: null });
+      throw new Error(`unexpected ${String(input)}`);
+    }));
+    mount();
+    window.dispatchEvent(new Event("pagehide"));
+    const restored = new Event("pageshow") as PageTransitionEvent;
+    Object.defineProperty(restored, "persisted", { value: true });
+    window.dispatchEvent(restored);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+  });
+
+  test("a stalled provenance request retries once and restores project navigation", async () => {
+    setPath("/sessions/2zY8Ab");
+    const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+    vi.spyOn(AbortSignal, "timeout").mockImplementationOnce(() => {
+      const controller = new AbortController();
+      queueMicrotask(() => controller.abort());
+      return controller.signal;
+    }).mockImplementation((milliseconds) => originalTimeout(milliseconds));
+    let fetches = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return jsonResponse({ posts: [post(2)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") {
+        if (++fetches === 1) return new Promise<Response>(() => {});
+        return jsonResponse({ ...session, label: "Post 2", closed: false, post_count: 1, saved_count: 0 });
+      }
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector('a[href="/projects/42"]')).not.toBeNull());
+    expect(fetches).toBe(2);
+  });
+
+  test("already expired provenance attempts still retry", async () => {
+    setPath("/sessions/2zY8Ab");
+    const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+    vi.spyOn(AbortSignal, "timeout").mockImplementationOnce(() => AbortSignal.abort())
+      .mockImplementation((milliseconds) => originalTimeout(milliseconds));
+    let fetches = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return jsonResponse({ posts: [post(2)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") {
+        if (++fetches === 1) return new Promise<Response>(() => {});
+        return jsonResponse(session);
+      }
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector('a[href="/projects/42"]')).not.toBeNull());
+    expect(fetches).toBe(2);
+  });
+
+  test("an ignored aborted provenance fetch cannot strand retained session navigation", async () => {
+    setPath("/sessions/2zY8Ab");
+    let fetches = 0;
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/posts")) return jsonResponse({ posts: [post(2, { saved: true })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab" && init?.method === "DELETE") return jsonResponse({ sessions_retained: 1 });
+      if (url === "/api/v1/sessions/2zY8Ab") {
+        if (++fetches === 1) return new Promise<Response>(() => {});
+        return jsonResponse({ ...session, closed: true, label: "Post 2", post_count: 1, saved_count: 1 });
+      }
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount(); await rendered(app, "Post 2");
+    await vi.waitFor(() => expect(fetches).toBe(1));
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-close-session]")?.click();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("closed"));
+    await vi.waitFor(() => expect(fetches).toBeGreaterThan(1));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector('a[href="/projects/42"]')).not.toBeNull());
+  });
+
+  test("a remote retained-session reset refreshes cached open provenance", async () => {
+    setPath("/sessions/2zY8Ab");
+    let closed = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/2zY8Ab/posts") return jsonResponse({ posts: [post(2, { saved: true })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse({ ...session, closed, label: "Post 2", post_count: 1, saved_count: 1 });
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("Post 2"));
+    closed = true;
+    FakeEventSource.instances[0].emit("reset", { reason: "session_retained" });
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-breadcrumbs]")?.textContent).toContain("closed"));
+    expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull();
+  });
+
+  test("cancelled saved deletion and mutation failure keep the post visible", async () => {
+    setPath("/saved");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/saved/posts") return jsonResponse({ posts: [post(2, { saved: true })], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      if (url === "/api/v1/posts/2/saved" && init?.method === "DELETE") return jsonResponse({}, 500);
+      throw new Error(`unexpected ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const confirm = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    vi.stubGlobal("confirm", confirm);
+    const app = mount();
+    await rendered(app, "Post 2");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-delete-post]")?.click();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-save-post]")?.click();
+    await rendered(app, "Change failed");
+    expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull();
+  });
+
+  test("missing older-daemon metrics are marked unavailable rather than shown as zero", async () => {
+    setPath("/settings");
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ ok: true, version: "older", finalized_unique_blob_bytes: 0, max_finalized_blob_bytes: 10 })));
+    const app = mount();
+    await rendered(app, "Metadata (database, WAL and SHM apparent file bytes) unavailable");
+    expect(composedText(app)).toContain("Temporary uploads unavailable");
+  });
+
+  test("storage limits are legible in GiB", async () => {
+    setPath("/settings");
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ ok: true, version: "1", finalized_unique_blob_bytes: 0, max_finalized_blob_bytes: 21474836480 })));
+    const app = mount();
+    await rendered(app, "20.0 GiB");
+  });
+
+  test("expired settings authentication hides stale storage figures", async () => {
+    setPath("/settings");
+    let expired = false;
+    vi.stubGlobal("fetch", vi.fn(async () => expired ? jsonResponse({}, 401) : jsonResponse({ ok: true, version: "1", finalized_unique_blob_bytes: 4, max_finalized_blob_bytes: 8 })));
+    const app = mount();
+    await rendered(app, "4 B");
+    expired = true;
+    app.shadowRoot?.querySelector<HTMLButtonElement>(".settings button")?.click();
+    await rendered(app, "Authentication expired");
+    expect(app.shadowRoot?.querySelector(".settings")).toBeNull();
+  });
+
+  test("Storage reports byte categories and safe reclaim result", async () => {
+    setPath("/settings");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return jsonResponse({ ok: true, version: "1.0", finalized_unique_blob_bytes: 100, max_finalized_blob_bytes: 500, metadata_disk_bytes: 30, staging_bytes_in_use: 5, max_staging_bytes: 200, max_upload_bytes: 100, max_concurrent_publications: 4, active_sessions: 2, sessions_due_for_purge: 1, queued_blob_deletions: 1, total_posts: 3, saved_posts: 1, retention_seconds: 604800, cleanup_interval_seconds: 3600 });
+      if (String(input) === "/api/v1/storage/reclaim") return jsonResponse({ unused_blobs_deleted: 1 });
+      throw new Error(`unexpected fetch ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount();
+    await rendered(app, "100 B");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-reclaim]")?.click();
+    await rendered(app, "Reclaimed 1 unused blob");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/storage/reclaim", expect.objectContaining({ method: "POST" }));
+  });
+
+  test("a live settings refresh keeps the visible reclaim result", async () => {
+    setPath("/settings");
+    let version = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return jsonResponse({ ok: true, version: String(++version), finalized_unique_blob_bytes: 4, max_finalized_blob_bytes: 8 });
+      if (String(input) === "/api/v1/storage/reclaim") return jsonResponse({ unused_blobs_deleted: 1 });
+      throw new Error(`unexpected ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount(); await rendered(app, "4 B");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-reclaim]")?.click();
+    await rendered(app, "Reclaimed 1 unused blob");
+    FakeEventSource.instances[0].emit("reset", { reason: "storage_changed" });
+    await rendered(app, "Daemon healthy · version 3");
+    expect(app.shadowRoot?.querySelector(".settings")?.textContent).toContain("Reclaimed 1 unused blob");
+  });
+
+  test.each([true, false])("a live settings refresh retains a pending reclaim and its %s outcome", async (success) => {
+    setPath("/settings");
+    let settle!: (response: Response) => void;
+    let version = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return jsonResponse({ ok: true, version: String(++version), finalized_unique_blob_bytes: 4, max_finalized_blob_bytes: 8 });
+      if (String(input) === "/api/v1/storage/reclaim") return new Promise<Response>((resolve) => { settle = resolve; });
+      throw new Error(`unexpected ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = mount(); await rendered(app, "4 B");
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-reclaim]")?.click();
+    await vi.waitFor(() => expect(settle).toBeDefined());
+    FakeEventSource.instances[0].emit("post", post(3), "3");
+    await rendered(app, "Daemon healthy · version 2");
+    expect(app.shadowRoot?.querySelector<HTMLButtonElement>("[data-reclaim]")?.disabled).toBe(true);
+    settle(success ? jsonResponse({ unused_blobs_deleted: 1 }) : jsonResponse({}, 500));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector(".settings")?.textContent).toContain(success ? "Reclaimed 1 unused blob" : "Could not reclaim unused data"));
+    expect(app.shadowRoot?.querySelector<HTMLButtonElement>("[data-reclaim]")?.disabled).toBe(false);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url) === "/api/v1/storage/reclaim")).toHaveLength(1);
+  });
+
+  test("project feed exposes its session directory", async () => {
+    setPath("/projects/42");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/projects/42/posts") return jsonResponse({ posts: [], next_cursor: null });
+      throw new Error(`unexpected ${String(input)}`);
+    }));
+    const app = mount();
+    await rendered(app, "No posts in this feed");
+    expect(app.shadowRoot?.querySelector('a[href="/#project-42"]')?.textContent).toContain("sessions");
+  });
 
   test("loads session context for navigation even when the session feed is empty", async () => {
     setPath("/sessions/2zY8Ab");
@@ -807,6 +1415,20 @@ describe("glim-app public route and element behavior", () => {
 
     await rendered(app, "Post 10 is outside this project");
     expect(app.shadowRoot?.querySelector("[data-comparison]")).toBeNull();
+  });
+
+  test("a deleted predecessor is disclosed as unavailable without affecting saved successor", async () => {
+    setPath("/saved#compare-9");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/saved/posts") return jsonResponse({ posts: [post(9, { saved: true, predecessor_post_id: 8 })], next_cursor: null });
+      if (url === "/api/v1/posts/8") return jsonResponse({ error: "not found" }, 404);
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount();
+    await rendered(app, "Predecessor post 8 unavailable");
+    expect(composedText(app)).toContain("Return to post");
   });
 
   test("rejects a predecessor whose validated identity leaves the revised post session", async () => {
@@ -1512,8 +2134,8 @@ describe("glim-app public route and element behavior", () => {
   });
 
   test.each([
-    ["/feed", "/api/v1/posts", ["/feed"]],
-    ["/projects/42", "/api/v1/projects/42/posts", ["/projects/42", "/feed"]],
+    ["/feed", "/api/v1/posts", ["/", "/feed", "/saved", "/settings"]],
+    ["/projects/42", "/api/v1/projects/42/posts", ["/", "/feed", "/saved", "/settings"]],
   ])("keeps %s header navigation scoped while adding per-post provenance links", async (path, endpoint, headerHrefs) => {
     setPath(path);
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {

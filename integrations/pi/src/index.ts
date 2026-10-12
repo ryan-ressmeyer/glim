@@ -276,7 +276,7 @@ export function createGlimExtension(dependencies: Dependencies) {
     });
 
     pi.registerCommand("glim-close", {
-      description: "Explicitly close and purge only the current branch's confirmed Glimse session",
+      description: "Close the current branch's confirmed Glimse session; saved posts remain readable",
       handler: async (_args, ctx) => {
         if (!current || current.pi_session_id !== ctx.sessionManager.getSessionId()) {
           emit(ctx, "No confirmed open Glimse publication exists on the current branch/session.", "info");
@@ -287,7 +287,7 @@ export function createGlimExtension(dependencies: Dependencies) {
           await dependencies.run(["close", closing.public_session_id], undefined, undefined);
           pi.appendEntry(GLIM_CLOSE_ENTRY, { pi_session_id: closing.pi_session_id, public_session_id: closing.public_session_id });
           current = undefined;
-          emit(ctx, `Closed Glimse session ${closing.public_session_id}; its ephemeral feed and snapshots were purged.`);
+          emit(ctx, `Closed Glimse session ${closing.public_session_id}; unsaved posts were removed and saved posts remain readable at the original session link.`);
         } catch (error) {
           emit(ctx, `${formatFailure(error)} Current Glimse state was preserved.`, "error");
         }

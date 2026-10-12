@@ -292,6 +292,6 @@ describe("branch state and commands", () => {
     await h.commands.get("glim-close").handler("", h.ctx);
     expect(run.mock.calls[2][0]).toEqual(["close", "Close88"]);
     expect(h.entries).toEqual([{ customType: GLIM_CLOSE_ENTRY, data: { pi_session_id: "session-A", public_session_id: "Close88" } }]);
-    expect(h.notifications.at(-1).text).toContain("purged");
+    expect(h.notifications.at(-1).text).toContain("saved posts remain readable");
   });
 });

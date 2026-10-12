@@ -29,11 +29,11 @@ pub(crate) use publication::{
 pub(crate) use read::AssociatedArtifact;
 pub use read::{
     BlobRead, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageRequest, PostFileRead, PostPage, PostRead,
-    ProjectRead, SessionRead, SupportAssetRead,
+    ProjectRead, SessionPage, SessionRead, SupportAssetRead,
 };
 pub use status::StoreStatusSnapshot;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
 const PUBLIC_ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const INITIAL_PUBLIC_ID_LENGTH: usize = 6;
@@ -177,6 +177,41 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE posts ADD COLUMN git_commit TEXT;
         "#,
     },
+    Migration {
+        version: 7,
+        sql: r#"
+            CREATE TABLE sessions_rebuilt (
+                id INTEGER PRIMARY KEY,
+                public_id TEXT NOT NULL UNIQUE,
+                integration_namespace TEXT NOT NULL,
+                external_key TEXT,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                last_activity_at INTEGER NOT NULL DEFAULT 0,
+                closed INTEGER NOT NULL DEFAULT 0,
+                retained_external_key TEXT,
+                UNIQUE (integration_namespace, external_key, project_id),
+                CHECK ((closed = 0 AND external_key IS NOT NULL) OR (closed = 1 AND external_key IS NULL))
+            );
+            INSERT INTO sessions_rebuilt
+                (id, public_id, integration_namespace, external_key, project_id, created_at, last_activity_at)
+            SELECT id, public_id, integration_namespace, external_key, project_id, created_at, last_activity_at
+            FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_rebuilt RENAME TO sessions;
+            CREATE TABLE post_id_sequence (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            INSERT INTO post_id_sequence (id) SELECT MAX(id) FROM posts HAVING COUNT(*) > 0;
+            DELETE FROM post_id_sequence;
+            CREATE TABLE saved_posts (
+                post_id INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE
+            );
+            CREATE TABLE post_tombstones (
+                post_id INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE
+            );
+            CREATE INDEX sessions_activity ON sessions(last_activity_at, id);
+            CREATE INDEX posts_session ON posts(session_id, published_at DESC, id DESC);
+        "#,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -217,7 +252,7 @@ impl Default for LifecycleNotifier {
 
 impl LifecycleNotifier {
     pub fn notify_cleanup(&self, report: LifecycleReport) {
-        if report.sessions_deleted > 0 {
+        if report.sessions_deleted > 0 || report.sessions_retained > 0 || report.posts_deleted > 0 {
             let _ = self.events.send(());
         }
     }
@@ -499,7 +534,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = transaction
             .query_row(
-                "SELECT last_activity_at FROM sessions WHERE public_id = ?1",
+                "SELECT last_activity_at FROM sessions WHERE public_id = ?1 AND closed = 0",
                 [public_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -531,7 +566,7 @@ fn find_session(
     transaction
         .query_row(
             "SELECT id, public_id, project_id FROM sessions
-             WHERE integration_namespace = ?1 AND external_key = ?2 AND project_id = ?3",
+             WHERE integration_namespace = ?1 AND external_key = ?2 AND project_id = ?3 AND closed = 0",
             params![integration_namespace, external_key, project_id],
             |row| {
                 Ok(SessionRecord {
@@ -604,6 +639,9 @@ pub enum StoreError {
     PostNotFound {
         post_id: i64,
     },
+    SavedPostRequiresConfirmation {
+        post_id: i64,
+    },
     InvalidPageLimit {
         limit: u32,
         maximum: u32,
@@ -674,6 +712,10 @@ impl fmt::Display for StoreError {
                 write!(formatter, "project {project_id} was not found")
             }
             Self::PostNotFound { post_id } => write!(formatter, "post {post_id} was not found"),
+            Self::SavedPostRequiresConfirmation { post_id } => write!(
+                formatter,
+                "saved post {post_id} requires explicit deletion confirmation"
+            ),
             Self::InvalidPageLimit { limit, maximum } => {
                 write!(formatter, "page limit {limit} is outside 1..={maximum}")
             }
@@ -757,6 +799,7 @@ impl Error for StoreError {
             | Self::SessionNotFound { .. }
             | Self::ProjectNotFound { .. }
             | Self::PostNotFound { .. }
+            | Self::SavedPostRequiresConfirmation { .. }
             | Self::InvalidPageLimit { .. }
             | Self::InvalidPageCursor
             | Self::InvalidStatusValue { .. }
@@ -806,7 +849,21 @@ fn apply_migrations(
         .iter()
         .filter(|migration| migration.version > current_version)
     {
-        apply_migration(connection.transaction()?, *migration)?;
+        if migration.version == 7 {
+            // Rebuild sessions without cascading its existing posts or changing their foreign keys.
+            let foreign_keys: i64 =
+                connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+            connection.execute_batch("PRAGMA foreign_keys = OFF")?;
+            let result = connection
+                .transaction()
+                .and_then(|transaction| apply_migration(transaction, *migration));
+            if foreign_keys != 0 {
+                connection.execute_batch("PRAGMA foreign_keys = ON")?;
+            }
+            result?;
+        } else {
+            apply_migration(connection.transaction()?, *migration)?;
+        }
     }
     Ok(())
 }
@@ -835,6 +892,16 @@ fn validate_migration_plan(migrations: &[Migration]) -> Result<(), StoreError> {
 
 fn apply_migration(transaction: Transaction<'_>, migration: Migration) -> rusqlite::Result<()> {
     transaction.execute_batch(migration.sql)?;
+    if migration.version == 7
+        && transaction
+            .query_row("SELECT 1 FROM pragma_foreign_key_check LIMIT 1", [], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some()
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     transaction.pragma_update(None, "user_version", migration.version)?;
     transaction.commit()
 }
@@ -950,7 +1017,7 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::InvalidMigrationPlan {
-                expected: 6,
+                expected: 7,
                 found: 0
             }
         ));

@@ -148,6 +148,30 @@ fn resolving_existing_working_directory_updates_label_without_changing_identity(
     );
 }
 
+// Restore the historical table instead of dropping a column used by today's CHECK.
+fn restore_legacy_sessions(connection: &Connection) {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+        CREATE TABLE sessions_legacy (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT NOT NULL UNIQUE,
+            integration_namespace TEXT NOT NULL,
+            external_key TEXT NOT NULL,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            last_activity_at INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (integration_namespace, external_key, project_id)
+        );
+        INSERT INTO sessions_legacy SELECT id, public_id, integration_namespace, external_key,
+            project_id, created_at, last_activity_at FROM sessions;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_legacy RENAME TO sessions;
+        PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+}
+
 fn insert_project_and_session(connection: &Connection) {
     connection
         .execute(
@@ -198,8 +222,11 @@ fn fresh_store_creates_current_schema_and_enables_required_sqlite_modes() {
             "blob_references",
             "blobs",
             "post_files",
+            "post_id_sequence",
+            "post_tombstones",
             "posts",
             "projects",
+            "saved_posts",
             "sessions",
             "support_assets",
         ]
@@ -381,6 +408,34 @@ fn version_two_posts_migrate_with_a_signed_publication_timestamp() {
                 if message == "posts are immutable"
         ));
     }
+    drop(connection);
+    let mut store = Store::open(root.path()).unwrap();
+    store.delete_post(1, false).unwrap();
+    let blob = store
+        .stage_publication_blob(std::io::Cursor::new(b"fresh"))
+        .unwrap();
+    let new = store
+        .publish_at(
+            glim::storage::PublicationRequest {
+                session_public_id: "legacy".into(),
+                title: "Fresh".into(),
+                commentary: "After migration".into(),
+                predecessor_post_id: None,
+                git: None,
+                files: vec![glim::storage::PublicationFile {
+                    filename: "fresh.txt".into(),
+                    caption: None,
+                    blob,
+                    support_assets: vec![],
+                }],
+            },
+            10,
+        )
+        .unwrap();
+    assert!(
+        new.id > 1,
+        "migrated post IDs remain reserved after deletion"
+    );
 }
 
 #[test]
@@ -414,9 +469,15 @@ fn version_four_files_migrate_to_conservative_download_classification() {
         .id;
     drop(store);
     let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    restore_legacy_sessions(&connection);
     connection
         .execute_batch(
-            "ALTER TABLE post_files DROP COLUMN renderer;
+            "DROP INDEX IF EXISTS sessions_activity;
+             DROP INDEX posts_session;
+             DROP TABLE post_id_sequence;
+             DROP TABLE saved_posts;
+             DROP TABLE post_tombstones;
+             ALTER TABLE post_files DROP COLUMN renderer;
              ALTER TABLE post_files DROP COLUMN media_type;
              ALTER TABLE posts DROP COLUMN git_commit;
              ALTER TABLE posts DROP COLUMN git_branch;
@@ -461,9 +522,15 @@ fn populated_version_five_migration_preserves_the_existing_immutability_trigger(
         .unwrap();
     drop(store);
     let connection = Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+    restore_legacy_sessions(&connection);
     connection
         .execute_batch(
-            "ALTER TABLE posts DROP COLUMN git_commit;
+            "DROP INDEX IF EXISTS sessions_activity;
+         DROP INDEX posts_session;
+         DROP TABLE post_id_sequence;
+         DROP TABLE saved_posts;
+         DROP TABLE post_tombstones;
+         ALTER TABLE posts DROP COLUMN git_commit;
          ALTER TABLE posts DROP COLUMN git_branch;
          ALTER TABLE posts DROP COLUMN git_root;
          DROP TRIGGER posts_are_immutable;

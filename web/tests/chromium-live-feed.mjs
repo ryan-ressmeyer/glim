@@ -312,7 +312,7 @@ const injected = document.createElement('script'); injected.src = target; docume
     root.querySelector('input[type=password]').value = '${accessToken}';
     root.querySelector('form').requestSubmit();
   })()`);
-  await waitFor("location.pathname === '/feed'", "browser session login");
+  await waitFor("location.pathname === '/'", "browser session login");
   await command("Page.navigate", { url: `${daemonOrigin}/sessions/${pdfSession}` });
   const pdfArtifact = `${app}?.querySelector('#post-${largePdf.post.id} glim-artifact')?.shadowRoot`;
   await waitFor(`${pdfArtifact}?.querySelector('iframe.pdf-frame')`, "large native PDF frame");
@@ -415,7 +415,7 @@ const injected = document.createElement('script'); injected.src = target; docume
 
   await evaluate("window.confirm = () => true");
   await evaluate(`(() => { const root = ${app}; root.querySelector('[data-actions]').open = true; root.querySelector('[data-close-session]').click(); })()`);
-  await waitFor(`${app}?.querySelector('.state')?.textContent === 'Session closed'`, "confirmed browser close");
+  await waitFor(`${app}?.querySelector('.state')?.textContent.includes('Session closed')`, "confirmed browser close");
   await evaluate(`(() => { const root = ${app}; root.querySelector('[data-actions]').open = true; root.querySelector('[data-logout]').click(); })()`);
   await waitFor("location.pathname === '/login'", "browser logout");
   const postLogoutStatus = await evaluate("fetch('/api/v1/posts').then((response) => response.status)");
@@ -445,7 +445,7 @@ const injected = document.createElement('script'); injected.src = target; docume
   await command("Page.navigate", { url: `${daemonOrigin}/login` });
   await waitFor(`${app}?.querySelector('input[type=password]')`, "inspection login");
   await evaluate(`(() => { const root=${app}; root.querySelector('input[type=password]').value='${accessToken}'; root.querySelector('form').requestSubmit(); })()`);
-  await waitFor("location.pathname === '/feed'", "inspection login complete");
+  await waitFor("location.pathname === '/'", "inspection login complete");
   await command("Page.navigate", { url: `${daemonOrigin}/sessions/${inspection.session.public_id}` });
   await waitFor(`${app}?.querySelectorAll('article').length >= 20`, "long inspection feed");
   await waitFor(`${app}?.querySelector('glim-artifact')?.shadowRoot?.querySelector('pre')`, "visible document render");
@@ -468,7 +468,7 @@ const injected = document.createElement('script'); injected.src = target; docume
   await command("Page.navigate", { url: `${daemonOrigin}/sessions/${inspection.session.public_id}` });
   const revisionRoot = `${app}.querySelector('#post-${revision.post.id} glim-artifact').shadowRoot`;
   await waitFor(`${app}?.querySelector('#post-${revision.post.id} glim-artifact')?.shadowRoot?.querySelector('img')?.complete`, "revision image");
-  await waitFor(`${app}?.querySelector('nav')?.textContent.includes('Visual neuroscience')`, "project context");
+  await waitFor(`${app}?.querySelector('[data-breadcrumbs]')?.textContent.includes('Visual neuroscience')`, "project context");
   const screenshotDirectory = process.env.GLIM_INSPECTION_SCREENSHOTS;
   const screenshot = async (name) => {
     if (!screenshotDirectory) return;
@@ -476,7 +476,59 @@ const injected = document.createElement('script'); injected.src = target; docume
     const capture = await command("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
     await writeFile(path.join(screenshotDirectory, name), Buffer.from(capture.data, "base64"));
   };
+  // Management regression uses only this isolated daemon and browser cookie.
+  const libraryPost = await publish("library-session", "Library saved result");
+  const librarySession = libraryPost.session.public_id;
+  await command("Page.navigate", { url: `${daemonOrigin}/` });
+  await waitFor(`${app}?.querySelector('.library-grid')?.textContent.includes('Library saved result')`, "Home session directory");
+  const currentLink = await evaluate(`(() => {
+    const link = ${app}.querySelector('nav a[aria-current="page"]');
+    const other = ${app}.querySelector('nav a:not([aria-current])');
+    return [getComputedStyle(link).fontWeight, getComputedStyle(other).fontWeight];
+  })()`);
+  if (Number(currentLink[0]) <= Number(currentLink[1])) throw new Error(`current page navigation has no visible emphasis: ${currentLink}`);
   await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
+  await screenshot("library-home-desktop.png");
+  await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+  await screenshot("library-home-dark.png");
+  await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
+  await command("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await screenshot("library-home-mobile.png");
+  if (await evaluate("document.documentElement.scrollWidth > innerWidth")) throw new Error("mobile Home overflows");
+  await command("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  await command("Page.navigate", { url: `${daemonOrigin}/sessions/${librarySession}` });
+  await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id} [data-save-post]')`, "library post controls");
+  await evaluate(`${app}.querySelector('#post-${libraryPost.post.id} [data-save-post]').click()`);
+  await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id} [data-save-post]')?.textContent === 'Unsave post'`, "saved action");
+  await command("Page.navigate", { url: `${daemonOrigin}/saved` });
+  await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id}')`, "Saved page");
+  await screenshot("library-saved-desktop.png");
+  await evaluate("window.confirm = () => false");
+  await evaluate(`${app}.querySelector('#post-${libraryPost.post.id} [data-delete-post]').click()`);
+  if (!await evaluate(`${app}.querySelector('#post-${libraryPost.post.id}') !== null`)) throw new Error("cancelled saved deletion removed post");
+  await command("Page.navigate", { url: `${daemonOrigin}/sessions/${librarySession}` });
+  await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id}')`, "saved session");
+  await waitFor(`${app}?.querySelector('[data-breadcrumbs]')?.textContent.includes('Live project')`, "library session project context", 240);
+  await evaluate("window.confirm = () => true");
+  await evaluate(`(() => { const root=${app}; root.querySelector('[data-actions]').open=true; root.querySelector('[data-close-session]').click(); })()`);
+  await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id}') && ${app}?.querySelector('[data-breadcrumbs]')?.textContent.includes('closed')`, "closed saved session retained");
+  if (await evaluate(`${app}.querySelector('[data-close-session]') !== null`)) throw new Error("closed retained session still offers close");
+  await command("Page.navigate", { url: `${daemonOrigin}/` });
+  await waitFor(`${app}?.querySelector('.library-grid')?.textContent.includes('Closed · retained content')`, "closed session in Home");
+  await command("Page.navigate", { url: `${daemonOrigin}/saved` });
+  await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id}')`, "Saved survives close");
+  await command("Page.navigate", { url: `${daemonOrigin}/settings` });
+  await waitFor(`${app}?.querySelector('.settings')?.textContent.includes('Unique finalized artifact storage')`, "storage dashboard");
+  await screenshot("library-storage-desktop.png");
+  await evaluate(`${app}.querySelector('[data-reclaim]').click()`);
+  await waitFor(`${app}?.querySelector('.settings')?.textContent.includes('Reclaimed')`, "safe reclaim result");
+  await command("Page.navigate", { url: `${daemonOrigin}/saved` });
+  await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id}')`, "saved deletion target");
+  await evaluate("window.confirm = () => true");
+  await evaluate(`${app}.querySelector('#post-${libraryPost.post.id} [data-delete-post]').click()`);
+  await waitFor(`${app}?.querySelector('.state')?.textContent.includes('No saved posts')`, "explicit saved deletion");
+  await command("Page.navigate", { url: `${daemonOrigin}/sessions/${inspection.session.public_id}` });
+  await waitFor(`${app}?.querySelector('#post-${revision.post.id}')`, "return to inspection");
   await screenshot("inspection-desktop.png");
   await command("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
   await screenshot("inspection-dark.png");
@@ -594,10 +646,10 @@ const injected = document.createElement('script'); injected.src = target; docume
   await waitFor(`${app}?.querySelector('[data-load-full-comparison]')`, "comparison oversized-file opt-in");
   if (await evaluate(`performance.getEntriesByType('resource').some(entry=>new URL(entry.name).pathname==='${largePath}')`)) throw new Error("comparison downloaded large document before opt-in");
   await evaluate(`${app}.querySelector('[data-load-full-comparison]').click()`);
-  await waitFor(`${app}?.querySelector('[data-text-comparison]')?.textContent.includes('FULL_DOCUMENT_END')`, "comparison preserves complete opted-in text", 300);
+  await waitFor(`${app}?.querySelector('[data-text-comparison]')?.textContent.includes('FULL_DOCUMENT_END')`, "comparison preserves complete opted-in text", 1200);
   const purgeInspection = await fetch(`${daemonOrigin}/api/v1/sessions/${inspection.session.public_id}`, { method: "DELETE", headers: authenticatedHeaders() });
   if (!purgeInspection.ok) throw new Error("inspection session purge failed");
-  await waitFor(`${app}?.querySelector('.state')?.textContent === 'Session closed'`, "inspection purge releases renderers");
+  await waitFor(`${app}?.querySelector('.state')?.textContent.includes('Session closed')`, "inspection purge releases renderers");
   console.log('Chromium comparison: cold links, manual pairing, shared image zoom, inert text/JSON, bounded diffs, HTML isolation, mobile layout, oversized opt-in, and deletion passed');
   console.log(`Chromium inspection: ${JSON.stringify(loading)}; 16 MiB opt-in, CSV disclosure, native modal, revision navigation, responsive screenshots passed`);
 

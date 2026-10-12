@@ -283,6 +283,62 @@ async fn committed_publication_and_successful_close_reach_open_streams_with_scop
 }
 
 #[tokio::test]
+async fn closing_a_retained_session_emits_reset_without_a_session_closed_event() {
+    let root = TempDir::new().unwrap();
+    let (mut store, public_id, _) = seeded_store(&root);
+    store.set_saved(1, true).unwrap();
+    let app = glim::app_with_store(store);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/sessions/{public_id}/posts/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    assert!(next_chunk(&mut body).await.contains("event: post"));
+    let closed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/sessions/{public_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), 200);
+    let first = next_chunk(&mut body).await;
+    assert!(first.contains("event: reset"), "{first}");
+    assert!(first.contains("\"reason\":\"session_retained\""), "{first}");
+    let session = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/sessions/{public_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.status(), 200);
+    let post = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/posts/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post.status(), 200);
+}
+
+#[tokio::test]
 async fn reconnect_after_deleted_history_receives_authoritative_reset() {
     let root = TempDir::new().unwrap();
     let (mut store, public_id, _) = seeded_store(&root);

@@ -20,7 +20,7 @@ use axum::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -173,6 +173,12 @@ pub struct DaemonStatus {
     pub active_sessions: u64,
     pub sessions_due_for_purge: u64,
     pub queued_blob_deletions: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_disk_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_posts: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_posts: Option<u64>,
     pub retention_seconds: u64,
     pub cleanup_interval_seconds: u64,
 }
@@ -193,6 +199,9 @@ async fn status(State(state): State<ApiState>) -> Result<Json<DaemonStatus>, Api
         active_sessions: snapshot.active_sessions,
         sessions_due_for_purge: snapshot.sessions_due_for_purge,
         queued_blob_deletions: snapshot.queued_blob_deletions,
+        metadata_disk_bytes: Some(snapshot.metadata_disk_bytes),
+        saved_posts: Some(snapshot.saved_posts),
+        total_posts: Some(snapshot.total_posts),
         retention_seconds: crate::daemon::RETENTION_SECONDS,
         cleanup_interval_seconds: crate::daemon::CLEANUP_INTERVAL_SECONDS,
     }))
@@ -223,13 +232,15 @@ enum FeedScope {
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
         .route("/status", get(status))
+        .route("/storage/reclaim", post(reclaim_unused_data))
+        .route("/saved/posts", get(saved_posts))
         .route(
             "/auth/session",
             post(create_browser_session)
                 .delete(delete_browser_session)
                 .route_layer(DefaultBodyLimit::max(1024)),
         )
-        .route("/sessions", post(resolve_session))
+        .route("/sessions", get(list_sessions).post(resolve_session))
         .route(
             "/sessions/{public_id}",
             get(get_session).delete(close_session),
@@ -245,7 +256,8 @@ pub(crate) fn routes() -> Router<ApiState> {
             "/posts",
             post(publish_post).route_layer(DefaultBodyLimit::disable()),
         )
-        .route("/posts/{post_id}", get(get_post))
+        .route("/posts/{post_id}", get(get_post).delete(delete_post))
+        .route("/posts/{post_id}/saved", put(save_post).delete(unsave_post))
         .route(
             "/posts/{post_id}/files/{position}/html-capability",
             post(create_html_capability),
@@ -818,6 +830,26 @@ async fn resolve_session(
     .await?;
     Ok(Json(
         with_store(state, move |store| store.session(&public_id)).await?,
+    ))
+}
+
+async fn list_sessions(
+    State(state): State<ApiState>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Result<Json<crate::storage::SessionPage>, ApiError> {
+    let page = page_request(query)?;
+    Ok(Json(
+        with_store(state, move |store| store.sessions(page)).await?,
+    ))
+}
+
+async fn saved_posts(
+    State(state): State<ApiState>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Result<Json<crate::storage::PostPage>, ApiError> {
+    let page = page_request(query)?;
+    Ok(Json(
+        with_store(state, move |store| store.saved_posts(page)).await?,
     ))
 }
 
@@ -1470,6 +1502,86 @@ fn parse_range(header: Option<&HeaderValue>, length: u64) -> Result<Option<(u64,
     Ok(Some((start, end)))
 }
 
+async fn save_post(
+    State(state): State<ApiState>,
+    Path(post_id): Path<String>,
+) -> Result<Json<crate::storage::PostRead>, ApiError> {
+    set_post_saved(state, post_id, true).await
+}
+
+async fn unsave_post(
+    State(state): State<ApiState>,
+    Path(post_id): Path<String>,
+) -> Result<Json<crate::storage::PostRead>, ApiError> {
+    set_post_saved(state, post_id, false).await
+}
+
+async fn set_post_saved(
+    state: ApiState,
+    post_id: String,
+    saved: bool,
+) -> Result<Json<crate::storage::PostRead>, ApiError> {
+    let post_id = positive_id(&post_id)?;
+    let events = state.events.clone();
+    Ok(Json(
+        with_store(state, move |store| {
+            store.set_saved(post_id, saved)?;
+            let post = store.post(post_id)?;
+            let _ = events.send(LiveEvent::Reset {
+                reason: "saved_changed",
+            });
+            Ok(post)
+        })
+        .await?,
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeletePostQuery {
+    confirm_saved: Option<bool>,
+}
+
+async fn delete_post(
+    State(state): State<ApiState>,
+    Path(post_id): Path<String>,
+    query: Result<Query<DeletePostQuery>, QueryRejection>,
+) -> Result<Json<LifecycleReport>, ApiError> {
+    let post_id = positive_id(&post_id)?;
+    let Query(query) = query.map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_query",
+            "Query parameters are malformed",
+            json!({}),
+        )
+    })?;
+    let events = state.events.clone();
+    Ok(Json(
+        with_store(state, move |store| {
+            let report = store.delete_post(post_id, query.confirm_saved.unwrap_or(false))?;
+            let _ = events.send(LiveEvent::Reset {
+                reason: "post_deleted",
+            });
+            Ok(report)
+        })
+        .await?,
+    ))
+}
+
+#[derive(Serialize)]
+struct ReclaimReport {
+    unused_blobs_deleted: u64,
+}
+
+async fn reclaim_unused_data(
+    State(state): State<ApiState>,
+) -> Result<Json<ReclaimReport>, ApiError> {
+    Ok(Json(ReclaimReport {
+        unused_blobs_deleted: with_store(state, |store| store.reclaim_unused_data()).await?,
+    }))
+}
+
 async fn get_post(
     State(state): State<ApiState>,
     Path(post_id): Path<String>,
@@ -1709,16 +1821,23 @@ async fn close_session(
     let report = with_store(state, move |store| {
         let context = store.session(&close_id).ok();
         let report = store.close_session(&close_id)?;
-        if report.sessions_deleted > 0 {
-            if let Some(session) = context {
-                let _ = events.send(LiveEvent::SessionClosed {
-                    project_id: session.project.id,
-                    session_public_id: close_id,
-                });
-            }
-            let _ = events.send(LiveEvent::Reset {
-                reason: "session_deleted",
+        if report.sessions_deleted > 0
+            && let Some(session) = context
+        {
+            let _ = events.send(LiveEvent::SessionClosed {
+                project_id: session.project.id,
+                session_public_id: close_id,
             });
+        }
+        if report.sessions_deleted > 0 || report.sessions_retained > 0 || report.posts_deleted > 0 {
+            let reason = if report.sessions_deleted > 0 {
+                "session_deleted"
+            } else if report.sessions_retained > 0 {
+                "session_retained"
+            } else {
+                "session_changed"
+            };
+            let _ = events.send(LiveEvent::Reset { reason });
         }
         Ok(report)
     })
@@ -1892,6 +2011,12 @@ impl From<StoreError> for ApiError {
                     json!({"post_id": post_id}),
                 )
             }
+            StoreError::SavedPostRequiresConfirmation { post_id } => Self::new(
+                StatusCode::CONFLICT,
+                "saved_post_confirmation_required",
+                "Deleting a saved post requires explicit per-post confirmation",
+                json!({"post_id": post_id}),
+            ),
             StoreError::InvalidPageLimit { limit, maximum } => Self::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_page_limit",

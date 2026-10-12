@@ -24,7 +24,9 @@ fn openapi_paths_and_methods_exactly_match_current_api_routes() {
             item.as_object()
                 .unwrap()
                 .keys()
-                .filter(|method| ["get", "head", "post", "delete"].contains(&method.as_str()))
+                .filter(|method| {
+                    ["get", "head", "post", "put", "delete"].contains(&method.as_str())
+                })
                 .map(move |method| (method.to_uppercase(), path.clone()))
         })
         .collect::<BTreeSet<_>>();
@@ -220,7 +222,7 @@ async fn every_documented_operation_is_recognized_by_the_actual_router() {
             .as_object()
             .unwrap()
             .keys()
-            .filter(|key| ["get", "head", "post", "delete"].contains(&key.as_str()))
+            .filter(|key| ["get", "head", "post", "put", "delete"].contains(&key.as_str()))
         {
             let method_value =
                 axum::http::Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();

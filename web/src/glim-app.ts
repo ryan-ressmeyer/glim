@@ -27,6 +27,7 @@ const MAX_BROWSER_SAFE_ID = 9_007_199_254_740_991;
 type Route =
   | { kind: "login" }
   | { kind: "global" }
+  | { kind: "home" | "saved" | "settings" }
   | { kind: "session"; publicId: string }
   | { kind: "project"; projectId: number }
   | { kind: "invalid" };
@@ -63,6 +64,7 @@ interface Post {
   published_at: number;
   git: GitProvenance | null;
   files: PostFile[];
+  saved: boolean;
 }
 
 interface Project {
@@ -79,6 +81,10 @@ interface Session {
   project: Project;
   created_at: number;
   last_activity_at: number;
+  closed?: boolean;
+  label?: string;
+  post_count?: number;
+  saved_count?: number;
 }
 
 interface Page {
@@ -121,7 +127,10 @@ function isDateSeconds(value: unknown): value is number {
 
 function routeFromLocation(pathname: string): Route {
   if (pathname === "/login") return { kind: "login" };
-  if (pathname === "/" || pathname === "/feed") return { kind: "global" };
+  if (pathname === "/") return { kind: "home" };
+  if (pathname === "/feed") return { kind: "global" };
+  if (pathname === "/saved") return { kind: "saved" };
+  if (pathname === "/settings") return { kind: "settings" };
   const sessionMatch = pathname.match(/^\/sessions\/([^/]+)$/);
   if (sessionMatch && isPublicId(sessionMatch[1])) return { kind: "session", publicId: sessionMatch[1] };
   const projectMatch = pathname.match(/^\/projects\/([1-9][0-9]*)$/);
@@ -141,6 +150,7 @@ function comparisonPostId(hash: string): number | null {
 
 function pageEndpoint(route: Route): string | null {
   if (route.kind === "global") return `${API}/posts`;
+  if (route.kind === "saved") return `${API}/saved/posts`;
   if (route.kind === "session") return `${API}/sessions/${route.publicId}/posts`;
   if (route.kind === "project") return `${API}/projects/${route.projectId}/posts`;
   return null;
@@ -148,7 +158,7 @@ function pageEndpoint(route: Route): string | null {
 
 function eventEndpoint(route: Route): string | null {
   const endpoint = pageEndpoint(route);
-  return endpoint ? `${endpoint}/events` : null;
+  return endpoint ? (route.kind === "saved" ? `${API}/posts/events` : `${endpoint}/events`) : route.kind === "home" || route.kind === "settings" ? `${API}/posts/events` : null;
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(name: K, text?: string): HTMLElementTagNameMap[K] {
@@ -405,11 +415,12 @@ function isPost(value: unknown): value is Post {
   const postValue = value as Record<string, unknown>;
   return Object.keys(postValue).every((key) => [
     "id", "session_id", "session_public_id", "title", "commentary", "predecessor_post_id",
-    "published_at", "git", "files",
+    "published_at", "git", "files", "saved",
   ].includes(key))
     && isPositiveSafeInteger(postValue.id)
     && isPositiveSafeInteger(postValue.session_id)
     && isPublicId(postValue.session_public_id)
+    && (postValue.saved === undefined || typeof postValue.saved === "boolean")
     && typeof postValue.title === "string"
     && typeof postValue.commentary === "string"
     && isDateSeconds(postValue.published_at)
@@ -452,7 +463,11 @@ function isSession(value: unknown): value is Session {
     && typeof project.label === "string"
     && typeof project.working_directory === "string"
     && isDateSeconds(candidate.created_at)
-    && isDateSeconds(candidate.last_activity_at);
+    && isDateSeconds(candidate.last_activity_at)
+    && (candidate.closed === undefined || typeof candidate.closed === "boolean")
+    && (candidate.label === undefined || typeof candidate.label === "string")
+    && (candidate.post_count === undefined || Number.isSafeInteger(candidate.post_count))
+    && (candidate.saved_count === undefined || Number.isSafeInteger(candidate.saved_count));
 }
 
 const DEFERRED_RENDERERS = new Set<Renderer>(["markdown", "text", "json", "csv", "html"]);
@@ -618,6 +633,7 @@ function lineDiff(olderText: string, newerText: string): DiffResult {
 function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
@@ -1464,6 +1480,7 @@ const appStyles = `
   h2 { font-size: clamp(1.25rem, 3vw, 1.65rem); line-height: 1.2; }
   nav { align-items: center; display: flex; flex-wrap: wrap; gap: .75rem; }
   a { color: var(--link); text-underline-offset: .15em; }
+  nav a[aria-current="page"] { color: var(--text); font-weight: 700; text-decoration-thickness: .15em; }
   button, summary { font: inherit; }
   button { background: var(--surface); border: 1px solid var(--border); border-radius: .4rem; color: var(--text); cursor: pointer; padding: .42rem .7rem; }
   button:hover { background: var(--surface-subtle); }
@@ -1477,6 +1494,12 @@ const appStyles = `
   .provenance { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: .7rem; }
   .provenance summary { cursor: pointer; width: max-content; }
   .provenance p { margin: .5rem 0 0; overflow-wrap: anywhere; white-space: pre-line; }
+  .library-grid { display: grid; gap: 1rem; }
+  .library-grid article { margin: .5rem 0; }
+  .library-grid h3 { margin: .3rem 0; }
+  .library-grid p { overflow-wrap: anywhere; }
+  .post-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .75rem 0; }
+  .breadcrumbs { color: var(--muted); margin: 0 0 1rem; overflow-wrap: anywhere; }
   .files { list-style: none; margin: 1.25rem 0 0; padding: 0; }
   .files > li { border-top: 1px solid var(--border); padding: 1rem 0; }
   .filename { font-weight: 650; overflow-wrap: anywhere; }
@@ -1526,6 +1549,10 @@ class GlimApp extends HTMLElement {
   private postIds = new Set<number>();
   private nextCursor: string | null = null;
   private sessions = new Map<string, Session>();
+  private directory: Session[] = [];
+  private directoryCursor: string | null = null;
+  private directoryController?: AbortController;
+  private mutationVersion = 0;
   private provenanceUnavailable = new Set<string>();
   private provenanceAttempts = new Map<string, number>();
   private provenanceInFlight = new Map<string, Promise<Session | null>>();
@@ -1547,12 +1574,17 @@ class GlimApp extends HTMLElement {
   private reconciling = false;
   private needsLiveReconciliation = false;
   private closed = false;
+  private retained = false;
   private authenticationExpired = false;
   private targetRequestVersion = 0;
   private targetController?: AbortController;
   private targetHash?: string;
   private focusedHash: string | null = null;
   private readonly visibilityHandler = () => this.syncHeartbeat();
+  private readonly pagehideHandler = () => { this.controller?.abort(); this.stopLive(); };
+  private readonly pageshowHandler = (event: PageTransitionEvent) => {
+    if (event.persisted && this.isConnected) { this.disconnectedCallback(); this.connectedCallback(); }
+  };
   private readonly hashHandler = () => {
     const requestedHash = window.location.hash;
     if (this.targetController && !this.targetController.signal.aborted && this.targetHash === requestedHash) return;
@@ -1560,6 +1592,12 @@ class GlimApp extends HTMLElement {
     this.targetRequestVersion += 1;
     this.targetController?.abort();
     this.targetController = undefined;
+    if (this.route.kind === "home") {
+      if (this.directoryTarget() && !this.shadowRoot?.getElementById(window.location.hash.slice(1)))
+        void this.loadDirectory(false, this.connectionGeneration);
+      else this.renderDirectory();
+      return;
+    }
     if (comparisonPostId(window.location.hash) === null) {
       this.main?.querySelector("[data-comparison]")?.remove();
       if (this.posts.length > 0) this.renderFeed();
@@ -1593,10 +1631,15 @@ class GlimApp extends HTMLElement {
       return;
     }
     this.closed = false;
+    this.retained = false;
     this.authenticationExpired = false;
     window.addEventListener("hashchange", this.hashHandler);
+    window.addEventListener("pagehide", this.pagehideHandler);
+    window.addEventListener("pageshow", this.pageshowHandler);
     this.startLive(generation);
-    this.load(false, generation).catch(() => undefined);
+    if (this.route.kind === "home") void this.loadDirectory(false, generation);
+    else if (this.route.kind === "settings") void this.loadSettings(generation);
+    else this.load(false, generation).catch(() => undefined);
   }
 
   disconnectedCallback() {
@@ -1606,6 +1649,9 @@ class GlimApp extends HTMLElement {
     this.targetController?.abort();
     this.targetController = undefined;
     window.removeEventListener("hashchange", this.hashHandler);
+    window.removeEventListener("pagehide", this.pagehideHandler);
+    window.removeEventListener("pageshow", this.pageshowHandler);
+    this.directoryController?.abort();
     this.stopLive();
   }
 
@@ -1637,17 +1683,26 @@ class GlimApp extends HTMLElement {
       this.reconcileLatest(generation);
     };
     source.addEventListener("post", ((event: MessageEvent<string>) => {
-      if (!this.isAppActive(generation) || this.events !== source || this.closed) return;
+      if (!this.isAppActive(generation) || this.events !== source || this.closed
+        || (this.retained && this.route.kind === "session")) return;
       let value: unknown;
       try { value = JSON.parse(event.data); } catch { this.reconcileLatest(generation); return; }
       if (!isPost(value) || (event.lastEventId !== "" && event.lastEventId !== String(value.id))) {
         this.reconcileLatest(generation);
         return;
       }
-      this.receivePost(value, generation);
+      if (this.route.kind === "home") void this.loadDirectory(false, generation);
+      else if (this.route.kind === "settings") void this.loadSettings(generation);
+      else if (this.route.kind === "saved") this.reconcileLatest(generation);
+      else this.receivePost(value, generation);
     }) as EventListener);
     source.addEventListener("reset", (() => {
-      if (this.isAppActive(generation) && this.events === source) this.reconcileLatest(generation);
+      if (!this.isAppActive(generation) || this.events !== source) return;
+      this.sessions.clear();
+      this.provenanceInFlight.clear();
+      if (this.route.kind === "home") void this.loadDirectory(false, generation);
+      else if (this.route.kind === "settings") void this.loadSettings(generation);
+      else this.reconcileLatest(generation);
     }) as EventListener);
     source.addEventListener("session-closed", ((event: MessageEvent<string>) => {
       if (!this.isAppActive(generation) || this.events !== source) return;
@@ -1663,6 +1718,8 @@ class GlimApp extends HTMLElement {
         this.showClosed();
         return;
       }
+      if (this.route.kind === "home") { void this.loadDirectory(false, generation); return; }
+      if (this.route.kind === "settings") { void this.loadSettings(generation); return; }
       this.posts = this.posts.filter((post) => post.session_public_id !== closure.session_public_id);
       this.postIds = new Set(this.posts.map((post) => post.id));
       for (const [id, post] of this.pendingPosts) {
@@ -1688,6 +1745,7 @@ class GlimApp extends HTMLElement {
     this.targetController?.abort();
     this.targetController = undefined;
     this.pendingPosts.clear();
+    this.directoryController?.abort();
     this.needsLiveReconciliation = false;
   }
 
@@ -1852,7 +1910,8 @@ class GlimApp extends HTMLElement {
   }
 
   private syncHeartbeat() {
-    if (this.route.kind !== "session" || !this.streamOpen || document.visibilityState !== "visible" || this.closed) {
+    if (this.route.kind !== "session" || !this.streamOpen || document.visibilityState !== "visible" || this.closed
+      || this.retained || this.sessions.get(this.route.publicId)?.closed) {
       this.stopHeartbeat();
       return;
     }
@@ -1863,7 +1922,8 @@ class GlimApp extends HTMLElement {
   }
 
   private async sendHeartbeat() {
-    if (this.route.kind !== "session" || this.heartbeatInFlight || !this.streamOpen || document.visibilityState !== "visible") return;
+    if (this.route.kind !== "session" || this.heartbeatInFlight || !this.streamOpen || document.visibilityState !== "visible"
+      || this.retained || this.sessions.get(this.route.publicId)?.closed) return;
     this.heartbeatInFlight = true;
     const controller = new AbortController();
     this.heartbeatController = controller;
@@ -1890,7 +1950,10 @@ class GlimApp extends HTMLElement {
     this.stopLive();
     this.setConnectionStatus("Closed");
     this.controller?.abort();
-    this.showState("Session closed");
+    this.showState("Session closed and removed. Open Home to find other sessions.");
+    const home = element("a", "Home");
+    home.href = "/";
+    this.main?.querySelector(".state")?.append(element("br"), home);
   }
 
   private renderLogin(generation: number) {
@@ -1926,7 +1989,7 @@ class GlimApp extends HTMLElement {
       }).then((response) => {
         if (!this.isAppActive(generation, controller.signal)) return;
         if (!response.ok) throw new Error("login rejected");
-        window.location.assign("/feed");
+        window.location.assign("/");
       }).catch((error: unknown) => {
         if (!this.isAppActive(generation, controller.signal)
           || (error instanceof DOMException && error.name === "AbortError")) return;
@@ -1947,15 +2010,22 @@ class GlimApp extends HTMLElement {
     this.shadowRoot?.querySelector("main")?.remove();
     const main = element("main");
     const header = element("header");
-    const heading = element("h1", "Glimse");
+    const heading = element("h1");
+    const brand = element("a", "Glimse");
+    brand.href = "/";
+    heading.append(brand);
     const status = element("span", "Offline");
     status.className = "connection-status";
     status.dataset.connectionStatus = "";
     status.setAttribute("role", "status");
     const navigation = element("nav");
-    navigation.setAttribute("aria-label", "Feed scopes");
+    navigation.setAttribute("aria-label", "Library navigation");
     header.append(heading, status, navigation);
     main.append(header);
+    const breadcrumb = element("div");
+    breadcrumb.className = "breadcrumbs";
+    breadcrumb.dataset.breadcrumbs = "";
+    main.append(breadcrumb);
     this.shadowRoot!.append(main);
     this.main = main;
     this.navigation = navigation;
@@ -1971,23 +2041,35 @@ class GlimApp extends HTMLElement {
     if (!this.navigation) return;
     this.navigation.replaceChildren();
     if (this.route.kind === "login") return;
-    if (this.route.kind === "session") {
-      const sessionLink = element("a", "Session");
-      sessionLink.href = `/sessions/${this.route.publicId}`;
-      this.navigation.append(sessionLink);
-      if (context) {
-        const projectLink = element("a", context.project.label || "Project");
-        projectLink.href = `/projects/${context.project.id}`;
-        this.navigation.append(projectLink);
+    const breadcrumb = this.main?.querySelector<HTMLElement>("[data-breadcrumbs]");
+    if (breadcrumb) {
+      breadcrumb.replaceChildren();
+      const home = element("a", "Home"); home.href = "/";
+      breadcrumb.append(home);
+      if (this.route.kind === "project" || this.route.kind === "session") {
+        const project = element("a", context?.project.label || "Project");
+        if (this.route.kind === "project" || context) {
+          project.href = `/projects/${this.route.kind === "project" ? this.route.projectId : context!.project.id}`;
+          breadcrumb.append(" / ", project);
+        } else breadcrumb.append(" / Project (loading)");
       }
-    } else if (this.route.kind === "project") {
-      const projectLink = element("a", context?.project.label || "Project");
-      projectLink.href = `/projects/${this.route.projectId}`;
-      this.navigation.append(projectLink);
+      if (this.route.kind === "session") breadcrumb.append(" / ", context?.label || this.posts[0]?.title || context?.external_key || this.route.publicId,
+        context?.closed || this.retained ? " (closed, retained content)" : "");
+      if (["global", "saved", "settings"].includes(this.route.kind)) breadcrumb.append(" / ", this.route.kind === "global" ? "All posts" : this.route.kind === "saved" ? "Saved" : "Storage & settings");
     }
-    const globalLink = element("a", "Global feed");
-    globalLink.href = "/feed";
-    this.navigation.append(globalLink);
+    for (const [label, path, active] of [
+      ["Home", "/", this.route.kind === "home"], ["All posts", "/feed", this.route.kind === "global"],
+      ["Saved", "/saved", this.route.kind === "saved"], ["Storage & settings", "/settings", this.route.kind === "settings"],
+    ] as const) {
+      const link = element("a", label); link.href = path;
+      if (active) link.setAttribute("aria-current", "page");
+      this.navigation.append(link);
+    }
+    if (this.route.kind === "project") {
+      const sessions = element("a", "Browse project sessions");
+      sessions.href = `/#project-${this.route.projectId}`;
+      breadcrumb?.append(" / ", sessions);
+    }
     const actions = element("details");
     actions.dataset.actions = "";
     actions.append(element("summary", "Actions"));
@@ -1998,7 +2080,7 @@ class GlimApp extends HTMLElement {
     logout.dataset.logout = "";
     logout.addEventListener("click", () => { void this.logout(logout); });
     actionMenu.append(logout);
-    if (this.route.kind === "session") {
+    if (this.route.kind === "session" && !context?.closed && !this.retained) {
       const close = element("button", "Close session");
       close.type = "button";
       close.className = "danger";
@@ -2029,18 +2111,293 @@ class GlimApp extends HTMLElement {
 
   private async closeSession(button: HTMLButtonElement) {
     if (this.route.kind !== "session" || button.disabled
-      || !window.confirm("Close this session and permanently remove its posts?")) return;
+      || !window.confirm("Close this session? Unsaved posts will be removed. Saved posts remain readable at this session link.")) return;
     button.disabled = true;
     try {
       const response = await fetch(`${API}/sessions/${this.route.publicId}`, { method: "DELETE" });
       if (!response.ok) throw new Error("close failed");
-      this.showClosed();
+      const report: { sessions_retained?: number } = await response.json();
+      if (report.sessions_retained) {
+        this.retained = true;
+        this.stopHeartbeat();
+        const context = this.sessions.get(this.route.publicId);
+        this.posts = this.posts.filter((post) => post.saved);
+        const retainedContext = context ? { ...context, closed: true, label: this.posts[0]?.title ?? context.label } : undefined;
+        if (retainedContext) this.sessions.set(this.route.publicId, retainedContext);
+        this.renderNavigation(retainedContext);
+        this.postIds = new Set(this.posts.map((post) => post.id));
+        this.pendingPosts.clear();
+        this.nextCursor = null;
+        if (this.posts.length) this.renderFeed();
+        else this.showState("Loading retained saved posts");
+        this.provenanceInFlight.delete(this.route.publicId);
+        this.reconcileLatest(this.connectionGeneration);
+      } else this.showClosed();
     } catch {
       button.disabled = false;
       const status = element("span", " Could not close the session. Try again.");
       status.setAttribute("role", "status");
       button.after(status);
     }
+  }
+
+  private async changePost(post: Post, button: HTMLButtonElement, action: "save" | "delete") {
+    if (button.disabled) return;
+    post = this.posts.find((value) => value.id === post.id) ?? post;
+    if (action === "save" && post.saved
+      && !window.confirm("Unsave this post? It will no longer be protected from session cleanup. Unsave does not delete it now.")) return;
+    if (action === "delete" && !window.confirm(post.saved
+      ? "Permanently delete this saved post and its files? Saved content will not survive this deletion."
+      : "Permanently delete this post and its files?")) return;
+    button.disabled = true;
+    const url = `${API}/posts/${post.id}`;
+    const mutation = ++this.mutationVersion;
+    try {
+      let response = await fetch(action === "save" ? `${url}/saved` : action === "delete" && post.saved ? `${url}?confirm_saved=true` : url,
+        { method: action === "save" ? (post.saved ? "DELETE" : "PUT") : "DELETE" });
+      if (action === "delete" && !post.saved && response.status === 409) {
+        const error: unknown = await response.json();
+        if (!error || typeof error !== "object" || !("error" in error)
+          || !error.error || typeof error.error !== "object" || !("code" in error.error)
+          || error.error.code !== "saved_post_confirmation_required") throw new Error("Delete conflict");
+        if (!window.confirm("This post was saved elsewhere. Permanently delete the protected post and its files?")) return;
+        response = await fetch(`${url}?confirm_saved=true`, { method: "DELETE" });
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (action === "save") {
+        const updated: unknown = await response.json();
+        if (!isPost(updated) || updated.id !== post.id) throw new Error("Invalid post response");
+        if (mutation !== this.mutationVersion || !this.isConnected) return;
+        this.posts = this.posts.map((value) => value.id === post.id ? updated : value);
+        if (this.route.kind === "saved" && !updated.saved) this.posts = this.posts.filter((value) => value.id !== post.id);
+      } else {
+        if (mutation !== this.mutationVersion || !this.isConnected) return;
+        this.posts = this.posts.filter((value) => value.id !== post.id);
+      }
+      this.postIds = new Set(this.posts.map((value) => value.id));
+      if (action === "save") button.textContent = post.saved ? "Save post" : "Unsave post";
+      this.controller?.abort();
+      this.reconciliationVersion += 1;
+      this.reconciliationController?.abort();
+      this.renderFeed();
+      this.reconcileLatest(this.connectionGeneration);
+    } catch {
+      if (!this.isConnected) return;
+      const notice = element("span", " Change failed. Post remains available; retry.");
+      notice.setAttribute("role", "status");
+      button.after(notice);
+    } finally { button.disabled = false; }
+  }
+
+  private directoryTarget(): number | null {
+    const match = window.location.hash.match(/^#project-([1-9][0-9]*)$/);
+    const id = match && Number(match[1]);
+    return id && isPositiveSafeInteger(id) ? id : null;
+  }
+
+  private async loadDirectory(more: boolean, generation: number) {
+    if (this.route.kind !== "home" || !this.isAppActive(generation)) return;
+    this.directoryController?.abort();
+    const controller = new AbortController();
+    this.directoryController = controller;
+    if (!more && !this.directory.length) this.showState("Loading library");
+    const oldest = more ? null : this.directory.at(-1)?.id;
+    const loaded: Session[] = more ? [...this.directory] : [];
+    const ids = new Set(loaded.map((session) => session.id));
+    const visited = new Set<string>();
+    let cursor = more ? this.directoryCursor : null;
+    try {
+      do {
+        if (cursor) {
+          if (visited.has(cursor)) throw new Error("Library cursor made no progress");
+          visited.add(cursor);
+        }
+        const params = new URLSearchParams({ limit: "50" });
+        if (cursor) params.set("cursor", cursor);
+        const response = await fetch(`${API}/sessions?${params}`, { signal: controller.signal });
+        if (!this.isAppActive(generation, controller.signal)) return;
+        if (response.status === 401) { this.showAuthenticationExpired(); return; }
+        if (!response.ok) throw new Error("Library request failed");
+        const payload: unknown = await response.json();
+        if (!this.isAppActive(generation, controller.signal)) return;
+        if (!payload || typeof payload !== "object" || !("sessions" in payload) || !("next_cursor" in payload)
+          || !Array.isArray(payload.sessions) || !payload.sessions.every(isSession)
+          || !(payload.next_cursor === null || typeof payload.next_cursor === "string")) throw new Error("Malformed library response");
+        for (const session of payload.sessions) {
+          if (!ids.has(session.id)) { ids.add(session.id); loaded.push(session); }
+        }
+        if (payload.next_cursor === cursor && cursor) throw new Error("Library cursor made no progress");
+        cursor = payload.next_cursor;
+        const target = this.directoryTarget();
+        const reachedLoadedRange = !oldest || loaded.some((session) => session.id <= oldest);
+        if (more || (reachedLoadedRange && (!target || loaded.some((session) => session.project.id === target)))) break;
+      } while (cursor);
+      if (!this.isAppActive(generation, controller.signal)) return;
+      this.directory = loaded.sort((a, b) => b.id - a.id);
+      this.directoryCursor = cursor;
+      this.renderDirectory();
+    } catch {
+      if (!this.isAppActive(generation, controller.signal)) return;
+      this.showLibraryRetry(more ? "Could not load more sessions" : "Could not load library",
+        () => { void this.loadDirectory(more, generation); });
+    } finally {
+      if (this.directoryController === controller) this.directoryController = undefined;
+    }
+  }
+
+  private showLibraryRetry(message: string, retry: () => void) {
+    if (!this.directory.length) { this.showState(message); }
+    else this.main?.querySelector("[data-library-retry]")?.remove();
+    const holder = element("p", message);
+    holder.dataset.libraryRetry = "";
+    const button = element("button", "Retry");
+    button.addEventListener("click", retry);
+    holder.append(" ", button);
+    (this.main?.querySelector(".library-grid") ?? this.main?.querySelector(".state"))?.append(holder);
+  }
+
+  private renderDirectory() {
+    const anchor = Array.from(this.main?.querySelectorAll<HTMLElement>(".library-grid article[data-session-id]") ?? [])
+      .find((article) => article.getBoundingClientRect().bottom > 0);
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    const anchorId = anchor?.dataset.sessionId;
+    this.main?.querySelectorAll(".state, .library-grid").forEach((value) => value.remove());
+    if (!this.directory.length) {
+      this.showState("No sessions yet. Published posts will appear here.");
+      if (this.directoryTarget()) this.showDirectoryTargetMissing(this.main?.querySelector(".state"));
+      return;
+    }
+    const grid = element("section"); grid.className = "library-grid";
+    grid.setAttribute("aria-label", "Sessions by project");
+    grid.append(element("p", "Recent activity means a session was used, not that its originating agent is online. Closed sessions remain here while saved posts are readable."));
+    const groups = new Map<number, Session[]>();
+    for (const session of this.directory) groups.set(session.project.id, [...groups.get(session.project.id) ?? [], session]);
+    for (const sessions of groups.values()) {
+      const group = element("section");
+      group.id = `project-${sessions[0].project.id}`;
+      const heading = element("h2");
+      const project = element("a", sessions[0].project.label || "Project");
+      project.href = `/projects/${sessions[0].project.id}`;
+      heading.append(project); group.append(heading);
+      for (const session of sessions) {
+        const article = element("article");
+        article.dataset.sessionId = session.public_id;
+        const title = element("h3"); const link = element("a", session.label || session.external_key || session.public_id);
+        link.href = `/sessions/${session.public_id}`; title.append(link);
+        article.append(title, element("p", `${session.closed ? "Closed · retained content" : "Open"} · ${session.post_count ?? 0} ${session.post_count === 1 ? "post" : "posts"} · ${session.saved_count ?? 0} saved · Last activity ${new Date(session.last_activity_at * 1000).toLocaleString()}`));
+        if (!session.closed) {
+          const remove = element("button", "Delete session"); remove.className = "danger";
+          remove.addEventListener("click", () => { void this.deleteDirectorySession(session, remove); });
+          article.append(remove);
+        }
+        group.append(article);
+      }
+      grid.append(group);
+    }
+    if (this.directoryCursor) {
+      const more = element("button", "Load more sessions"); more.dataset.loadMore = "";
+      more.addEventListener("click", () => { more.disabled = true; void this.loadDirectory(true, this.connectionGeneration); });
+      grid.append(more);
+    }
+    this.main?.append(grid);
+    const nextAnchor = Array.from(grid.querySelectorAll<HTMLElement>("article[data-session-id]"))
+      .find((article) => article.dataset.sessionId === anchorId);
+    if (nextAnchor && anchorTop !== undefined && !this.directoryTarget())
+      window.scrollBy(0, nextAnchor.getBoundingClientRect().top - anchorTop);
+    const targetId = this.directoryTarget();
+    const target = targetId && this.shadowRoot?.getElementById(`project-${targetId}`);
+    if (target && this.focusedHash !== window.location.hash) {
+      this.focusedHash = window.location.hash;
+      target.scrollIntoView();
+    } else if (targetId && !this.directoryCursor) this.showDirectoryTargetMissing(grid);
+  }
+
+  private showDirectoryTargetMissing(parent: Element | null | undefined) {
+    const status = element("p", "Project sessions not found");
+    status.dataset.targetState = "";
+    status.setAttribute("role", "status");
+    parent?.append(status);
+  }
+
+  private async deleteDirectorySession(session: Session, button: HTMLButtonElement) {
+    if (!window.confirm("Close this session? Unsaved posts will be removed. Saved posts remain readable at the original session link.")) return;
+    button.disabled = true;
+    try {
+      const response = await fetch(`${API}/sessions/${session.public_id}`, { method: "DELETE" });
+      if (!response.ok) throw new Error("Close failed");
+      await this.loadDirectory(false, this.connectionGeneration);
+    } catch {
+      button.disabled = false;
+      const status = element("span", " Could not close session. Try again."); status.setAttribute("role", "status"); button.after(status);
+    }
+  }
+
+  private async loadSettings(generation: number) {
+    if (this.route.kind !== "settings" || !this.isAppActive(generation)) return;
+    this.directoryController?.abort();
+    const controller = new AbortController(); this.directoryController = controller;
+    if (!this.main?.querySelector(".settings")) this.showState("Loading storage status");
+    try {
+      const response = await fetch(`${API}/status`, { signal: controller.signal });
+      if (!this.isAppActive(generation, controller.signal)) return;
+      if (response.status === 401) { this.showAuthenticationExpired(); return; }
+      if (!response.ok) throw new Error("Status request failed");
+      const status: Record<string, unknown> = await response.json();
+      if (!this.isAppActive(generation, controller.signal)) return;
+      if (typeof status.ok !== "boolean" || typeof status.version !== "string"
+        || typeof status.finalized_unique_blob_bytes !== "number" || typeof status.max_finalized_blob_bytes !== "number") throw new Error("Malformed status");
+      const section = this.main?.querySelector<HTMLElement>(".settings") ?? element("section");
+      const bytes = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? formatBytes(value) : "unavailable";
+      const lines = [
+        `Daemon ${status.ok ? "healthy" : "unhealthy"} · version ${status.version}`,
+        `Unique finalized artifact storage ${formatBytes(status.finalized_unique_blob_bytes)} / ${formatBytes(status.max_finalized_blob_bytes)}`,
+        `Metadata (database, WAL and SHM apparent file bytes) ${bytes(status.metadata_disk_bytes)}`,
+        `Temporary uploads ${bytes(status.staging_bytes_in_use)} / ${bytes(status.max_staging_bytes)}`,
+        `Per-file upload limit ${formatBytes(Number(status.max_upload_bytes))} · Concurrent publications ${status.max_concurrent_publications ?? "unavailable"}`,
+        `Posts ${status.total_posts ?? "unavailable"} · Saved ${status.saved_posts ?? "unavailable"}`,
+        `Active sessions ${status.active_sessions ?? "unavailable"} · Due for cleanup ${status.sessions_due_for_purge ?? "unavailable"} · Queued blob deletions ${status.queued_blob_deletions ?? "unavailable"}`,
+        `Retention ${Number(status.retention_seconds) / 86400} days · Cleanup every ${Number(status.cleanup_interval_seconds) / 3600} hour(s)`,
+        "Active sessions do not indicate online agents. Limits are read-only here; configure the daemon through its configuration file or environment variables.",
+        "Reclaim unused data deletes only unreferenced finalized blobs. It does not delete posts, active uploads, or browser HTTP cache.",
+      ];
+      const metrics = element("div"); metrics.dataset.settingsMetrics = "";
+      for (const line of lines) metrics.append(element("p", line));
+      if (section.isConnected) section.querySelector("[data-settings-metrics]")?.replaceWith(metrics);
+      else {
+        this.main?.querySelector(".state")?.remove();
+        section.className = "settings";
+        section.append(element("h2", "Storage & settings"), metrics);
+        const refresh = element("button", "Refresh"); refresh.addEventListener("click", () => { void this.loadSettings(generation); });
+        const reclaim = element("button", "Reclaim unused data"); reclaim.dataset.reclaim = "";
+        reclaim.addEventListener("click", () => { void this.reclaim(reclaim, section, generation); });
+        section.append(refresh, " ", reclaim); this.main?.append(section);
+      }
+    } catch {
+      if (!this.isAppActive(generation, controller.signal)) return;
+      if (this.main?.querySelector(".settings")) {
+        const state = element("p", "Could not refresh storage status. Try again."); state.setAttribute("role", "status"); this.main?.querySelector(".settings")?.append(state);
+      } else this.showLibraryRetry("Could not load storage status", () => { void this.loadSettings(generation); });
+    }
+  }
+
+  private async reclaim(button: HTMLButtonElement, section: HTMLElement, generation: number) {
+    button.disabled = true;
+    try {
+      const response = await fetch(`${API}/storage/reclaim`, { method: "POST" });
+      if (!response.ok) throw new Error("Reclaim failed");
+      const result: { unused_blobs_deleted: number } = await response.json();
+      if (!this.isAppActive(generation)) return;
+      await this.loadSettings(generation);
+      if (!this.isAppActive(generation) || !section.isConnected || this.authenticationExpired) return;
+      section.querySelector("[data-reclaim-notice]")?.remove();
+      const notice = element("p", `Reclaimed ${result.unused_blobs_deleted} unused blob${result.unused_blobs_deleted === 1 ? "" : "s"}.`);
+      notice.dataset.reclaimNotice = ""; notice.setAttribute("role", "status"); section.append(notice);
+    } catch {
+      if (!this.isAppActive(generation) || !section.isConnected || this.authenticationExpired) return;
+      section.querySelector("[data-reclaim-notice]")?.remove();
+      const notice = element("p", "Could not reclaim unused data. No posts were removed.");
+      notice.dataset.reclaimNotice = ""; notice.setAttribute("role", "status"); section.append(notice);
+    } finally { button.disabled = false; }
   }
 
   private showAuthenticationExpired() {
@@ -2056,7 +2413,7 @@ class GlimApp extends HTMLElement {
   }
 
   private showState(message: string, retry = false) {
-    this.main?.querySelectorAll(".state, .feed, [data-live-notice], [data-comparison]").forEach((value) => value.remove());
+    this.main?.querySelectorAll(".state, .feed, .library-grid, .settings, [data-live-notice], [data-comparison]").forEach((value) => value.remove());
     const state = element("section", message);
     state.className = "state";
     state.setAttribute("aria-live", "polite");
@@ -2272,7 +2629,8 @@ class GlimApp extends HTMLElement {
       const response = await fetch(`${API}/posts/${id}`, { signal: controller.signal });
       if (!active()) return null;
       if (response.status === 401) { this.showAuthenticationExpired(); return null; }
-      if (!response.ok) throw new Error(`Post ${id} could not be loaded (HTTP ${response.status})`);
+      if (!response.ok) throw new Error(id !== postId && response.status === 404
+        ? `Predecessor post ${id} unavailable` : `Post ${id} could not be loaded (HTTP ${response.status})`);
       const payload: unknown = await response.json();
       if (!active()) return null;
       if (!isPost(payload) || payload.id !== id) throw new Error(`Post ${id} returned malformed data`);
@@ -2317,6 +2675,10 @@ class GlimApp extends HTMLElement {
       status.dataset.targetState = "";
       status.className = "target-state";
       status.setAttribute("role", "status");
+      const back = element("a", `Return to post ${postId}`);
+      back.href = `#post-${postId}`;
+      back.addEventListener("click", (event) => { event.preventDefault(); this.navigateHash(back.hash); });
+      status.append(element("br"), back);
       this.main?.append(status);
     } finally {
       if (this.targetController === controller) {
@@ -2477,7 +2839,7 @@ class GlimApp extends HTMLElement {
     this.main?.querySelectorAll(".state").forEach((value) => value.remove());
     if (this.posts.length === 0) {
       this.main?.querySelector(".feed")?.remove();
-      this.showState("No posts in this feed");
+      this.showState(this.route.kind === "saved" ? "No saved posts" : "No posts in this feed");
       return;
     }
     let feed = this.main?.querySelector<HTMLElement>(".feed");
@@ -2500,6 +2862,8 @@ class GlimApp extends HTMLElement {
     let current = feed.firstElementChild;
     for (const post of this.posts) {
       const article = byId.get(`post-${post.id}`) ?? this.renderPost(post);
+      const save = article.querySelector<HTMLButtonElement>("[data-save-post]");
+      if (save) save.textContent = post.saved ? "Unsave post" : "Save post";
       while (current && current.tagName !== "ARTICLE") current = current.nextElementSibling;
       if (current === article) current = current.nextElementSibling;
       else feed.insertBefore(article, current);
@@ -2526,10 +2890,22 @@ class GlimApp extends HTMLElement {
     const time = element("time", validPublished ? published.toLocaleString() : "Publication time unavailable");
     if (validPublished) time.dateTime = published.toISOString();
     time.className = "meta";
+    const actions = element("div");
+    actions.className = "post-actions";
+    const save = element("button", post.saved ? "Unsave post" : "Save post");
+    save.dataset.savePost = "";
+    save.addEventListener("click", () => { void this.changePost(post, save, "save"); });
+    const remove = element("button", "Delete post");
+    remove.dataset.deletePost = "";
+    remove.className = "danger";
+    remove.addEventListener("click", () => { void this.changePost(post, remove, "delete"); });
+    const scope = element("a", "Open in session");
+    scope.href = `/sessions/${post.session_public_id}#post-${post.id}`;
+    actions.append(save, remove, scope);
     const commentary = element("div");
     commentary.className = "commentary";
     commentary.innerHTML = safeMarkdown(post.commentary);
-    article.append(heading, time, commentary);
+    article.append(heading, time, actions, commentary);
     if (post.predecessor_post_id !== null) {
       const revision = element("a", `Revises post ${post.predecessor_post_id}`);
       revision.href = `#post-${post.predecessor_post_id}`;
@@ -2615,7 +2991,25 @@ class GlimApp extends HTMLElement {
     await this.acquireProvenanceSlot();
     try {
       if (!this.isAppActive(generation, signal)) return null;
-      const response = await fetch(`${API}/sessions/${id}`, { signal });
+      let response!: Response;
+      let payload: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const timeout = AbortSignal.timeout(3_000);
+        const requestSignal = AbortSignal.any([signal, timeout]);
+        const aborted = new Promise<never>((_resolve, reject) => {
+          if (requestSignal.aborted) reject(new DOMException("aborted", "AbortError"));
+          else requestSignal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+        try {
+          response = await Promise.race([fetch(`${API}/sessions/${id}`, { signal: requestSignal }), aborted]);
+          if (!this.isAppActive(generation, signal)) return null;
+          if (response.ok) payload = await Promise.race([response.json(), aborted]);
+          break;
+        } catch (error) {
+          if (!signal.aborted && timeout.aborted && attempt === 0) continue;
+          throw error;
+        }
+      }
       if (!this.isAppActive(generation, signal)) return null;
       if (!response.ok) {
         if (response.status === 401) {
@@ -2626,7 +3020,6 @@ class GlimApp extends HTMLElement {
         else this.provenanceUnavailable.add(id);
         return null;
       }
-      const payload: unknown = await response.json();
       if (!this.isAppActive(generation, signal)) return null;
       const expectedSessionId = this.posts.find((post) => post.session_public_id === id)?.session_id;
       const projectMatches = this.route.kind !== "project" || (isSession(payload) && payload.project.id === this.route.projectId);
@@ -2636,6 +3029,7 @@ class GlimApp extends HTMLElement {
         return null;
       }
       this.sessions.set(id, payload);
+      if (this.route.kind === "session" && payload.closed) this.stopHeartbeat();
       this.provenanceAttempts.delete(id);
       return payload;
     } catch {
@@ -2682,7 +3076,7 @@ class GlimApp extends HTMLElement {
         }
         continue;
       }
-      const sessionLink = element("a", "Session");
+      const sessionLink = element("a", value.label || value.external_key || "Session");
       sessionLink.href = `/sessions/${value.public_id}`;
       const projectLink = element("a", value.project.label);
       projectLink.href = `/projects/${value.project.id}`;

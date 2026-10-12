@@ -230,7 +230,7 @@ impl Store {
             } else {
                 self.connection
                     .query_row(
-                        "SELECT id FROM sessions WHERE public_id = ?1",
+                        "SELECT id FROM sessions WHERE public_id = ?1 AND closed = 0",
                         [&request.session_public_id],
                         |row| row.get::<_, i64>(0),
                     )
@@ -334,12 +334,18 @@ impl Store {
                 }
             }
 
+            self.connection
+                .execute("INSERT INTO post_id_sequence DEFAULT VALUES", [])?;
+            let post_id = self.connection.last_insert_rowid();
+            self.connection
+                .execute("DELETE FROM post_id_sequence WHERE id = ?1", [post_id])?;
             self.connection.execute(
                 "INSERT INTO posts
-                 (session_id, title, commentary, predecessor_post_id, published_at,
+                 (id, session_id, title, commentary, predecessor_post_id, published_at,
                   git_root, git_branch, git_commit)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
+                    post_id,
                     session_id,
                     request.title,
                     request.commentary,
@@ -350,7 +356,6 @@ impl Store {
                     request.git.as_ref().and_then(|git| git.commit.as_deref()),
                 ],
             )?;
-            let post_id = self.connection.last_insert_rowid();
 
             for (position, file) in request.files.iter().enumerate() {
                 let reference_id = insert_reference(&self.connection, post_id, &file.blob.hash)?;
@@ -460,7 +465,7 @@ fn resolve_publication_identity(
     if let Some(found) = connection
         .query_row(
             "SELECT id, public_id FROM sessions
-             WHERE integration_namespace = ?1 AND external_key = ?2 AND project_id = ?3",
+             WHERE integration_namespace = ?1 AND external_key = ?2 AND project_id = ?3 AND closed = 0",
             params![
                 identity.integration_namespace,
                 identity.external_key,
@@ -584,7 +589,7 @@ fn validate_predecessor(
     };
     let predecessor_session = connection
         .query_row(
-            "SELECT session_id FROM posts WHERE id = ?1",
+            "SELECT session_id FROM posts WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM post_tombstones WHERE post_id = ?1)",
             [predecessor],
             |row| row.get::<_, i64>(0),
         )

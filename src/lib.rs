@@ -8,8 +8,11 @@ pub mod storage;
 pub const API_V1_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/health"),
     ("GET", "/api/v1/status"),
+    ("POST", "/api/v1/storage/reclaim"),
+    ("GET", "/api/v1/saved/posts"),
     ("POST", "/api/v1/auth/session"),
     ("DELETE", "/api/v1/auth/session"),
+    ("GET", "/api/v1/sessions"),
     ("POST", "/api/v1/sessions"),
     ("GET", "/api/v1/sessions/{public_id}"),
     ("DELETE", "/api/v1/sessions/{public_id}"),
@@ -22,6 +25,9 @@ pub const API_V1_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/posts"),
     ("POST", "/api/v1/posts"),
     ("GET", "/api/v1/posts/{post_id}"),
+    ("DELETE", "/api/v1/posts/{post_id}"),
+    ("PUT", "/api/v1/posts/{post_id}/saved"),
+    ("DELETE", "/api/v1/posts/{post_id}/saved"),
     (
         "POST",
         "/api/v1/posts/{post_id}/files/{position}/html-capability",
@@ -105,6 +111,8 @@ fn app_with_state(state: api::ApiState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/feed", get(root))
+        .route("/saved", get(root))
+        .route("/settings", get(root))
         .route("/login", get(login_page))
         .route("/sessions/{public_id}", get(session_page))
         .route("/projects/{project_id}", get(project_page))

@@ -4,7 +4,7 @@
 
 Glimse gives terminal-based AI agents a browser surface for results that do not render well in a terminal. An agent explicitly publishes one or more files with Markdown commentary. The user inspects the complete result in a live feed and returns to the terminal to continue the conversation.
 
-Glimse is a temporary review surface. It is not an archive, project file browser, chat interface, or cloud publishing service.
+Glimse is a review surface with explicit saved-post retention. Unsaved results expire; it is not a project file browser, chat interface, or cloud publishing service.
 
 ## System boundary
 
@@ -55,9 +55,9 @@ Each session has two identifiers.
 
 Agent-provided links open the session feed. The viewer also provides project and global feed scopes.
 
-Explicitly closing a session immediately removes its posts and metadata from the feed and queues unreferenced blobs for deletion. If physical cleanup fails after the metadata commit, closure remains successful, cleanup stays queued for retry, and status exposes the outstanding deletion count. An inactive session is purged after seven days. New publications and a heartbeat from a visible session feed reset inactivity. Background listing or polling does not.
+Explicitly closing a session immediately removes unsaved posts and queues unreferenced blobs for deletion. Saved posts and their original session provenance remain readable; the closed context no longer accepts heartbeats or new posts. If physical cleanup fails after the metadata commit, closure remains successful, cleanup stays queued for retry, and status exposes the outstanding deletion count. After seven inactive days, cleanup removes unsaved posts and leaves saved posts in a closed context. New publications and a heartbeat from a visible open session feed reset inactivity. Background listing or polling does not.
 
-After purge, another publication with the same external key creates a fresh session. Glimse has no pin, archive, or saved-history mechanism.
+After close, another publication with the same external key creates a fresh session. Individuals may save posts for retention. Unsave removes protection without immediate deletion; permanently deleting saved content requires separate explicit confirmation for that post. Saved revisions do not automatically save predecessors. A missing predecessor remains unavailable.
 
 ## Posts and revisions
 
@@ -75,7 +75,7 @@ A post contains:
 
 Every post requires at least one visible artifact. Text-only status messages belong in the terminal.
 
-Posts are immutable snapshots. Revising a result creates a new post at the top of the feed and links it to its predecessor. Publication is atomic, so a failed file, validation error, or storage limit leaves no partial post.
+Posts are immutable snapshots. The browser Home groups session entries by project; project feeds remain views, with a route back to the project session directory. Saved, All posts, and Storage & settings are persistent navigation destinations. Revising a result creates a new post at the top of the feed and links it to its predecessor. Publication is atomic, so a failed file, validation error, or storage limit leaves no partial post.
 
 ## Revision comparison
 
@@ -178,7 +178,7 @@ The same repository packages the generic agent skill and native pi extension.
 The first release does not include:
 
 - browser-to-agent comments, annotations, or approvals;
-- durable history, pins, or archives;
+- full-history archiving or pinning beyond individually saved posts;
 - automatic project scanning or watched directories;
 - Office or notebook rendering;
 - cloud publishing, accounts, or collaboration;

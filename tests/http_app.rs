@@ -58,6 +58,8 @@ async fn root_serves_the_embedded_frontend() {
 async fn feed_page_routes_serve_the_embedded_frontend() {
     for uri in [
         "/feed",
+        "/saved",
+        "/settings",
         "/login",
         "/sessions/2zY8Ab",
         "/projects/42",

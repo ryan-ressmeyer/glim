@@ -30,6 +30,20 @@ pub struct SessionRead {
     pub project: ProjectRead,
     pub created_at: i64,
     pub last_activity_at: i64,
+    #[serde(default)]
+    pub closed: bool,
+    #[serde(default)]
+    pub post_count: u64,
+    #[serde(default)]
+    pub saved_count: u64,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPage {
+    pub sessions: Vec<SessionRead>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +79,8 @@ pub struct PostRead {
     pub commentary: String,
     pub predecessor_post_id: Option<i64>,
     pub published_at: i64,
+    #[serde(default)]
+    pub saved: bool,
     pub git: Option<GitProvenance>,
     pub files: Vec<PostFileRead>,
 }
@@ -94,8 +110,14 @@ impl Store {
     pub fn session(&self, public_id: &str) -> Result<SessionRead, StoreError> {
         self.connection
             .query_row(
-                "SELECT s.id, s.public_id, s.integration_namespace, s.external_key,
-                    p.id, p.label, p.working_directory, s.created_at, s.last_activity_at
+                "SELECT s.id, s.public_id, s.integration_namespace, COALESCE(s.retained_external_key, s.external_key),
+                    p.id, p.label, p.working_directory, s.created_at, s.last_activity_at,
+                    s.closed, (SELECT COUNT(*) FROM posts x WHERE x.session_id = s.id
+                        AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = x.id)),
+                    (SELECT COUNT(*) FROM saved_posts v JOIN posts x ON x.id = v.post_id WHERE x.session_id = s.id),
+                    (SELECT x.title FROM posts x WHERE x.session_id = s.id
+                        AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = x.id)
+                        ORDER BY x.published_at DESC, x.id DESC LIMIT 1)
              FROM sessions s JOIN projects p ON p.id = s.project_id
              WHERE s.public_id = ?1",
                 [public_id],
@@ -112,6 +134,10 @@ impl Store {
                         },
                         created_at: row.get(7)?,
                         last_activity_at: row.get(8)?,
+                        closed: row.get(9)?,
+                        post_count: row.get::<_, i64>(10)? as u64,
+                        saved_count: row.get::<_, i64>(11)? as u64,
+                        label: row.get::<_, Option<String>>(12)?.unwrap_or_else(|| row.get::<_, String>(3).unwrap_or_default()),
                     })
                 },
             )
@@ -119,6 +145,60 @@ impl Store {
             .ok_or_else(|| StoreError::SessionNotFound {
                 public_id: public_id.to_owned(),
             })
+    }
+
+    pub fn sessions(&self, page: PageRequest) -> Result<SessionPage, StoreError> {
+        let limit = page.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+        if limit == 0 || limit > MAX_PAGE_LIMIT {
+            return Err(StoreError::InvalidPageLimit {
+                limit,
+                maximum: MAX_PAGE_LIMIT,
+            });
+        }
+        let cursor = page
+            .cursor
+            .as_deref()
+            .map(|cursor| {
+                cursor
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|id| *id > 0)
+                    .ok_or(StoreError::InvalidPageCursor)
+            })
+            .transpose()?;
+        let mut statement = self.connection.prepare(
+            "SELECT public_id, id FROM sessions WHERE (?1 IS NULL OR id < ?1)
+             AND (closed = 0 OR EXISTS (SELECT 1 FROM posts p WHERE p.session_id = sessions.id
+                AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = p.id)))
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let mut rows = statement
+            .query_map(params![cursor, i64::from(limit) + 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let next_cursor = if more {
+            rows.last().map(|(_, id)| id.to_string())
+        } else {
+            None
+        };
+        Ok(SessionPage {
+            sessions: rows
+                .into_iter()
+                .map(|(id, _)| self.session(&id))
+                .collect::<Result<_, _>>()?,
+            next_cursor,
+        })
+    }
+
+    pub fn saved_posts(&self, page: PageRequest) -> Result<PostPage, StoreError> {
+        self.posts_page(
+            "EXISTS (SELECT 1 FROM saved_posts v WHERE v.post_id = p.id) AND 1 = ?",
+            1,
+            page,
+        )
     }
 
     pub fn post(&self, post_id: i64) -> Result<PostRead, StoreError> {
@@ -131,7 +211,7 @@ impl Store {
         page: PageRequest,
     ) -> Result<PostPage, StoreError> {
         let session = self.session(public_id)?;
-        self.posts_page("p.session_id = ?", session.id, page)
+        self.posts_page("p.session_id = ? AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = p.id)", session.id, page)
     }
 
     pub fn project_posts(
@@ -147,11 +227,15 @@ impl Store {
         if !exists {
             return Err(StoreError::ProjectNotFound { project_id });
         }
-        self.posts_page("s.project_id = ?", project_id, page)
+        self.posts_page("s.project_id = ? AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = p.id)", project_id, page)
     }
 
     pub fn global_posts(&self, page: PageRequest) -> Result<PostPage, StoreError> {
-        self.posts_page("1 = ?", 1_i64, page)
+        self.posts_page(
+            "1 = ? AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = p.id)",
+            1_i64,
+            page,
+        )
     }
 
     pub(crate) fn session_posts_after(
@@ -161,7 +245,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<PostRead>, StoreError> {
         let session = self.session(public_id)?;
-        self.posts_after("p.session_id = ?", session.id, after_id, limit)
+        self.posts_after("p.session_id = ? AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = p.id)", session.id, after_id, limit)
     }
 
     pub(crate) fn project_posts_after(
@@ -178,7 +262,7 @@ impl Store {
         if !exists {
             return Err(StoreError::ProjectNotFound { project_id });
         }
-        self.posts_after("s.project_id = ?", project_id, after_id, limit)
+        self.posts_after("s.project_id = ? AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = p.id)", project_id, after_id, limit)
     }
 
     pub(crate) fn global_posts_after(
@@ -186,7 +270,12 @@ impl Store {
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<PostRead>, StoreError> {
-        self.posts_after("1 = ?", 1, after_id, limit)
+        self.posts_after(
+            "1 = ? AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = p.id)",
+            1,
+            after_id,
+            limit,
+        )
     }
 
     fn posts_after(
@@ -367,7 +456,8 @@ fn load_post(
         .query_row(
             "SELECT p.id, p.session_id, s.public_id, p.title, p.commentary, p.predecessor_post_id, p.published_at,
                     p.git_root, p.git_branch, p.git_commit
-             FROM posts p JOIN sessions s ON s.id = p.session_id WHERE p.id = ?1",
+             FROM posts p JOIN sessions s ON s.id = p.session_id WHERE p.id = ?1
+             AND NOT EXISTS (SELECT 1 FROM post_tombstones t WHERE t.post_id = p.id)",
             [post_id],
             |row| {
                 Ok((
@@ -411,6 +501,11 @@ fn load_post(
         commentary: raw.4,
         predecessor_post_id: raw.5,
         published_at: raw.6,
+        saved: connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM saved_posts WHERE post_id = ?1)",
+            [post_id],
+            |row| row.get(0),
+        )?,
         git,
         files: vec![],
     };

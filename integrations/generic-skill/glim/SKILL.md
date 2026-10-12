@@ -54,6 +54,6 @@ Create a new publication with `predecessor_post_id` set to the earlier positive 
 
 ### Step 6: Close the current Glimse session when directed
 
-Close only after explicit user direction or a known harness session-end hook. Use the current session's returned `result.session.public_id` with `glim close PUBLIC_ID`; never substitute an external key, post ID, agent exit, or guessed identity. If the current public ID is unavailable, inspect a safe list or status path or ask the user rather than guessing. Parse the close command's exit status and require `ok: true`. Explain that closing purges the ephemeral feed and snapshots.
+Close only after explicit user direction or a known harness session-end hook. Use the current session's returned `result.session.public_id` with `glim close PUBLIC_ID`; never substitute an external key, post ID, agent exit, or guessed identity. If the current public ID is unavailable, inspect a safe list or status path or ask the user rather than guessing. Parse the close command's exit status and require `ok: true`. Explain that closing removes unsaved posts, while saved posts remain readable at their original session links.
 
-**Complete when:** the confirmed current public session ID has an `ok: true` close envelope and the purge has been explained, or closure has stopped without affecting any session because identity or success could not be confirmed.
+**Complete when:** the confirmed current public session ID has an `ok: true` close envelope and saved-post retention has been explained, or closure has stopped without affecting any session because identity or success could not be confirmed.

@@ -62,7 +62,7 @@ Downgrade compatibility is not provided. Restore the pre-upgrade backup if an up
 
 ## SQLite migrations and startup failures
 
-The store database is `metadata.sqlite3` under the selected store root. The current code uses numbered forward migrations through schema version 6. Startup reads `PRAGMA user_version`, rejects a database newer than supported before applying migrations, and applies each pending migration in a SQLite transaction. A failed migration rolls back that migration and startup returns an error. Existing tests cover rollback, newer-schema rejection, and preservation for the checked legacy fixtures; they do not establish compatibility with future releases or arbitrary modified databases.
+The store database is `metadata.sqlite3` under the selected store root. The current code uses numbered forward migrations through schema version 7. Startup reads `PRAGMA user_version`, rejects a database newer than supported before applying migrations, and applies each pending migration in a SQLite transaction. A failed migration rolls back that migration and startup returns an error. Existing tests cover rollback, newer-schema rejection, and preservation for the checked legacy fixtures; they do not establish compatibility with future releases or arbitrary modified databases.
 
 Do not open an upgraded store with an older binary. Preserve the backup until the upgraded daemon starts and its status is acceptable.
 
@@ -93,7 +93,7 @@ The daemon distinguishes finalized storage from temporary in-flight staging. Def
 
 `limits.max_concurrent_publications` / `GLIM_MAX_CONCURRENT_PUBLICATIONS` accepts one through four. All byte limits must be positive; the per-file ceiling cannot exceed the staging or finalized budget. Existing configurations may omit the new staging and concurrency fields.
 
-A successful close means the session's metadata deletion committed. If filesystem cleanup fails afterward, the daemon logs `blob_cleanup_deferred` and retains queued blob deletions for retry. Inspect status and filesystem permissions rather than repeatedly closing a session that is already gone. The new CLI can read older v1 status responses without inventing staging limits; upgrade the binary and restart the daemon together before relying on the new resource controls.
+A successful close removes unsaved posts; saved posts and their original closed session context remain readable. Unsave removes protection but does not immediately delete the post. Permanent deletion of a saved post requires explicit per-post confirmation. `POST /api/v1/storage/reclaim` removes only unreferenced finalized blobs, not posts, live staging, or browser HTTP cache. The browser's Storage & settings page shows status and effective limits but does not change them; configure limits in the daemon configuration file or environment. A successful close means the session's cleanup or retention transaction committed. If filesystem cleanup fails afterward, the daemon logs `blob_cleanup_deferred` and retains queued blob deletions for retry. Inspect status and filesystem permissions rather than repeatedly closing a session that is already gone. The new CLI can read older v1 status responses without inventing staging limits; upgrade the binary and restart the daemon together before relying on the new resource controls.
 
 ## Complete removal
 

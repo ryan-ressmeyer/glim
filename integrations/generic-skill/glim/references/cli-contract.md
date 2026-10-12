@@ -152,4 +152,4 @@ PUBLIC_SESSION_ID=7Yp2Qa  # value previously returned as result.session.public_i
 glim close $PUBLIC_SESSION_ID
 ```
 
-Require a zero exit and `ok: true`. Closing deletes the session's ephemeral feed, posts, snapshots, and blobs no longer referenced elsewhere. If the current public ID is unavailable, use a known safe read path such as `glim list --session CONFIRMED_PUBLIC_ID` or ask the user. Never guess, close another session, or interpret exiting the agent as a Glimse close request.
+Require a zero exit and `ok: true`. Closing removes unsaved posts and blobs no longer referenced elsewhere. Saved posts remain readable at their original session links. If the current public ID is unavailable, use a known safe read path such as `glim list --session CONFIRMED_PUBLIC_ID` or ask the user. Never guess, close another session, or interpret exiting the agent as a Glimse close request.
