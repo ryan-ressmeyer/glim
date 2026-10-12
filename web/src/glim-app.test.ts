@@ -840,6 +840,30 @@ describe("glim-app public route and element behavior", () => {
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/v1/sessions/2zY8Ab")).toHaveLength(1);
   });
 
+  test("keeps post actions in a collapsed heading menu and provenance below attachments", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => String(input) === "/api/v1/posts"
+      ? jsonResponse({ posts: [post(10)], next_cursor: null }) : jsonResponse(session)));
+    const app = mount();
+    await rendered(app, "Post 10");
+    const article = app.shadowRoot!.querySelector("article")!;
+    const menu = article.querySelector<HTMLDetailsElement>(".post-heading details.post-actions");
+    expect(menu).not.toBeNull();
+    expect(menu!.open).toBe(false);
+    const summary = menu!.querySelector("summary")!;
+    expect(summary.textContent).toBe("⋯");
+    expect(summary.getAttribute("aria-label")).toBe("Post actions");
+    expect(menu!.querySelector("[data-save-post]")?.textContent).toBe("Save post");
+    expect(menu!.querySelector("[data-delete-post]")?.textContent).toBe("Delete post");
+    expect(menu!.querySelector("a")?.textContent).toBe("Open in session");
+    expect(article.lastElementChild?.className).toBe("provenance");
+    expect(article.querySelector(".files")?.nextElementSibling?.className).toBe("provenance");
+    menu!.open = true;
+    menu!.querySelector<HTMLButtonElement>("button")!.focus();
+    menu!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(menu!.open).toBe(false);
+    expect(app.shadowRoot!.activeElement).toBe(summary);
+  });
+
   test("presents post markdown, captions, revision, Git, provenance, and scoped navigation safely", async () => {
     const richPost = post(10, {
       title: "Retinal response",

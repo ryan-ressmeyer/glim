@@ -1498,7 +1498,13 @@ const appStyles = `
   .library-grid article { margin: .5rem 0; }
   .library-grid h3 { margin: .3rem 0; }
   .library-grid p { overflow-wrap: anywhere; }
-  .post-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .75rem 0; }
+  .post-heading { align-items: start; display: grid; gap: .75rem; grid-template-columns: minmax(0, 1fr) auto; }
+  .post-heading h2 { overflow-wrap: anywhere; }
+  .post-actions { position: relative; }
+  .post-actions > summary { border-radius: .4rem; cursor: pointer; display: grid; font-size: 1.5rem; line-height: 1; list-style: none; min-height: 2.75rem; min-width: 2.75rem; place-items: center; }
+  .post-actions > summary::-webkit-details-marker { display: none; }
+  .post-actions > summary:hover { background: var(--surface-subtle); }
+  .post-actions .action-menu { max-width: calc(100vw - 3rem); }
   .breadcrumbs { color: var(--muted); margin: 0 0 1rem; overflow-wrap: anywhere; }
   .files { list-style: none; margin: 1.25rem 0 0; padding: 0; }
   .files > li { border-top: 1px solid var(--border); padding: 1rem 0; }
@@ -2890,8 +2896,21 @@ class GlimApp extends HTMLElement {
     const time = element("time", validPublished ? published.toLocaleString() : "Publication time unavailable");
     if (validPublished) time.dateTime = published.toISOString();
     time.className = "meta";
-    const actions = element("div");
+    const actions = element("details");
     actions.className = "post-actions";
+    const summary = element("summary", "⋯");
+    summary.setAttribute("aria-label", "Post actions");
+    summary.title = "Post actions";
+    const menu = element("div");
+    menu.className = "action-menu";
+    actions.append(summary, menu);
+    actions.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      actions.open = false;
+      summary.focus();
+      event.preventDefault();
+      event.stopPropagation();
+    });
     const save = element("button", post.saved ? "Unsave post" : "Save post");
     save.dataset.savePost = "";
     save.addEventListener("click", () => { void this.changePost(post, save, "save"); });
@@ -2901,11 +2920,16 @@ class GlimApp extends HTMLElement {
     remove.addEventListener("click", () => { void this.changePost(post, remove, "delete"); });
     const scope = element("a", "Open in session");
     scope.href = `/sessions/${post.session_public_id}#post-${post.id}`;
-    actions.append(save, remove, scope);
+    menu.append(save, remove, scope);
+    const title = element("div");
+    title.append(heading, time);
+    const postHeading = element("div");
+    postHeading.className = "post-heading";
+    postHeading.append(title, actions);
     const commentary = element("div");
     commentary.className = "commentary";
     commentary.innerHTML = safeMarkdown(post.commentary);
-    article.append(heading, time, actions, commentary);
+    article.append(postHeading, commentary);
     if (post.predecessor_post_id !== null) {
       const revision = element("a", `Revises post ${post.predecessor_post_id}`);
       revision.href = `#post-${post.predecessor_post_id}`;
@@ -2934,7 +2958,6 @@ class GlimApp extends HTMLElement {
       const gitParts = [post.git.root, post.git.branch, post.git.commit].filter((value): value is string => !!value);
       provenanceDetails.append(element("p", gitParts.join(" · ")));
     }
-    article.append(provenanceDetails);
     const files = element("ol");
     files.className = "files";
     for (const postFile of post.files) {
@@ -2952,7 +2975,7 @@ class GlimApp extends HTMLElement {
       item.append(artifact);
       files.append(item);
     }
-    article.append(files);
+    article.append(files, provenanceDetails);
     return article;
   }
 
