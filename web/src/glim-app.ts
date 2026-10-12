@@ -1498,13 +1498,13 @@ const appStyles = `
   .library-grid article { margin: .5rem 0; }
   .library-grid h3 { margin: .3rem 0; }
   .library-grid p { overflow-wrap: anywhere; }
-  .post-heading { align-items: start; display: grid; gap: .75rem; grid-template-columns: minmax(0, 1fr) auto; }
-  .post-heading h2 { overflow-wrap: anywhere; }
-  .post-actions { position: relative; }
-  .post-actions > summary { border-radius: .4rem; cursor: pointer; display: grid; font-size: 1.5rem; line-height: 1; list-style: none; min-height: 2.75rem; min-width: 2.75rem; place-items: center; }
-  .post-actions > summary::-webkit-details-marker { display: none; }
-  .post-actions > summary:hover { background: var(--surface-subtle); }
-  .post-actions .action-menu { max-width: calc(100vw - 3rem); }
+  .post-heading, .session-heading { align-items: start; display: grid; gap: .75rem; grid-template-columns: minmax(0, 1fr) auto; }
+  .post-heading h2, .session-heading h3 { overflow-wrap: anywhere; }
+  .card-actions { position: relative; }
+  .card-actions > summary { border-radius: .4rem; cursor: pointer; display: grid; font-size: 1.5rem; line-height: 1; list-style: none; min-height: 2.75rem; min-width: 2.75rem; place-items: center; }
+  .card-actions > summary::-webkit-details-marker { display: none; }
+  .card-actions > summary:hover { background: var(--surface-subtle); }
+  .card-actions .action-menu { max-width: calc(100vw - 3rem); }
   .breadcrumbs { color: var(--muted); margin: 0 0 1rem; overflow-wrap: anywhere; }
   .files { list-style: none; margin: 1.25rem 0 0; padding: 0; }
   .files > li { border-top: 1px solid var(--border); padding: 1rem 0; }
@@ -2290,11 +2290,13 @@ class GlimApp extends HTMLElement {
         article.dataset.sessionId = session.public_id;
         const title = element("h3"); const link = element("a", session.label || session.external_key || session.public_id);
         link.href = `/sessions/${session.public_id}`; title.append(link);
-        article.append(title, element("p", `${session.closed ? "Closed · retained content" : "Open"} · ${session.post_count ?? 0} ${session.post_count === 1 ? "post" : "posts"} · ${session.saved_count ?? 0} saved · Last activity ${new Date(session.last_activity_at * 1000).toLocaleString()}`));
+        const sessionHeading = element("div"); sessionHeading.className = "session-heading";
+        sessionHeading.append(title);
+        article.append(sessionHeading, element("p", `${session.closed ? "Closed · retained content" : "Open"} · ${session.post_count ?? 0} ${session.post_count === 1 ? "post" : "posts"} · ${session.saved_count ?? 0} saved · Last activity ${new Date(session.last_activity_at * 1000).toLocaleString()}`));
         if (!session.closed) {
           const remove = element("button", "Delete session"); remove.className = "danger";
           remove.addEventListener("click", () => { void this.deleteDirectorySession(session, remove); });
-          article.append(remove);
+          sessionHeading.append(this.renderActionMenu("Session actions", remove));
         }
         group.append(article);
       }
@@ -2887,20 +2889,12 @@ class GlimApp extends HTMLElement {
     }
   }
 
-  private renderPost(post: Post): HTMLElement {
-    const article = element("article");
-    article.id = `post-${post.id}`;
-    const heading = element("h2", post.title);
-    const published = new Date(post.published_at * 1000);
-    const validPublished = Number.isFinite(published.getTime());
-    const time = element("time", validPublished ? published.toLocaleString() : "Publication time unavailable");
-    if (validPublished) time.dateTime = published.toISOString();
-    time.className = "meta";
+  private renderActionMenu(label: string, ...items: HTMLElement[]): HTMLDetailsElement {
     const actions = element("details");
-    actions.className = "post-actions";
+    actions.className = "card-actions";
     const summary = element("summary", "⋯");
-    summary.setAttribute("aria-label", "Post actions");
-    summary.title = "Post actions";
+    summary.setAttribute("aria-label", label);
+    summary.title = label;
     const menu = element("div");
     menu.className = "action-menu";
     actions.append(summary, menu);
@@ -2911,6 +2905,19 @@ class GlimApp extends HTMLElement {
       event.preventDefault();
       event.stopPropagation();
     });
+    menu.append(...items);
+    return actions;
+  }
+
+  private renderPost(post: Post): HTMLElement {
+    const article = element("article");
+    article.id = `post-${post.id}`;
+    const heading = element("h2", post.title);
+    const published = new Date(post.published_at * 1000);
+    const validPublished = Number.isFinite(published.getTime());
+    const time = element("time", validPublished ? published.toLocaleString() : "Publication time unavailable");
+    if (validPublished) time.dateTime = published.toISOString();
+    time.className = "meta";
     const save = element("button", post.saved ? "Unsave post" : "Save post");
     save.dataset.savePost = "";
     save.addEventListener("click", () => { void this.changePost(post, save, "save"); });
@@ -2920,7 +2927,8 @@ class GlimApp extends HTMLElement {
     remove.addEventListener("click", () => { void this.changePost(post, remove, "delete"); });
     const scope = element("a", "Open in session");
     scope.href = `/sessions/${post.session_public_id}#post-${post.id}`;
-    menu.append(save, remove, scope);
+    const actions = this.renderActionMenu("Post actions", save, remove, scope);
+    actions.classList.add("post-actions");
     const title = element("div");
     title.append(heading, time);
     const postHeading = element("div");

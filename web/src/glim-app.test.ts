@@ -207,6 +207,18 @@ describe("glim-app public route and element behavior", () => {
     await rendered(app, "Saved draft");
     expect(app.shadowRoot?.querySelector('a[href="/projects/42"]')).not.toBeNull();
     expect(composedText(app)).toContain("Closed · retained content · 1 post");
+    const active = app.shadowRoot!.querySelector(`article[data-session-id="${session.public_id}"]`)!;
+    const menu = active.querySelector<HTMLDetailsElement>(".session-heading details");
+    expect(menu).not.toBeNull();
+    expect(menu!.open).toBe(false);
+    expect(menu!.querySelector("summary")?.getAttribute("aria-label")).toBe("Session actions");
+    expect(menu!.querySelector(".action-menu button")?.textContent).toBe("Delete session");
+    expect(active.querySelector("h3 a")?.closest("details")).toBeNull();
+    expect(app.shadowRoot!.querySelector('article[data-session-id="2zY8Ac"] details')).toBeNull();
+    menu!.open = true;
+    menu!.querySelector("button")!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(menu!.open).toBe(false);
+    expect(app.shadowRoot!.activeElement).toBe(menu!.querySelector("summary"));
     app.shadowRoot?.querySelector<HTMLButtonElement>("[data-load-more]")?.click();
     await rendered(app, "Other");
   });
