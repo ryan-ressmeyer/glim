@@ -481,6 +481,14 @@ const injected = document.createElement('script'); injected.src = target; docume
   const librarySession = libraryPost.session.public_id;
   await command("Page.navigate", { url: `${daemonOrigin}/` });
   await waitFor(`${app}?.querySelector('.library-grid')?.textContent.includes('Library saved result')`, "Home session directory");
+  await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id}')`, "Home global feed");
+  if (!await evaluate(`(() => {
+    const root=${app}, row=root.querySelector('article[data-session-id="${librarySession}"]');
+    const feed=root.querySelector('[data-home-feed] .feed');
+    return row.classList.contains('session-row') && row.getBoundingClientRect().height < 110
+      && row.compareDocumentPosition(feed) & Node.DOCUMENT_POSITION_FOLLOWING
+      && feed.querySelector('#post-${libraryPost.post.id} [data-save-post]');
+  })()`)) throw new Error("Home directory rows are not compact above the global feed");
   const currentLink = await evaluate(`(() => {
     const link = ${app}.querySelector('nav a[aria-current="page"]');
     const other = ${app}.querySelector('nav a:not([aria-current])');
@@ -509,7 +517,11 @@ const injected = document.createElement('script'); injected.src = target; docume
   await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   if (!await evaluate(`!${sessionMenu}.open && ${app}.activeElement === ${sessionMenu}.querySelector('summary')`)) throw new Error("session menu Escape did not restore focus");
   if (await evaluate("document.documentElement.scrollWidth > innerWidth")) throw new Error("mobile Home overflows");
+  if (!await evaluate(`(() => { const root=${app}; return root.querySelector('.session-row').getBoundingClientRect().height < 135 && root.querySelector('[data-home-feed] #post-${libraryPost.post.id}'); })()`)) throw new Error("mobile Home lost compact sessions or feed");
   await command("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  const homeLive = await publish("library-session", "Home live update");
+  await waitFor(`${app}?.querySelector('#post-${homeLive.post.id}') && ${app}?.querySelector('article[data-session-id="${librarySession}"]')?.textContent.includes('2 posts')`, "Home live feed and directory");
+  if (!await evaluate(`${app}.querySelector('#post-${libraryPost.post.id} glim-artifact') !== null`)) throw new Error("Home live refresh removed the existing artifact");
   await command("Page.navigate", { url: `${daemonOrigin}/sessions/${librarySession}` });
   await waitFor(`${app}?.querySelector('#post-${libraryPost.post.id} [data-save-post]')`, "library post controls");
   const postMenu = `${app}.querySelector('#post-${libraryPost.post.id} .post-actions')`;

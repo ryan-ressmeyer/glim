@@ -149,7 +149,7 @@ function comparisonPostId(hash: string): number | null {
 }
 
 function pageEndpoint(route: Route): string | null {
-  if (route.kind === "global") return `${API}/posts`;
+  if (route.kind === "global" || route.kind === "home") return `${API}/posts`;
   if (route.kind === "saved") return `${API}/saved/posts`;
   if (route.kind === "session") return `${API}/sessions/${route.publicId}/posts`;
   if (route.kind === "project") return `${API}/projects/${route.projectId}/posts`;
@@ -1494,10 +1494,13 @@ const appStyles = `
   .provenance { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: .7rem; }
   .provenance summary { cursor: pointer; width: max-content; }
   .provenance p { margin: .5rem 0 0; overflow-wrap: anywhere; white-space: pre-line; }
-  .library-grid { display: grid; gap: 1rem; }
-  .library-grid article { margin: .5rem 0; }
-  .library-grid h3 { margin: .3rem 0; }
-  .library-grid p { overflow-wrap: anywhere; }
+  .library-grid { display: grid; gap: .65rem; }
+  .library-grid > p { color: var(--muted); font-size: .875rem; margin: 0 0 .35rem; }
+  .library-grid section h2 { font-size: 1.1rem; margin: .35rem 0; }
+  .library-grid .session-row { border-radius: .4rem; margin: .25rem 0; padding: .35rem .6rem; }
+  .library-grid h3 { font-size: 1rem; margin: 0; }
+  .library-grid .session-row p { color: var(--muted); font-size: .85rem; margin: -.25rem 2.75rem .1rem 0; overflow-wrap: anywhere; }
+  [data-home-feed] { margin-top: 1.75rem; }
   .post-heading, .session-heading { align-items: start; display: grid; gap: .75rem; grid-template-columns: minmax(0, 1fr) auto; }
   .post-heading h2, .session-heading h3 { overflow-wrap: anywhere; }
   .card-actions { position: relative; }
@@ -1541,6 +1544,7 @@ const appStyles = `
     header { grid-template-columns: 1fr auto; }
     nav { grid-column: 1 / -1; }
     article, [data-comparison] { border-radius: 0; margin-inline: -.75rem; }
+    .library-grid .session-row { margin-inline: 0; }
     .comparison-columns { grid-template-columns: minmax(0, 1fr); }
     .diff-wrap thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
     .diff-wrap tr, .diff-wrap td { display: block; width: auto; }
@@ -1598,8 +1602,10 @@ class GlimApp extends HTMLElement {
     this.targetRequestVersion += 1;
     this.targetController?.abort();
     this.targetController = undefined;
-    if (this.route.kind === "home") {
-      if (this.directoryTarget() && !this.shadowRoot?.getElementById(window.location.hash.slice(1)))
+    if (this.route.kind === "home" && this.directoryTarget()) {
+      this.homeSection("feed")?.querySelector("[data-comparison]")?.remove();
+      if (this.posts.length) this.renderFeed();
+      if (!this.shadowRoot?.getElementById(window.location.hash.slice(1)))
         void this.loadDirectory(false, this.connectionGeneration);
       else this.renderDirectory();
       return;
@@ -1643,8 +1649,10 @@ class GlimApp extends HTMLElement {
     window.addEventListener("pagehide", this.pagehideHandler);
     window.addEventListener("pageshow", this.pageshowHandler);
     this.startLive(generation);
-    if (this.route.kind === "home") void this.loadDirectory(false, generation);
-    else if (this.route.kind === "settings") void this.loadSettings(generation);
+    if (this.route.kind === "home") {
+      void this.loadDirectory(false, generation);
+      void this.load(false, generation);
+    } else if (this.route.kind === "settings") void this.loadSettings(generation);
     else this.load(false, generation).catch(() => undefined);
   }
 
@@ -1698,7 +1706,7 @@ class GlimApp extends HTMLElement {
         return;
       }
       if (this.route.kind === "home") void this.loadDirectory(false, generation);
-      else if (this.route.kind === "settings") void this.loadSettings(generation);
+      if (this.route.kind === "settings") void this.loadSettings(generation);
       else if (this.route.kind === "saved") this.reconcileLatest(generation);
       else this.receivePost(value, generation);
     }) as EventListener);
@@ -1707,7 +1715,7 @@ class GlimApp extends HTMLElement {
       this.sessions.clear();
       this.provenanceInFlight.clear();
       if (this.route.kind === "home") void this.loadDirectory(false, generation);
-      else if (this.route.kind === "settings") void this.loadSettings(generation);
+      if (this.route.kind === "settings") void this.loadSettings(generation);
       else this.reconcileLatest(generation);
     }) as EventListener);
     source.addEventListener("session-closed", ((event: MessageEvent<string>) => {
@@ -1724,7 +1732,7 @@ class GlimApp extends HTMLElement {
         this.showClosed();
         return;
       }
-      if (this.route.kind === "home") { void this.loadDirectory(false, generation); return; }
+      if (this.route.kind === "home") void this.loadDirectory(false, generation);
       if (this.route.kind === "settings") { void this.loadSettings(generation); return; }
       this.posts = this.posts.filter((post) => post.session_public_id !== closure.session_public_id);
       this.postIds = new Set(this.posts.map((post) => post.id));
@@ -2034,6 +2042,14 @@ class GlimApp extends HTMLElement {
     main.append(breadcrumb);
     this.shadowRoot!.append(main);
     this.main = main;
+    if (this.route.kind === "home") {
+      for (const [name, heading] of [["directory", "Sessions by project"], ["feed", "All posts"]]) {
+        const section = element("section");
+        section.dataset[name === "directory" ? "homeDirectory" : "homeFeed"] = "";
+        section.append(element("h2", heading));
+        main.append(section);
+      }
+    }
     this.navigation = navigation;
     this.connectionStatus = status;
     this.renderNavigation();
@@ -2186,6 +2202,7 @@ class GlimApp extends HTMLElement {
       this.reconciliationVersion += 1;
       this.reconciliationController?.abort();
       this.renderFeed();
+      if (this.route.kind === "home") void this.loadDirectory(false, this.connectionGeneration);
       this.reconcileLatest(this.connectionGeneration);
     } catch {
       if (!this.isConnected) return;
@@ -2206,7 +2223,7 @@ class GlimApp extends HTMLElement {
     this.directoryController?.abort();
     const controller = new AbortController();
     this.directoryController = controller;
-    if (!more && !this.directory.length) this.showState("Loading library");
+    if (!more && !this.directory.length) this.showState("Loading library", false, "directory");
     const oldest = more ? null : this.directory.at(-1)?.id;
     const loaded: Session[] = more ? [...this.directory] : [];
     const ids = new Set(loaded.map((session) => session.id));
@@ -2252,14 +2269,14 @@ class GlimApp extends HTMLElement {
   }
 
   private showLibraryRetry(message: string, retry: () => void) {
-    if (!this.directory.length) { this.showState(message); }
+    if (!this.directory.length) { this.showState(message, false, "directory"); }
     else this.main?.querySelector("[data-library-retry]")?.remove();
     const holder = element("p", message);
     holder.dataset.libraryRetry = "";
     const button = element("button", "Retry");
     button.addEventListener("click", retry);
     holder.append(" ", button);
-    (this.main?.querySelector(".library-grid") ?? this.main?.querySelector(".state"))?.append(holder);
+    (this.main?.querySelector(".library-grid") ?? this.homeSection("directory")?.querySelector(".state"))?.append(holder);
   }
 
   private renderDirectory() {
@@ -2267,10 +2284,10 @@ class GlimApp extends HTMLElement {
       .find((article) => article.getBoundingClientRect().bottom > 0);
     const anchorTop = anchor?.getBoundingClientRect().top;
     const anchorId = anchor?.dataset.sessionId;
-    this.main?.querySelectorAll(".state, .library-grid").forEach((value) => value.remove());
+    this.homeSection("directory")?.querySelectorAll(".state, .library-grid").forEach((value) => value.remove());
     if (!this.directory.length) {
-      this.showState("No sessions yet. Published posts will appear here.");
-      if (this.directoryTarget()) this.showDirectoryTargetMissing(this.main?.querySelector(".state"));
+      this.showState("No sessions yet. Published posts will appear here.", false, "directory");
+      if (this.directoryTarget()) this.showDirectoryTargetMissing(this.homeSection("directory")?.querySelector(".state"));
       return;
     }
     const grid = element("section"); grid.className = "library-grid";
@@ -2288,6 +2305,7 @@ class GlimApp extends HTMLElement {
       for (const session of sessions) {
         const article = element("article");
         article.dataset.sessionId = session.public_id;
+        article.className = "session-row";
         const title = element("h3"); const link = element("a", session.label || session.external_key || session.public_id);
         link.href = `/sessions/${session.public_id}`; title.append(link);
         const sessionHeading = element("div"); sessionHeading.className = "session-heading";
@@ -2307,7 +2325,7 @@ class GlimApp extends HTMLElement {
       more.addEventListener("click", () => { more.disabled = true; void this.loadDirectory(true, this.connectionGeneration); });
       grid.append(more);
     }
-    this.main?.append(grid);
+    this.homeSection("directory")?.append(grid);
     const nextAnchor = Array.from(grid.querySelectorAll<HTMLElement>("article[data-session-id]"))
       .find((article) => article.dataset.sessionId === anchorId);
     if (nextAnchor && anchorTop !== undefined && !this.directoryTarget())
@@ -2334,6 +2352,7 @@ class GlimApp extends HTMLElement {
       const response = await fetch(`${API}/sessions/${session.public_id}`, { method: "DELETE" });
       if (!response.ok) throw new Error("Close failed");
       await this.loadDirectory(false, this.connectionGeneration);
+      this.reconcileLatest(this.connectionGeneration);
     } catch {
       button.disabled = false;
       const status = element("span", " Could not close session. Try again."); status.setAttribute("role", "status"); button.after(status);
@@ -2420,8 +2439,13 @@ class GlimApp extends HTMLElement {
     state.append(element("br"), login);
   }
 
-  private showState(message: string, retry = false) {
-    this.main?.querySelectorAll(".state, .feed, .library-grid, .settings, [data-live-notice], [data-comparison]").forEach((value) => value.remove());
+  private homeSection(kind: "directory" | "feed"): HTMLElement | undefined {
+    return this.main?.querySelector<HTMLElement>(kind === "directory" ? "[data-home-directory]" : "[data-home-feed]") ?? this.main;
+  }
+
+  private showState(message: string, retry = false, section?: "directory" | "feed") {
+    const parent = section ? this.homeSection(section) : this.main;
+    parent?.querySelectorAll(".state, .feed, .library-grid, .settings, [data-live-notice], [data-comparison]").forEach((value) => value.remove());
     const state = element("section", message);
     state.className = "state";
     state.setAttribute("aria-live", "polite");
@@ -2431,7 +2455,7 @@ class GlimApp extends HTMLElement {
       button.addEventListener("click", () => this.load(false).catch(() => undefined));
       state.append(element("br"), button);
     }
-    this.main?.append(state);
+    parent?.append(state);
   }
 
   private async load(more: boolean, generation = this.connectionGeneration) {
@@ -2447,7 +2471,7 @@ class GlimApp extends HTMLElement {
       this.provenanceUnavailable.clear();
       this.provenanceAttempts.clear();
       this.provenanceInFlight.clear();
-      this.showState("Loading feed");
+      this.showState("Loading feed", false, this.route.kind === "home" ? "feed" : undefined);
     }
     const controller = this.controller;
     if (!controller || !this.isAppActive(generation, controller.signal)) return;
@@ -2509,7 +2533,7 @@ class GlimApp extends HTMLElement {
 
   private handleLoadError(more: boolean, paginationMessage: string, initialMessage: string) {
     if (more) this.showPaginationState(paginationMessage, true);
-    else this.showState(initialMessage, true);
+    else this.showState(initialMessage, true, this.route.kind === "home" ? "feed" : undefined);
   }
 
   private showPaginationState(message: string, retry: boolean) {
@@ -2530,7 +2554,7 @@ class GlimApp extends HTMLElement {
 
   private async resolveLocationPost(generation: number) {
     if (!this.isAppActive(generation)) return;
-    this.main?.querySelector("[data-target-state]")?.remove();
+    this.homeSection("feed")?.querySelector("[data-target-state]")?.remove();
     const requestedHash = window.location.hash;
     const comparisonId = comparisonPostId(requestedHash);
     if (comparisonId !== null) {
@@ -2687,7 +2711,7 @@ class GlimApp extends HTMLElement {
       back.href = `#post-${postId}`;
       back.addEventListener("click", (event) => { event.preventDefault(); this.navigateHash(back.hash); });
       status.append(element("br"), back);
-      this.main?.append(status);
+      this.homeSection("feed")?.append(status);
     } finally {
       if (this.targetController === controller) {
         this.targetController = undefined;
@@ -2702,7 +2726,7 @@ class GlimApp extends HTMLElement {
   }
 
   private renderComparison(newer: Post, older: Post) {
-    this.main?.querySelectorAll(".state, .feed, [data-comparison]").forEach((value) => value.remove());
+    this.homeSection("feed")?.querySelectorAll(".state, .feed, [data-comparison]").forEach((value) => value.remove());
     const comparison = element("section");
     comparison.dataset.comparison = "";
     const heading = element("h2", `Comparing post ${newer.id} with post ${older.id}`);
@@ -2829,7 +2853,7 @@ class GlimApp extends HTMLElement {
       renderPair();
     });
     renderPair();
-    this.main?.append(comparison);
+    this.homeSection("feed")?.append(comparison);
     heading.focus();
   }
 
@@ -2844,10 +2868,11 @@ class GlimApp extends HTMLElement {
 
   private renderFeed() {
     if (comparisonPostId(window.location.hash) !== null) return;
-    this.main?.querySelectorAll(".state").forEach((value) => value.remove());
+    this.homeSection("feed")?.querySelectorAll(".state").forEach((value) => value.remove());
     if (this.posts.length === 0) {
       this.main?.querySelector(".feed")?.remove();
-      this.showState(this.route.kind === "saved" ? "No saved posts" : "No posts in this feed");
+      this.showState(this.route.kind === "saved" ? "No saved posts" : "No posts in this feed", false,
+        this.route.kind === "home" ? "feed" : undefined);
       return;
     }
     let feed = this.main?.querySelector<HTMLElement>(".feed");
@@ -2855,7 +2880,7 @@ class GlimApp extends HTMLElement {
       feed = element("section");
       feed.className = "feed";
       feed.setAttribute("aria-label", "Published artifacts");
-      this.main?.append(feed);
+      this.homeSection("feed")?.append(feed);
     }
     feed.querySelectorAll("[data-load-more], [data-pagination-state]").forEach((value) => value.remove());
     const expectedIds = new Set(this.posts.map((post) => `post-${post.id}`));
@@ -3032,7 +3057,7 @@ class GlimApp extends HTMLElement {
           else requestSignal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
         });
         try {
-          response = await Promise.race([fetch(`${API}/sessions/${id}`, { signal: requestSignal }), aborted]);
+          response = await Promise.race([Promise.resolve().then(() => fetch(`${API}/sessions/${id}`, { signal: requestSignal })), aborted]);
           if (!this.isAppActive(generation, signal)) return null;
           if (response.ok) payload = await Promise.race([response.json(), aborted]);
           break;

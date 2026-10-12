@@ -75,7 +75,7 @@ A post contains:
 
 Every post requires at least one visible artifact. Text-only status messages belong in the terminal.
 
-Posts are immutable snapshots. The browser Home groups session entries by project; project feeds remain views, with a route back to the project session directory. Saved, All posts, and Storage & settings are persistent navigation destinations. Revising a result creates a new post at the top of the feed and links it to its predecessor. Publication is atomic, so a failed file, validation error, or storage limit leaves no partial post.
+Posts are immutable snapshots. The browser Home groups compact session entries by project above the all-posts feed; project feeds remain views, with a route back to the project session directory. Saved, All posts, and Storage & settings are persistent navigation destinations. Revising a result creates a new post at the top of the feed and links it to its predecessor. Publication is atomic, so a failed file, validation error, or storage limit leaves no partial post.
 
 ## Revision comparison
 

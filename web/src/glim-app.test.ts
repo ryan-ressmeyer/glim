@@ -190,6 +190,96 @@ describe("glim-app public route and element behavior", () => {
     },
   );
 
+  test("Home renders compact project sessions above a paginated global feed", async () => {
+    setPath("/");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions?limit=50") return jsonResponse({ sessions: [{ ...session, post_count: 2, saved_count: 1 }], next_cursor: null });
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(2, { saved: true })], next_cursor: "older" });
+      if (url === "/api/v1/posts?cursor=older") return jsonResponse({ posts: [post(1)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull());
+    const directory = app.shadowRoot!.querySelector(".library-grid")!;
+    const feed = app.shadowRoot!.querySelector(".feed")!;
+    expect(directory.compareDocumentPosition(feed) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(directory.querySelector("article")?.classList.contains("session-row")).toBe(true);
+    expect(directory.textContent).toContain("2 posts · 1 saved · Last activity");
+    expect(directory.querySelector('a[href="/projects/42"]')).not.toBeNull();
+    expect(directory.querySelector('a[href="/sessions/2zY8Ab"]')).not.toBeNull();
+    expect(feed.querySelector('a[href="/sessions/2zY8Ab#post-2"]')).not.toBeNull();
+    feed.querySelector<HTMLButtonElement>("[data-load-more]")!.click();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("#post-1")).not.toBeNull());
+    expect(app.shadowRoot?.querySelector(".library-grid")).toBe(directory);
+  });
+
+  test("Home keeps feed artifacts mounted across directory refresh and independent empty/error states", async () => {
+    setPath("/");
+    let sessions = [{ ...session, post_count: 1, saved_count: 0 }];
+    let failDirectory = false;
+    let feedPosts = [post(2)];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions?limit=50") return failDirectory ? jsonResponse({}, 500) : jsonResponse({ sessions, next_cursor: null });
+      if (url === "/api/v1/posts") return jsonResponse({ posts: feedPosts, next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("#post-2 glim-artifact")).not.toBeNull());
+    const artifact = app.shadowRoot!.querySelector("#post-2 glim-artifact");
+    failDirectory = true;
+    FakeEventSource.instances[0].emit("reset", {});
+    await rendered(app, "Could not load library");
+    expect(app.shadowRoot?.querySelector("#post-2 glim-artifact")).toBe(artifact);
+    feedPosts = [];
+    FakeEventSource.instances[0].emit("reset", {});
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-home-feed] .state")?.textContent).toContain("No posts"));
+    expect(app.shadowRoot?.querySelector("[data-home-directory] .library-grid")).not.toBeNull();
+    sessions = [];
+    failDirectory = false;
+    app.shadowRoot?.querySelector<HTMLButtonElement>("[data-library-retry] button")?.click();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-home-directory] .state")?.textContent).toContain("No sessions"));
+    expect(app.shadowRoot?.querySelector("[data-home-feed] .state")?.textContent).toContain("No posts");
+  });
+
+  test("Home resolves post hashes independently of project directory hashes", async () => {
+    setPath("/#post-2");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions?limit=50") return jsonResponse({ sessions: [{ ...session, post_count: 1 }], next_cursor: null });
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(2)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected ${url}`);
+    }));
+    const focus = vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(() => {});
+    const app = mount();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull());
+    await vi.waitFor(() => expect(focus).toHaveBeenCalled());
+    window.history.replaceState({}, "", "/#project-42"); window.dispatchEvent(new Event("hashchange"));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("#project-42")).not.toBeNull());
+    expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull();
+  });
+
+  test("Home restores its feed when navigating from a comparison to a project hash", async () => {
+    setPath("/#compare-2");
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions?limit=50") return jsonResponse({ sessions: [{ ...session, post_count: 2 }], next_cursor: null });
+      if (url === "/api/v1/posts") return jsonResponse({ posts: [post(2, { predecessor_post_id: 1 }), post(1)], next_cursor: null });
+      if (url === "/api/v1/sessions/2zY8Ab") return jsonResponse(session);
+      throw new Error(`unexpected ${url}`);
+    }));
+    const app = mount();
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("[data-comparison]")).not.toBeNull());
+    window.history.replaceState({}, "", "/#project-42"); window.dispatchEvent(new Event("hashchange"));
+    await vi.waitFor(() => expect(app.shadowRoot?.querySelector("#project-42")).not.toBeNull());
+    expect(app.shadowRoot?.querySelector("[data-comparison]")).toBeNull();
+    expect(app.shadowRoot?.querySelector("#post-2")).not.toBeNull();
+  });
+
   test("Home groups paginated sessions by project and preserves closed saved contexts", async () => {
     setPath("/");
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
